@@ -1,5 +1,6 @@
 """Tests for vm_launcher module."""
 
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -7,10 +8,13 @@ import pytest
 from qemu_harness.vm_launcher import (
     VMConfig,
     VMHandle,
+    _get_proc,
+    _kill_via_pid,
+    _kill_via_proc,
     _qemu_args,
     _qemu_binary,
-    _send_signal,
-    _wait_for_exit,
+    _register_proc,
+    _unregister_proc,
     has_kvm,
     kill_vm,
     launch_vm,
@@ -86,6 +90,28 @@ class TestHasKvm:
         assert has_kvm() is False
 
 
+class TestProcRegistry:
+    """Tests for the process registry."""
+
+    def test_register_and_get(self) -> None:
+        proc = MagicMock(pid=99999)
+        _register_proc(proc)
+        assert _get_proc(99999) is proc
+        _unregister_proc(99999)
+
+    def test_get_missing(self) -> None:
+        assert _get_proc(88888) is None
+
+    def test_unregister_missing(self) -> None:
+        _unregister_proc(77777)
+
+    def test_unregister_cleans_up(self) -> None:
+        proc = MagicMock(pid=66666)
+        _register_proc(proc)
+        _unregister_proc(66666)
+        assert _get_proc(66666) is None
+
+
 class TestLaunchVm:
     """Tests for launch_vm()."""
 
@@ -104,6 +130,22 @@ class TestLaunchVm:
         assert handle.pid == 12345
         assert handle.serial_path == serial
         mock_popen.assert_called_once()
+        _unregister_proc(12345)
+
+    @patch("qemu_harness.vm_launcher.subprocess.Popen")
+    def test_registers_proc(
+        self, mock_popen: MagicMock, tmp_path: object,
+    ) -> None:
+        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        mock_proc = MagicMock(pid=11111)
+        mock_popen.return_value = mock_proc
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="qemu", serial_path=serial,
+        )
+        launch_vm(config)
+        assert _get_proc(11111) is mock_proc
+        _unregister_proc(11111)
 
     def test_firecracker_no_kvm_raises(
         self, tmp_path: object,
@@ -160,86 +202,79 @@ class TestWaitForReady:
         assert wait_for_ready(handle, "READY", 0.1) is False
 
 
-class TestSendSignal:
-    """Tests for _send_signal()."""
+class TestKillViaProc:
+    """Tests for _kill_via_proc()."""
+
+    def test_terminate_succeeds(self) -> None:
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        _kill_via_proc(proc)
+        proc.terminate.assert_called_once()
+        proc.wait.assert_called_once_with(timeout=5.0)
+        proc.kill.assert_not_called()
+
+    def test_terminate_timeout_then_kill(self) -> None:
+        proc = MagicMock()
+        proc.wait.side_effect = [
+            subprocess.TimeoutExpired("qemu", 5.0),
+            0,
+        ]
+        _kill_via_proc(proc)
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        assert proc.wait.call_count == 2
+
+
+class TestKillViaPid:
+    """Tests for _kill_via_pid()."""
 
     @patch("qemu_harness.vm_launcher.os.kill")
-    def test_success(self, mock_kill: MagicMock) -> None:
-        assert _send_signal(123, 15) is True
-        mock_kill.assert_called_once_with(123, 15)
-
-    @patch("qemu_harness.vm_launcher.os.kill")
-    def test_gone(self, mock_kill: MagicMock) -> None:
-        mock_kill.side_effect = ProcessLookupError
-        assert _send_signal(123, 15) is False
-
-
-class TestWaitForExit:
-    """Tests for _wait_for_exit()."""
-
-    @patch("qemu_harness.vm_launcher._send_signal")
-    def test_exits_immediately(
-        self, mock_send: MagicMock,
+    def test_already_dead(
+        self, mock_kill: MagicMock,
     ) -> None:
-        mock_send.return_value = False
-        assert _wait_for_exit(123, 1.0) is True
+        mock_kill.side_effect = ProcessLookupError
+        _kill_via_pid(1)
+        mock_kill.assert_called_once_with(1, 15)
 
     @patch("qemu_harness.vm_launcher.time.sleep")
-    @patch("qemu_harness.vm_launcher._send_signal")
     @patch("qemu_harness.vm_launcher.time.monotonic")
-    def test_timeout(
-        self, mock_time: MagicMock,
-        mock_send: MagicMock,
+    @patch("qemu_harness.vm_launcher.os.kill")
+    def test_exits_after_sigterm(
+        self, mock_kill: MagicMock,
+        mock_time: MagicMock,
         mock_sleep: MagicMock,
     ) -> None:
-        mock_time.side_effect = [0.0, 0.0, 1.0, 2.0]
-        mock_send.return_value = True
-        assert _wait_for_exit(123, 0.5) is False
+        mock_kill.side_effect = [
+            None,
+            ProcessLookupError,
+        ]
+        mock_time.side_effect = [0.0, 0.0]
+        _kill_via_pid(1)
+        assert mock_kill.call_count == 2
 
 
 class TestKillVm:
     """Tests for kill_vm()."""
 
-    @patch("qemu_harness.vm_launcher._send_signal")
-    def test_already_dead(
-        self, mock_send: MagicMock,
-    ) -> None:
-        mock_send.return_value = False
+    def test_uses_proc_when_registered(self) -> None:
+        proc = MagicMock(pid=44444)
+        proc.wait.return_value = 0
+        _register_proc(proc)
         handle = VMHandle(
-            pid=1, serial_path="/s",
+            pid=44444, serial_path="/s",
             arch="x86_64", platform="qemu",
         )
         kill_vm(handle)
-        mock_send.assert_called_once()
+        proc.terminate.assert_called_once()
+        assert _get_proc(44444) is None
 
-    @patch("qemu_harness.vm_launcher._send_signal")
-    @patch("qemu_harness.vm_launcher._wait_for_exit")
-    def test_sigterm_sufficient(
-        self, mock_wait: MagicMock,
-        mock_send: MagicMock,
+    @patch("qemu_harness.vm_launcher._kill_via_pid")
+    def test_falls_back_to_pid(
+        self, mock_kill_pid: MagicMock,
     ) -> None:
-        mock_send.return_value = True
-        mock_wait.return_value = True
         handle = VMHandle(
-            pid=1, serial_path="/s",
+            pid=55555, serial_path="/s",
             arch="x86_64", platform="qemu",
         )
         kill_vm(handle)
-        assert mock_send.call_count == 1
-
-    @patch("qemu_harness.vm_launcher._send_signal")
-    @patch("qemu_harness.vm_launcher._wait_for_exit")
-    def test_needs_sigkill(
-        self, mock_wait: MagicMock,
-        mock_send: MagicMock,
-    ) -> None:
-        mock_send.return_value = True
-        mock_wait.return_value = False
-        handle = VMHandle(
-            pid=1, serial_path="/s",
-            arch="x86_64", platform="qemu",
-        )
-        kill_vm(handle)
-        import signal
-        mock_send.assert_any_call(1, signal.SIGTERM)
-        mock_send.assert_any_call(1, signal.SIGKILL)
+        mock_kill_pid.assert_called_once_with(55555)
