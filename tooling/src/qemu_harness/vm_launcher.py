@@ -46,6 +46,7 @@ class VMHandle(BaseModel):
 
     pid: int
     serial_path: str
+    stderr_path: str
     arch: str
     platform: str
 
@@ -99,16 +100,21 @@ def launch_vm(config: VMConfig) -> VMHandle:
             raise RuntimeError(msg)
         msg = "Firecracker launch not yet implemented"
         raise NotImplementedError(msg)
+    stderr_path = config.serial_path + ".stderr"
+    Path(stderr_path).touch()
     args = _qemu_args(config)
+    stderr_file = open(stderr_path, "w")  # noqa: SIM115
     proc = subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=stderr_file,
     )
+    stderr_file.close()
     _register_proc(proc)
     return VMHandle(
         pid=proc.pid,
         serial_path=config.serial_path,
+        stderr_path=stderr_path,
         arch=config.arch,
         platform=config.platform,
     )

@@ -1,6 +1,7 @@
 """Tests for vm_launcher module."""
 
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -129,7 +130,25 @@ class TestLaunchVm:
         handle = launch_vm(config)
         assert handle.pid == 12345
         assert handle.serial_path == serial
+        assert handle.stderr_path == serial + ".stderr"
         mock_popen.assert_called_once()
+
+    @patch("qemu_harness.vm_launcher.subprocess.Popen")
+    def test_stderr_captured_to_file(
+        self, mock_popen: MagicMock, tmp_path: object,
+    ) -> None:
+        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        mock_proc = MagicMock(pid=22222)
+        mock_popen.return_value = mock_proc
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="qemu", serial_path=serial,
+        )
+        handle = launch_vm(config)
+        assert Path(handle.stderr_path).exists()
+        call_kwargs = mock_popen.call_args[1]
+        assert call_kwargs["stderr"] is not subprocess.DEVNULL
+        _unregister_proc(22222)
         _unregister_proc(12345)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
@@ -186,7 +205,7 @@ class TestWaitForReady:
         from pathlib import Path
         Path(serial).write_text("booting...\nREADY\n")
         handle = VMHandle(
-            pid=1, serial_path=serial,
+            pid=1, serial_path=serial, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         assert wait_for_ready(handle, "READY", 1.0) is True
@@ -196,7 +215,7 @@ class TestWaitForReady:
         from pathlib import Path
         Path(serial).write_text("booting...")
         handle = VMHandle(
-            pid=1, serial_path=serial,
+            pid=1, serial_path=serial, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         assert wait_for_ready(handle, "READY", 0.1) is False
@@ -261,7 +280,7 @@ class TestKillVm:
         proc.wait.return_value = 0
         _register_proc(proc)
         handle = VMHandle(
-            pid=44444, serial_path="/s",
+            pid=44444, serial_path="/s", stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         kill_vm(handle)
@@ -273,7 +292,7 @@ class TestKillVm:
         self, mock_kill_pid: MagicMock,
     ) -> None:
         handle = VMHandle(
-            pid=55555, serial_path="/s",
+            pid=55555, serial_path="/s", stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         kill_vm(handle)

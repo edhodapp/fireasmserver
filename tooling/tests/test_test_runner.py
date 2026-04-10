@@ -80,7 +80,7 @@ class TestRunCase:
         p = str(tmp_path) + "/serial.log"  # type: ignore[operator]
         Path(p).write_text("READY")
         handle = VMHandle(
-            pid=1, serial_path=p,
+            pid=1, serial_path=p, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         case = TestCase(
@@ -93,7 +93,7 @@ class TestRunCase:
 
     def test_unknown_type(self) -> None:
         handle = VMHandle(
-            pid=1, serial_path="/s",
+            pid=1, serial_path="/s", stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         case = TestCase(
@@ -176,7 +176,7 @@ class TestBootAndTest:
     ) -> None:
         mock_wait.return_value = False
         handle = VMHandle(
-            pid=1, serial_path="/s",
+            pid=1, serial_path="/s", stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         suite = TestSuite(
@@ -195,7 +195,7 @@ class TestBootAndTest:
         p = str(tmp_path) + "/serial.log"  # type: ignore[operator]
         Path(p).write_text("READY")
         handle = VMHandle(
-            pid=1, serial_path=p,
+            pid=1, serial_path=p, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         suite = TestSuite(
@@ -284,7 +284,7 @@ class TestRunSuite:
         serial = str(tmp_path) + "/s.log"  # type: ignore[operator]
         Path(serial).write_text("READY")
         mock_launch.return_value = VMHandle(
-            pid=1, serial_path=serial,
+            pid=1, serial_path=serial, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
         )
         mock_wait.return_value = True
