@@ -152,6 +152,22 @@ class TestLaunchVm:
         _unregister_proc(12345)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
+    def test_truncates_serial_on_launch(
+        self, mock_popen: MagicMock, tmp_path: object,
+    ) -> None:
+        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        Path(serial).write_text("STALE READY MARKER")
+        mock_proc = MagicMock(pid=33333)
+        mock_popen.return_value = mock_proc
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="qemu", serial_path=serial,
+        )
+        launch_vm(config)
+        assert Path(serial).read_text() == ""
+        _unregister_proc(33333)
+
+    @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_registers_proc(
         self, mock_popen: MagicMock, tmp_path: object,
     ) -> None:

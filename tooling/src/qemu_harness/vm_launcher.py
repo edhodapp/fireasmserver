@@ -93,7 +93,7 @@ def launch_vm(config: VMConfig) -> VMHandle:
     Returns a handle with pid and serial output path.
     Does not block -- caller must poll for readiness.
     """
-    Path(config.serial_path).touch()
+    Path(config.serial_path).write_bytes(b"")
     if config.platform == "firecracker":
         if not has_kvm():
             msg = "Firecracker requires /dev/kvm"
@@ -101,7 +101,7 @@ def launch_vm(config: VMConfig) -> VMHandle:
         msg = "Firecracker launch not yet implemented"
         raise NotImplementedError(msg)
     stderr_path = config.serial_path + ".stderr"
-    Path(stderr_path).touch()
+    Path(stderr_path).write_bytes(b"")
     args = _qemu_args(config)
     stderr_file = open(stderr_path, "w")  # noqa: SIM115
     proc = subprocess.Popen(
