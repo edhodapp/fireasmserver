@@ -1,2 +1,15 @@
 # Claude Code session state
 .claude/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.coverage
+*.egg-info/
+
+# Build artifacts
+build/
+
+# DAG signing key
+tooling/.dag-key
