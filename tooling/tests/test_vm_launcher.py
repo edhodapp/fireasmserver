@@ -75,6 +75,42 @@ class TestQemuArgs:
         assert "128" in args
 
 
+class TestPathValidation:
+    """Tests for path traversal rejection."""
+
+    def test_clean_path_accepted(self) -> None:
+        config = VMConfig(
+            image_path="/tmp/guest.elf", arch="x86_64",
+            platform="qemu", serial_path="/tmp/serial.log",
+        )
+        assert "guest.elf" in config.image_path
+
+    def test_image_path_traversal_rejected(self) -> None:
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="traversal"):
+            VMConfig(
+                image_path="/tmp/../etc/shadow", arch="x86_64",
+                platform="qemu", serial_path="/tmp/s.log",
+            )
+
+    def test_serial_path_traversal_rejected(self) -> None:
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="traversal"):
+            VMConfig(
+                image_path="/tmp/guest.elf", arch="x86_64",
+                platform="qemu",
+                serial_path="../../etc/passwd",
+            )
+
+    def test_paths_resolved(self) -> None:
+        config = VMConfig(
+            image_path="/tmp/./guest.elf", arch="x86_64",
+            platform="qemu", serial_path="/tmp/./s.log",
+        )
+        assert "/tmp/guest.elf" == config.image_path
+        assert "/tmp/s.log" == config.serial_path
+
+
 class TestPlatformValidation:
     """Tests for Platform Literal validation."""
 

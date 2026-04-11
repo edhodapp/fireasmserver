@@ -8,9 +8,18 @@ import time
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 Platform = Literal["qemu", "firecracker"]
+
+
+def _reject_traversal(path: str) -> str:
+    """Reject paths containing '..' components."""
+    if ".." in Path(path).parts:
+        msg = f"Path traversal not allowed: {path}"
+        raise ValueError(msg)
+    return str(Path(path).resolve())
+
 
 # Registry of Popen objects keyed by PID.
 # Popen is not Pydantic-serializable, so VMHandle stays
@@ -42,6 +51,12 @@ class VMConfig(BaseModel):
     platform: Platform
     serial_path: str
     extra_args: list[str] = []
+
+    @field_validator("image_path", "serial_path")
+    @classmethod
+    def no_traversal(cls, v: str) -> str:
+        """Reject path traversal in file paths."""
+        return _reject_traversal(v)
 
 
 class VMHandle(BaseModel):
