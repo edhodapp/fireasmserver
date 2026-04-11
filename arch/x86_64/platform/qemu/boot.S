@@ -2,6 +2,7 @@
 # Copyright (c) 2026 Ed Hodapp
 #
 # Minimal x86_64 QEMU guest stub for pipeline verification.
+# End-to-end pipeline test: this comment triggers the full flow.
 # Multiboot entry — QEMU boots this in 32-bit protected mode.
 # Writes "READY\n" to serial port 0x3F8 (COM1) and halts.
 
