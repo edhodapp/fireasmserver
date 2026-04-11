@@ -21,6 +21,7 @@ from qemu_harness.vm_launcher import (
     _qemu_args,
     _qemu_binary,
     _register_proc,
+    _signal_pid,
     _try_waitpid,
     _unregister_proc,
     has_kvm,
@@ -464,6 +465,32 @@ class TestKillViaProc:
         proc.terminate.assert_called_once()
         proc.kill.assert_called_once()
         assert proc.wait.call_count == 2
+
+
+class TestSignalPid:
+    """Tests for _signal_pid()."""
+
+    @patch("qemu_harness.vm_launcher.os.kill")
+    def test_signal_delivered(self, mock_kill: MagicMock) -> None:
+        mock_kill.return_value = None
+        assert _signal_pid(123, 15) is True
+        mock_kill.assert_called_once_with(123, 15)
+
+    @patch("qemu_harness.vm_launcher.os.kill")
+    def test_process_gone_returns_false(
+        self, mock_kill: MagicMock,
+    ) -> None:
+        mock_kill.side_effect = ProcessLookupError
+        assert _signal_pid(123, 15) is False
+
+    @patch("qemu_harness.vm_launcher.os.kill")
+    def test_permission_denied_treats_as_existing(
+        self, mock_kill: MagicMock,
+    ) -> None:
+        # PID recycled to another user; we cannot signal it,
+        # but it exists, so contract is "process exists" -> True.
+        mock_kill.side_effect = PermissionError
+        assert _signal_pid(123, 15) is True
 
 
 class TestTryWaitpid:

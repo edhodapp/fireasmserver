@@ -330,11 +330,25 @@ def _kill_via_proc(
 
 
 def _signal_pid(pid: int, sig: int) -> bool:
-    """Send signal to PID. Return False if process gone."""
+    """Send signal to PID. Return False if process is gone.
+
+    Returns True for the "process exists" case, including the
+    sub-case where the PID has been recycled to a process owned
+    by another user (PermissionError). The caller can't kill it
+    in that case, but the process exists, which is what the bool
+    contract reports. Logged so the caller can spot the
+    pathological case in test output.
+    """
     try:
         os.kill(pid, sig)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        log.warning(
+            "PID %d exists but is not signalable by us "
+            "(likely recycled to another user)", pid,
+        )
+        return True
     return True
 
 
