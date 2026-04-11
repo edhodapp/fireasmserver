@@ -1,7 +1,9 @@
 # Architecture Decision Log
 
 Chronological record of design decisions for fireasmserver.
-Each entry captures the decision, rationale, and date.
+Each entry captures: the decision, the justification, and the date/time.
+Entries are numbered sequentially (D001, D002, ...) and never renumbered.
+Review this log before making new decisions to avoid re-litigating settled questions.
 
 ## 2026-04-09
 
@@ -97,6 +99,37 @@ Commit blocked if any gate fails. Gemini review runs after gates pass
 ### D018: Gemini batched review for speed
 Gemini review script batches all files into a single prompt instead of
 one API call per file. Reduces review time from minutes to seconds.
+
+## 2026-04-11
+
+### D019: FAT32 read-only for virtio-block content filesystem (04:15 UTC)
+**Decision:** Web content served by fireasmserver is stored on a FAT32
+filesystem on the Firecracker virtio-block device. The guest implements
+a read-only FAT32 driver — no write support needed since the guest only
+serves what's on the disk.
+
+**Justification:**
+- The guest has no OS and no filesystem — content must come from somewhere.
+  Options considered: compiled into binary, custom binary format, virtio-block
+  with real filesystem, virtio-vsock push, network fetch at boot.
+- Compiled-in is too inflexible (rebuild to change content).
+- Custom binary format requires our proprietary packing tool — friction for
+  users who are not us.
+- FAT32 is universally supported: every OS (Linux, macOS, Windows) can create
+  FAT32 images with standard tools (`mkfs.fat -F 32`). No special tooling.
+- FAT16 was considered but caps at 2GB partition / 2GB file size — too
+  restrictive for sites with large media assets.
+- FAT32 supports 2TB partition / 4GB file size — more than enough.
+- Read-only implementation in assembly is straightforward: read BPB, compute
+  offsets, walk directory entries, follow 32-bit cluster chains. No journaling,
+  no allocation, no write logic.
+- The delta from FAT16 to FAT32 in assembly is marginal (32-bit cluster
+  entries, root dir as cluster chain instead of fixed region).
+- Target audience (anyone deploying bare-metal assembly in Firecracker) is
+  comfortable with disk image creation. For convenience, we'll ship a Python
+  packing tool: `fireasmserver-pack ./www/ -o disk.img`.
+- Fly.io (major Firecracker hosting platform) charges $0.08/GB/month for
+  storage; a typical static site fits in the 10GB free tier.
 
 ## Future decisions (not yet made)
 - PVH boot protocol for Firecracker
