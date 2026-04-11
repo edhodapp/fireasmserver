@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +86,19 @@ class VMConfig(BaseModel):
                 raise ValueError(msg)
         return v
 
+    @model_validator(mode="after")
+    def extra_args_qemu_only(self) -> "VMConfig":
+        """extra_args is QEMU-specific; firecracker config
+        is generated from VMConfig fields and doesn't accept
+        passthrough CLI flags."""
+        if self.platform == "firecracker" and self.extra_args:
+            msg = (
+                "extra_args is qemu-only; firecracker takes "
+                "configuration via the generated JSON"
+            )
+            raise ValueError(msg)
+        return self
+
 
 class VMHandle(BaseModel):
     """Handle to a running VM process."""
@@ -127,6 +141,62 @@ def _qemu_args(config: VMConfig) -> list[str]:
     return args
 
 
+# Firecracker requires a logger file path that already exists
+# at startup. We co-locate it with the serial output file so
+# the launcher's path discipline (no traversal, abs paths)
+# applies uniformly.
+def _firecracker_log_path(serial_path: str) -> str:
+    return serial_path + ".fc-log"
+
+
+def _firecracker_config_path(serial_path: str) -> str:
+    return serial_path + ".fc-config.json"
+
+
+def _firecracker_vm_id(serial_path: str) -> str:
+    """Derive a stable per-launch microVM id from serial_path.
+
+    Tests use unique tmpdirs, so the stem is unique per test.
+    Real deployments name serial files distinctly.
+    """
+    return Path(serial_path).stem
+
+
+def _firecracker_config_dict(config: VMConfig) -> dict[str, Any]:
+    """Build the JSON config Firecracker expects via --config-file.
+
+    drives must be present (Firecracker rejects missing field)
+    but may be empty for diagnostic boots that have no rootfs.
+    Logger path diverts Firecracker's own log lines off stdout
+    so the serial console stream stays mostly clean -- only the
+    one-line boot header leaks before the logger is configured.
+    """
+    return {
+        "boot-source": {
+            "kernel_image_path": config.image_path,
+        },
+        "machine-config": {
+            "vcpu_count": 1,
+            "mem_size_mib": 128,
+        },
+        "drives": [],
+        "logger": {
+            "log_path": _firecracker_log_path(config.serial_path),
+            "level": "Info",
+        },
+    }
+
+
+def _firecracker_args(config_path: str, vm_id: str) -> list[str]:
+    """Build the firecracker --no-api command line."""
+    return [
+        "firecracker",
+        "--no-api",
+        "--config-file", config_path,
+        "--id", vm_id,
+    ]
+
+
 def has_kvm() -> bool:
     """Check if /dev/kvm is available."""
     return os.access("/dev/kvm", os.R_OK | os.W_OK)
@@ -142,13 +212,14 @@ def launch_vm(config: VMConfig) -> VMHandle:
         "Launching %s/%s: %s",
         config.arch, config.platform, config.image_path,
     )
-    Path(config.serial_path).write_bytes(b"")
     if config.platform == "firecracker":
-        if not has_kvm():
-            msg = "Firecracker requires /dev/kvm"
-            raise RuntimeError(msg)
-        msg = "Firecracker launch not yet implemented"
-        raise NotImplementedError(msg)
+        return _launch_firecracker(config)
+    return _launch_qemu(config)
+
+
+def _launch_qemu(config: VMConfig) -> VMHandle:
+    """Spawn QEMU and return a handle."""
+    Path(config.serial_path).write_bytes(b"")
     stderr_path = config.serial_path + ".stderr"
     Path(stderr_path).write_bytes(b"")
     args = _qemu_args(config)
@@ -156,6 +227,49 @@ def launch_vm(config: VMConfig) -> VMHandle:
         proc = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
+    _register_proc(proc)
+    log.info("VM launched, pid=%d", proc.pid)
+    return VMHandle(
+        pid=proc.pid,
+        serial_path=config.serial_path,
+        stderr_path=stderr_path,
+        arch=config.arch,
+        platform=config.platform,
+    )
+
+
+def _launch_firecracker(config: VMConfig) -> VMHandle:
+    """Spawn Firecracker via --no-api and return a handle.
+
+    Firecracker has no equivalent of QEMU's -serial file:<path>
+    flag -- the 8250 UART always writes to stdout. We redirect
+    stdout into the caller's serial_path so the same wait/read
+    interface works for both platforms. The Firecracker logger
+    is diverted to a sibling .fc-log file to keep VMM log lines
+    off the serial stream.
+    """
+    if not has_kvm():
+        msg = "Firecracker requires /dev/kvm"
+        raise RuntimeError(msg)
+    log_path = _firecracker_log_path(config.serial_path)
+    config_path = _firecracker_config_path(config.serial_path)
+    stderr_path = config.serial_path + ".stderr"
+    Path(log_path).write_bytes(b"")
+    Path(stderr_path).write_bytes(b"")
+    Path(config_path).write_text(
+        json.dumps(_firecracker_config_dict(config), indent=2),
+        encoding="utf-8",
+    )
+    args = _firecracker_args(
+        config_path, _firecracker_vm_id(config.serial_path),
+    )
+    with open(config.serial_path, "wb") as serial_file, \
+            open(stderr_path, "w", encoding="utf-8") as stderr_file:
+        proc = subprocess.Popen(
+            args,
+            stdout=serial_file,
             stderr=stderr_file,
         )
     _register_proc(proc)

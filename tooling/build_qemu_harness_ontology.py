@@ -94,7 +94,7 @@ vm_instance = Entity(
             name="stderr_path",
             property_type=PropertyType(kind="str"),
             description=(
-                "Path to QEMU stderr capture file. "
+                "Path to VMM stderr capture file. "
                 "Created alongside serial_path as "
                 "<serial_path>.stderr. Truncated on launch."
             ),
@@ -283,11 +283,14 @@ vm_launcher_mod = ModuleSpec(
     responsibility=(
         "Launch QEMU or Firecracker VMs in the background, "
         "poll for readiness via serial output file, and "
-        "kill cleanly. Handles both x86_64 and aarch64 "
-        "with appropriate QEMU system binary and flags. "
-        "Maintains a thread-safe Popen registry for safe "
-        "process lifecycle management. Validates paths "
-        "and QEMU arguments. Logs all lifecycle events."
+        "kill cleanly. QEMU uses -serial file: for direct "
+        "serial capture; Firecracker has no equivalent so "
+        "stdout is redirected into serial_path and the VMM's "
+        "own logger is diverted to a sibling .fc-log file. "
+        "Handles both x86_64 and aarch64. Maintains a "
+        "thread-safe Popen registry for safe process "
+        "lifecycle management. Validates paths and QEMU "
+        "arguments. Logs all lifecycle events."
     ),
     classes=[
         ClassSpec(
@@ -371,8 +374,9 @@ vm_launcher_mod = ModuleSpec(
             return_type="VMHandle",
             docstring=(
                 "Launch a VM in the background. Truncates "
-                "serial and stderr files. Registers Popen. "
-                "Returns handle. Does not block."
+                "serial and stderr files. Dispatches to "
+                "_launch_qemu or _launch_firecracker by "
+                "platform. Does not block."
             ),
             preconditions=[
                 "Guest image exists at config.image_path",
@@ -383,6 +387,80 @@ vm_launcher_mod = ModuleSpec(
                 "Serial and stderr files exist (truncated)",
                 "Popen registered in _proc_registry",
             ],
+        ),
+        FunctionSpec(
+            name="_launch_qemu",
+            parameters=[("config", "VMConfig")],
+            return_type="VMHandle",
+            docstring=(
+                "Spawn QEMU with -serial file: redirecting "
+                "the UART straight to serial_path."
+            ),
+        ),
+        FunctionSpec(
+            name="_launch_firecracker",
+            parameters=[("config", "VMConfig")],
+            return_type="VMHandle",
+            docstring=(
+                "Spawn Firecracker via --no-api with a "
+                "generated JSON config. Redirects stdout to "
+                "serial_path (Firecracker has no equivalent "
+                "of -serial file:) and diverts VMM logger "
+                "lines to a sibling .fc-log so the serial "
+                "stream stays mostly clean."
+            ),
+            preconditions=["/dev/kvm is available"],
+        ),
+        FunctionSpec(
+            name="_firecracker_log_path",
+            parameters=[("serial_path", "str")],
+            return_type="str",
+            docstring=(
+                "Co-located VMM log path: serial_path + "
+                "'.fc-log'."
+            ),
+        ),
+        FunctionSpec(
+            name="_firecracker_config_path",
+            parameters=[("serial_path", "str")],
+            return_type="str",
+            docstring=(
+                "Co-located JSON config path: serial_path + "
+                "'.fc-config.json'."
+            ),
+        ),
+        FunctionSpec(
+            name="_firecracker_vm_id",
+            parameters=[("serial_path", "str")],
+            return_type="str",
+            docstring=(
+                "Derive a stable per-launch microVM id from "
+                "Path(serial_path).stem. Tests use unique "
+                "tmpdirs so the stem is unique per test."
+            ),
+        ),
+        FunctionSpec(
+            name="_firecracker_config_dict",
+            parameters=[("config", "VMConfig")],
+            return_type="dict[str, Any]",
+            docstring=(
+                "Build the JSON config Firecracker expects. "
+                "drives is empty (no rootfs needed for "
+                "diagnostic boots), logger is set to a "
+                "sibling .fc-log file."
+            ),
+        ),
+        FunctionSpec(
+            name="_firecracker_args",
+            parameters=[
+                ("config_path", "str"), ("vm_id", "str"),
+            ],
+            return_type="list[str]",
+            docstring=(
+                "Build the firecracker --no-api command line: "
+                "[firecracker, --no-api, --config-file <path>, "
+                "--id <vm_id>]."
+            ),
         ),
         FunctionSpec(
             name="wait_for_ready",
@@ -479,12 +557,17 @@ vm_launcher_mod = ModuleSpec(
     test_strategy=(
         "Unit test with mock subprocess. Autouse fixture "
         "clears _proc_registry before/after each test. "
-        "Tests verify: launch registers Popen, stderr "
+        "Tests verify: qemu launch registers Popen, stderr "
         "captured to file, serial truncated on launch, "
         "path traversal rejected, blocked args rejected, "
         "platform Literal validated, marker found/timeout "
         "in wait_for_ready, kill via Popen vs bare PID "
-        "fallback, waitpid reaps zombies. Random test "
+        "fallback, waitpid reaps zombies. Firecracker tests "
+        "verify --no-api command shape, JSON config file "
+        "materializes with correct fields (drives, logger, "
+        "boot-source), config/log/stderr files all created "
+        "on disk, no-kvm raises RuntimeError. Helper tests "
+        "cover the path-derivation functions. Random test "
         "order verified via pytest-randomly."
     ),
 )
@@ -494,8 +577,10 @@ guest_builder_mod = ModuleSpec(
     responsibility=(
         "Assemble and link guest images using GNU as "
         "cross-toolchains and GNU ld. Selects the correct "
-        "toolchain based on target arch. Returns the path "
-        "to the built binary."
+        "toolchain based on (arch, platform) -- ELF class "
+        "depends on boot protocol: x86_64 qemu uses Multiboot1 "
+        "(ELF32), x86_64 firecracker uses PVH (ELF64). "
+        "Returns the path to the built binary."
     ),
     functions=[
         FunctionSpec(
@@ -521,22 +606,27 @@ guest_builder_mod = ModuleSpec(
             ],
         ),
         FunctionSpec(
-            name="toolchain_for_arch",
-            parameters=[("arch", "str")],
-            return_type="tuple[str, str]",
+            name="toolchain_for",
+            parameters=[
+                ("arch", "str"), ("platform", "str"),
+            ],
+            return_type="Toolchain",
             docstring=(
-                "Return (assembler, linker) binary names "
-                "for the target arch."
+                "Return the Toolchain (assembler, linker, "
+                "as_flags, ld_flags) for the (arch, platform) "
+                "target. Raises ValueError on unsupported "
+                "combinations."
             ),
         ),
     ],
     dependencies=["subprocess", "pathlib"],
     test_strategy=(
-        "Unit test toolchain_for_arch with known arches. "
-        "Functional test build_guest with a minimal .S "
-        "file that assembles and links successfully. Test "
-        "missing-toolchain path by mocking "
-        "subprocess.run to raise FileNotFoundError."
+        "Unit test toolchain_for with all supported (arch, "
+        "platform) combos plus rejection cases. Functional "
+        "test build_guest with a minimal .S file that "
+        "assembles and links successfully. Test missing-"
+        "toolchain path by mocking subprocess.run to raise "
+        "FileNotFoundError."
     ),
 )
 

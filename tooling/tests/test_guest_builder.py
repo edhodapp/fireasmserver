@@ -7,28 +7,40 @@ import pytest
 
 from qemu_harness.guest_builder import (
     build_guest,
-    toolchain_for_arch,
+    toolchain_for,
 )
 
 
-class TestToolchainForArch:
-    """Tests for toolchain_for_arch()."""
+class TestToolchainFor:
+    """Tests for toolchain_for()."""
 
-    def test_x86_64(self) -> None:
-        tc = toolchain_for_arch("x86_64")
+    def test_x86_64_qemu(self) -> None:
+        tc = toolchain_for("x86_64", "qemu")
         assert tc.assembler == "x86_64-linux-gnu-as"
         assert tc.linker == "x86_64-linux-gnu-ld"
         assert "--32" in tc.as_flags
         assert "-m" in tc.ld_flags
+        assert "elf_i386" in tc.ld_flags
 
-    def test_aarch64(self) -> None:
-        tc = toolchain_for_arch("aarch64")
+    def test_x86_64_firecracker_is_elf64(self) -> None:
+        tc = toolchain_for("x86_64", "firecracker")
+        assert tc.assembler == "x86_64-linux-gnu-as"
+        assert tc.linker == "x86_64-linux-gnu-ld"
+        assert "--32" not in tc.as_flags
+        assert "elf_i386" not in tc.ld_flags
+
+    def test_aarch64_qemu(self) -> None:
+        tc = toolchain_for("aarch64", "qemu")
         assert tc.assembler == "aarch64-linux-gnu-as"
         assert tc.linker == "aarch64-linux-gnu-ld"
 
-    def test_unsupported_raises(self) -> None:
+    def test_unsupported_arch_raises(self) -> None:
         with pytest.raises(ValueError, match="Unsupported"):
-            toolchain_for_arch("riscv64")
+            toolchain_for("riscv64", "qemu")
+
+    def test_unsupported_platform_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported"):
+            toolchain_for("aarch64", "firecracker")
 
 
 class TestBuildGuest:

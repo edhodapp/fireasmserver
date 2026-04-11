@@ -22,32 +22,42 @@ class Toolchain:
         self.ld_flags = ld_flags
 
 
-def toolchain_for_arch(arch: str) -> Toolchain:
-    """Return the toolchain for the target arch."""
-    toolchains: dict[str, Toolchain] = {
-        "x86_64": Toolchain(
+def toolchain_for(arch: str, platform: str) -> Toolchain:
+    """Return the toolchain for the (arch, platform) target.
+
+    ELF class is a function of (arch, platform): qemu boots
+    x86_64 via Multiboot1 (ELF32), firecracker via PVH (ELF64).
+    """
+    toolchains: dict[tuple[str, str], Toolchain] = {
+        ("x86_64", "qemu"): Toolchain(
             assembler="x86_64-linux-gnu-as",
             linker="x86_64-linux-gnu-ld",
             as_flags=["--32"],
             ld_flags=["-m", "elf_i386"],
         ),
-        "aarch64": Toolchain(
+        ("x86_64", "firecracker"): Toolchain(
+            assembler="x86_64-linux-gnu-as",
+            linker="x86_64-linux-gnu-ld",
+            as_flags=[],
+            ld_flags=[],
+        ),
+        ("aarch64", "qemu"): Toolchain(
             assembler="aarch64-linux-gnu-as",
             linker="aarch64-linux-gnu-ld",
             as_flags=[],
             ld_flags=[],
         ),
     }
-    result = toolchains.get(arch)
+    result = toolchains.get((arch, platform))
     if result is None:
-        msg = f"Unsupported arch: {arch}"
+        msg = f"Unsupported target: {arch}/{platform}"
         raise ValueError(msg)
     return result
 
 
 def build_guest(
     arch: str,
-    platform: str,  # pylint: disable=unused-argument
+    platform: str,
     source_dir: str,
     build_dir: str | None = None,
 ) -> Path:
@@ -59,7 +69,7 @@ def build_guest(
     src = Path(source_dir)
     out = Path(build_dir) if build_dir else src / "build"
     out.mkdir(parents=True, exist_ok=True)
-    tc = toolchain_for_arch(arch)
+    tc = toolchain_for(arch, platform)
     sources = sorted(src.glob("*.S"))
     if not sources:
         msg = f"No .S files in {source_dir}"

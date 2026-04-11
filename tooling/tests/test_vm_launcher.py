@@ -1,5 +1,6 @@
 """Tests for vm_launcher module."""
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,9 +9,11 @@ import pytest
 from pydantic import ValidationError
 
 from qemu_harness.vm_launcher import (
-    _unregister_proc,
-    VMConfig,
-    VMHandle,
+    _firecracker_args,
+    _firecracker_config_dict,
+    _firecracker_config_path,
+    _firecracker_log_path,
+    _firecracker_vm_id,
     _get_proc,
     _kill_via_pid,
     _kill_via_proc,
@@ -19,9 +22,12 @@ from qemu_harness.vm_launcher import (
     _qemu_binary,
     _register_proc,
     _try_waitpid,
+    _unregister_proc,
     has_kvm,
     kill_vm,
     launch_vm,
+    VMConfig,
+    VMHandle,
     wait_for_ready,
 )
 
@@ -120,6 +126,21 @@ class TestExtraArgsValidation:
                 platform="qemu", serial_path="/s",
                 extra_args=["-chardev", "socket,id=foo"],
             )
+
+    def test_extra_args_rejected_on_firecracker(self) -> None:
+        with pytest.raises(ValidationError, match="qemu-only"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="firecracker", serial_path="/s",
+                extra_args=["-m", "256"],
+            )
+
+    def test_empty_extra_args_ok_on_firecracker(self) -> None:
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="firecracker", serial_path="/s",
+        )
+        assert not config.extra_args
 
 
 class TestPathValidation:
@@ -296,20 +317,108 @@ class TestLaunchVm:
             with pytest.raises(RuntimeError, match="kvm"):
                 launch_vm(config)
 
-    def test_firecracker_with_kvm_not_implemented(
-        self, tmp_path: Path,
+    @patch("qemu_harness.vm_launcher.has_kvm", return_value=True)
+    @patch("qemu_harness.vm_launcher.subprocess.Popen")
+    def test_firecracker_launch(
+        self, mock_popen: MagicMock,
+        mock_kvm_unused: MagicMock, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path / "serial.log")
+        del mock_kvm_unused
+        serial = str(tmp_path / "fc.log")
+        mock_proc = MagicMock(pid=77777)
+        mock_popen.return_value = mock_proc
         config = VMConfig(
-            image_path="/img", arch="x86_64",
+            image_path=str(tmp_path / "guest.elf"),
+            arch="x86_64",
             platform="firecracker", serial_path=serial,
         )
-        with patch(
-            "qemu_harness.vm_launcher.has_kvm",
-            return_value=True,
-        ):
-            with pytest.raises(NotImplementedError):
-                launch_vm(config)
+        handle = launch_vm(config)
+        assert handle.pid == 77777
+        assert handle.platform == "firecracker"
+        assert handle.serial_path == serial
+        assert handle.stderr_path == serial + ".stderr"
+        # Config and stderr files materialize on disk.
+        assert Path(serial + ".fc-config.json").exists()
+        assert Path(serial + ".fc-log").exists()
+        assert Path(serial + ".stderr").exists()
+        # firecracker invoked with --no-api and --config-file.
+        invoked = mock_popen.call_args[0][0]
+        assert invoked[0] == "firecracker"
+        assert "--no-api" in invoked
+        assert "--config-file" in invoked
+        cf_idx = invoked.index("--config-file")
+        assert invoked[cf_idx + 1] == serial + ".fc-config.json"
+
+    @patch("qemu_harness.vm_launcher.has_kvm", return_value=True)
+    @patch("qemu_harness.vm_launcher.subprocess.Popen")
+    def test_firecracker_config_file_content(
+        self, mock_popen: MagicMock,
+        mock_kvm_unused: MagicMock, tmp_path: Path,
+    ) -> None:
+        del mock_kvm_unused
+        serial = str(tmp_path / "fc.log")
+        mock_popen.return_value = MagicMock(pid=88888)
+        image = str(tmp_path / "guest.elf")
+        config = VMConfig(
+            image_path=image, arch="x86_64",
+            platform="firecracker", serial_path=serial,
+        )
+        launch_vm(config)
+        cfg_doc = json.loads(
+            Path(serial + ".fc-config.json").read_text(
+                encoding="utf-8",
+            ),
+        )
+        assert cfg_doc["boot-source"]["kernel_image_path"] == image
+        assert not cfg_doc["drives"]
+        assert (
+            cfg_doc["logger"]["log_path"] == serial + ".fc-log"
+        )
+        assert cfg_doc["machine-config"]["vcpu_count"] == 1
+
+
+class TestFirecrackerHelpers:
+    """Tests for firecracker config/path helpers."""
+
+    def test_log_path_co_located(self) -> None:
+        assert (
+            _firecracker_log_path("/tmp/x.log")
+            == "/tmp/x.log.fc-log"
+        )
+
+    def test_config_path_co_located(self) -> None:
+        assert (
+            _firecracker_config_path("/tmp/x.log")
+            == "/tmp/x.log.fc-config.json"
+        )
+
+    def test_vm_id_from_stem(self) -> None:
+        assert (
+            _firecracker_vm_id("/tmp/test-foo.log") == "test-foo"
+        )
+
+    def test_config_dict_shape(self) -> None:
+        config = VMConfig(
+            image_path="/tmp/g.elf", arch="x86_64",
+            platform="firecracker",
+            serial_path="/tmp/s.log",
+        )
+        doc = _firecracker_config_dict(config)
+        assert doc["boot-source"]["kernel_image_path"] == "/tmp/g.elf"
+        assert not doc["drives"]
+        assert doc["machine-config"]["vcpu_count"] == 1
+        assert doc["machine-config"]["mem_size_mib"] == 128
+        assert doc["logger"]["log_path"] == "/tmp/s.log.fc-log"
+        assert doc["logger"]["level"] == "Info"
+
+    def test_args_shape(self) -> None:
+        args = _firecracker_args("/tmp/c.json", "fc-test")
+        assert args[0] == "firecracker"
+        assert "--no-api" in args
+        assert "--config-file" in args
+        assert "/tmp/c.json" in args
+        assert "--id" in args
+        assert "fc-test" in args
 
 
 class TestWaitForReady:

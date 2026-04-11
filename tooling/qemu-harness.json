@@ -2,7 +2,7 @@
   "project_name": "fireasmserver-qemu-harness",
   "nodes": [
     {
-      "id": "277081e0-f43b-4e40-8591-a6551e8b2786",
+      "id": "1a78f95a-86c4-40da-a032-0c60dd4dfc15",
       "ontology": {
         "entities": [
           {
@@ -79,7 +79,7 @@
                   "kind": "str",
                   "reference": null
                 },
-                "description": "Path to QEMU stderr capture file. Created alongside serial_path as <serial_path>.stderr. Truncated on launch.",
+                "description": "Path to VMM stderr capture file. Created alongside serial_path as <serial_path>.stderr. Truncated on launch.",
                 "required": true,
                 "constraints": []
               },
@@ -276,7 +276,7 @@
         "modules": [
           {
             "name": "vm_launcher",
-            "responsibility": "Launch QEMU or Firecracker VMs in the background, poll for readiness via serial output file, and kill cleanly. Handles both x86_64 and aarch64 with appropriate QEMU system binary and flags. Maintains a thread-safe Popen registry for safe process lifecycle management. Validates paths and QEMU arguments. Logs all lifecycle events.",
+            "responsibility": "Launch QEMU or Firecracker VMs in the background, poll for readiness via serial output file, and kill cleanly. QEMU uses -serial file: for direct serial capture; Firecracker has no equivalent so stdout is redirected into serial_path and the VMM's own logger is diverted to a sibling .fc-log file. Handles both x86_64 and aarch64. Maintains a thread-safe Popen registry for safe process lifecycle management. Validates paths and QEMU arguments. Logs all lifecycle events.",
             "classes": [
               {
                 "name": "VMConfig",
@@ -384,7 +384,7 @@
                   ]
                 ],
                 "return_type": "VMHandle",
-                "docstring": "Launch a VM in the background. Truncates serial and stderr files. Registers Popen. Returns handle. Does not block.",
+                "docstring": "Launch a VM in the background. Truncates serial and stderr files. Dispatches to _launch_qemu or _launch_firecracker by platform. Does not block.",
                 "preconditions": [
                   "Guest image exists at config.image_path",
                   "For firecracker: /dev/kvm is available"
@@ -394,6 +394,103 @@
                   "Serial and stderr files exist (truncated)",
                   "Popen registered in _proc_registry"
                 ]
+              },
+              {
+                "name": "_launch_qemu",
+                "parameters": [
+                  [
+                    "config",
+                    "VMConfig"
+                  ]
+                ],
+                "return_type": "VMHandle",
+                "docstring": "Spawn QEMU with -serial file: redirecting the UART straight to serial_path.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_launch_firecracker",
+                "parameters": [
+                  [
+                    "config",
+                    "VMConfig"
+                  ]
+                ],
+                "return_type": "VMHandle",
+                "docstring": "Spawn Firecracker via --no-api with a generated JSON config. Redirects stdout to serial_path (Firecracker has no equivalent of -serial file:) and diverts VMM logger lines to a sibling .fc-log so the serial stream stays mostly clean.",
+                "preconditions": [
+                  "/dev/kvm is available"
+                ],
+                "postconditions": []
+              },
+              {
+                "name": "_firecracker_log_path",
+                "parameters": [
+                  [
+                    "serial_path",
+                    "str"
+                  ]
+                ],
+                "return_type": "str",
+                "docstring": "Co-located VMM log path: serial_path + '.fc-log'.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_firecracker_config_path",
+                "parameters": [
+                  [
+                    "serial_path",
+                    "str"
+                  ]
+                ],
+                "return_type": "str",
+                "docstring": "Co-located JSON config path: serial_path + '.fc-config.json'.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_firecracker_vm_id",
+                "parameters": [
+                  [
+                    "serial_path",
+                    "str"
+                  ]
+                ],
+                "return_type": "str",
+                "docstring": "Derive a stable per-launch microVM id from Path(serial_path).stem. Tests use unique tmpdirs so the stem is unique per test.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_firecracker_config_dict",
+                "parameters": [
+                  [
+                    "config",
+                    "VMConfig"
+                  ]
+                ],
+                "return_type": "dict[str, Any]",
+                "docstring": "Build the JSON config Firecracker expects. drives is empty (no rootfs needed for diagnostic boots), logger is set to a sibling .fc-log file.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_firecracker_args",
+                "parameters": [
+                  [
+                    "config_path",
+                    "str"
+                  ],
+                  [
+                    "vm_id",
+                    "str"
+                  ]
+                ],
+                "return_type": "list[str]",
+                "docstring": "Build the firecracker --no-api command line: [firecracker, --no-api, --config-file <path>, --id <vm_id>].",
+                "preconditions": [],
+                "postconditions": []
               },
               {
                 "name": "wait_for_ready",
@@ -522,12 +619,12 @@
               "logging",
               "os"
             ],
-            "test_strategy": "Unit test with mock subprocess. Autouse fixture clears _proc_registry before/after each test. Tests verify: launch registers Popen, stderr captured to file, serial truncated on launch, path traversal rejected, blocked args rejected, platform Literal validated, marker found/timeout in wait_for_ready, kill via Popen vs bare PID fallback, waitpid reaps zombies. Random test order verified via pytest-randomly.",
+            "test_strategy": "Unit test with mock subprocess. Autouse fixture clears _proc_registry before/after each test. Tests verify: qemu launch registers Popen, stderr captured to file, serial truncated on launch, path traversal rejected, blocked args rejected, platform Literal validated, marker found/timeout in wait_for_ready, kill via Popen vs bare PID fallback, waitpid reaps zombies. Firecracker tests verify --no-api command shape, JSON config file materializes with correct fields (drives, logger, boot-source), config/log/stderr files all created on disk, no-kvm raises RuntimeError. Helper tests cover the path-derivation functions. Random test order verified via pytest-randomly.",
             "status": "not_started"
           },
           {
             "name": "guest_builder",
-            "responsibility": "Assemble and link guest images using GNU as cross-toolchains and GNU ld. Selects the correct toolchain based on target arch. Returns the path to the built binary.",
+            "responsibility": "Assemble and link guest images using GNU as cross-toolchains and GNU ld. Selects the correct toolchain based on (arch, platform) -- ELF class depends on boot protocol: x86_64 qemu uses Multiboot1 (ELF32), x86_64 firecracker uses PVH (ELF64). Returns the path to the built binary.",
             "classes": [],
             "functions": [
               {
@@ -561,15 +658,19 @@
                 ]
               },
               {
-                "name": "toolchain_for_arch",
+                "name": "toolchain_for",
                 "parameters": [
                   [
                     "arch",
                     "str"
+                  ],
+                  [
+                    "platform",
+                    "str"
                   ]
                 ],
-                "return_type": "tuple[str, str]",
-                "docstring": "Return (assembler, linker) binary names for the target arch.",
+                "return_type": "Toolchain",
+                "docstring": "Return the Toolchain (assembler, linker, as_flags, ld_flags) for the (arch, platform) target. Raises ValueError on unsupported combinations.",
                 "preconditions": [],
                 "postconditions": []
               }
@@ -578,7 +679,7 @@
               "subprocess",
               "pathlib"
             ],
-            "test_strategy": "Unit test toolchain_for_arch with known arches. Functional test build_guest with a minimal .S file that assembles and links successfully. Test missing-toolchain path by mocking subprocess.run to raise FileNotFoundError.",
+            "test_strategy": "Unit test toolchain_for with all supported (arch, platform) combos plus rejection cases. Functional test build_guest with a minimal .S file that assembles and links successfully. Test missing-toolchain path by mocking subprocess.run to raise FileNotFoundError.",
             "status": "not_started"
           },
           {
@@ -812,11 +913,11 @@
         ],
         "open_questions": []
       },
-      "created_at": "2026-04-11T01:39:19.039010+00:00",
+      "created_at": "2026-04-11T16:11:19.075340+00:00",
       "label": "post-review-v2",
-      "integrity_hash": "26d37503bf5dafd4cb84e1768869432d52a8404958a4ac7d5c8262d5ff09a238"
+      "integrity_hash": "5f3cc55f3685b402ae6969c0fae27e185df8b7e20235e9c9cce6f1e884eb3cba"
     }
   ],
   "edges": [],
-  "current_node_id": "277081e0-f43b-4e40-8591-a6551e8b2786"
+  "current_node_id": "1a78f95a-86c4-40da-a032-0c60dd4dfc15"
 }

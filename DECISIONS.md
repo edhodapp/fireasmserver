@@ -134,8 +134,41 @@ serves what's on the disk.
 - Fly.io (major Firecracker hosting platform) charges $0.08/GB/month for
   storage; a typical static site fits in the 10GB free tier.
 
+### D020: PVH boot protocol for Firecracker (x86_64) — confirmed
+**Decision:** Firecracker x86_64 guests boot via the PVH (Xen Para-Virtualized
+Hardware) protocol. The guest ELF carries an `XEN_ELFNOTE_PHYS32_ENTRY` (type
+18) note in a `PT_NOTE` program header pointing at a 32-bit protected-mode
+entry. Linker emits both `PT_LOAD` (containing `.note.Xen` and `.text`) and
+`PT_NOTE` (referencing `.note.Xen`) program headers.
+
+**Justification:**
+- D014 already committed to PVH for Firecracker; this entry locks in the
+  concrete implementation now that the boot stub boots and writes "READY" to
+  COM1 in ~5 ms after VMM startup.
+- Firecracker's `linux-loader` accepts ELF binaries with PVH notes or Linux
+  bzImages. PVH ELF is the path of least resistance for assembly guests:
+  no Linux header struct, no real-mode entry, no boot params marshalling.
+- The same `.code32` entry instructions work under both QEMU `-machine pc`
+  (Multiboot1, ELF32) and Firecracker (PVH, ELF64). Only the ELF class and
+  the loader-discovered entry note differ. The instruction stream is
+  unchanged.
+- ELF class is now a function of `(arch, platform)`: x86_64 qemu uses ELF32
+  via `--32 -m elf_i386`; x86_64 firecracker uses ELF64 via the default
+  `as`/`ld` flags. The Toolchain selector in `guest_builder.toolchain_for`
+  encodes this.
+- The 8250 UART at 0x3F8 (COM1) is identical between QEMU `-machine pc`
+  and Firecracker — the serial diagnostics path is unified across both
+  platforms with no per-platform `out` instruction differences.
+
+**Reference implementation:**
+- `arch/x86_64/platform/firecracker/boot.S` — PVH note + READY stub
+- `arch/x86_64/platform/firecracker/linker.ld` — PHDRS with PT_LOAD + PT_NOTE
+- `arch/x86_64/Makefile` — `PLATFORM=firecracker` builds ELF64
+- `tooling/src/qemu_harness/vm_launcher.py:_launch_firecracker` — JSON config
+  generation, `--no-api` invocation, stdout-to-serial redirection, VMM logger
+  diverted to a sibling `.fc-log` file
+
 ## Future decisions (not yet made)
-- PVH boot protocol for Firecracker
 - virtio-net driver design
 - TCP state machine implementation
 - HTTP parser design
