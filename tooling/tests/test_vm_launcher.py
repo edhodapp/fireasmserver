@@ -132,6 +132,7 @@ class TestLaunchVm:
         assert handle.serial_path == serial
         assert handle.stderr_path == serial + ".stderr"
         mock_popen.assert_called_once()
+        _unregister_proc(12345)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_stderr_captured_to_file(
@@ -149,7 +150,6 @@ class TestLaunchVm:
         call_kwargs = mock_popen.call_args[1]
         assert call_kwargs["stderr"] is not subprocess.DEVNULL
         _unregister_proc(22222)
-        _unregister_proc(12345)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_truncates_serial_on_launch(
@@ -218,8 +218,7 @@ class TestWaitForReady:
 
     def test_marker_found(self, tmp_path: object) -> None:
         serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
-        from pathlib import Path
-        Path(serial).write_text("booting...\nREADY\n")
+        Path(serial).write_bytes(b"booting...\nREADY\n")
         handle = VMHandle(
             pid=1, serial_path=serial, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
@@ -228,8 +227,7 @@ class TestWaitForReady:
 
     def test_timeout(self, tmp_path: object) -> None:
         serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
-        from pathlib import Path
-        Path(serial).write_text("booting...")
+        Path(serial).write_bytes(b"booting...")
         handle = VMHandle(
             pid=1, serial_path=serial, stderr_path="/s.err",
             arch="x86_64", platform="qemu",

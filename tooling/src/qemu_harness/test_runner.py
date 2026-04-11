@@ -65,7 +65,8 @@ def check_serial(
     expected: str,
 ) -> TestResult:
     """Check serial output file for expected content."""
-    content = Path(serial_path).read_text()
+    raw = Path(serial_path).read_bytes()
+    content = raw.decode(errors="replace")
     passed = expected in content
     return TestResult(
         name="serial_check",

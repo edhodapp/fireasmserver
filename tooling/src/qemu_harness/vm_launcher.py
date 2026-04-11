@@ -127,14 +127,20 @@ def wait_for_ready(
 ) -> bool:
     """Poll serial output until marker appears or timeout.
 
+    Opens the file once, reads incrementally in binary mode.
     Returns True if ready, False if timed out.
     """
+    marker_bytes = marker.encode()
     deadline = time.monotonic() + timeout_sec
-    while time.monotonic() < deadline:
-        content = Path(handle.serial_path).read_text()
-        if marker in content:
-            return True
-        time.sleep(0.05)
+    with open(handle.serial_path, "rb") as f:
+        buf = b""
+        while time.monotonic() < deadline:
+            chunk = f.read()
+            if chunk:
+                buf += chunk
+                if marker_bytes in buf:
+                    return True
+            time.sleep(0.05)
     return False
 
 
