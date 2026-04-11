@@ -75,6 +75,32 @@ class TestQemuArgs:
         assert "128" in args
 
 
+class TestPlatformValidation:
+    """Tests for Platform Literal validation."""
+
+    def test_valid_qemu(self) -> None:
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="qemu", serial_path="/s",
+        )
+        assert config.platform == "qemu"
+
+    def test_valid_firecracker(self) -> None:
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="firecracker", serial_path="/s",
+        )
+        assert config.platform == "firecracker"
+
+    def test_invalid_rejects(self) -> None:
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="docker", serial_path="/s",
+            )
+
+
 class TestHasKvm:
     """Tests for has_kvm()."""
 

@@ -6,8 +6,11 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel
+
+Platform = Literal["qemu", "firecracker"]
 
 # Registry of Popen objects keyed by PID.
 # Popen is not Pydantic-serializable, so VMHandle stays
@@ -36,7 +39,7 @@ class VMConfig(BaseModel):
 
     image_path: str
     arch: str
-    platform: str
+    platform: Platform
     serial_path: str
     extra_args: list[str] = []
 
@@ -48,7 +51,7 @@ class VMHandle(BaseModel):
     serial_path: str
     stderr_path: str
     arch: str
-    platform: str
+    platform: Platform
 
 
 def _qemu_binary(arch: str) -> str:
