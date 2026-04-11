@@ -178,16 +178,21 @@ def wait_for_ready(
         "Waiting for marker '%s' (timeout=%.1fs)", marker, timeout_sec,
     )
     marker_bytes = marker.encode()
+    marker_len = len(marker_bytes)
     deadline = time.monotonic() + timeout_sec
     with open(handle.serial_path, "rb") as f:
-        buf = bytearray()
+        tail = b""
         while time.monotonic() < deadline:
             chunk = f.read()
             if chunk:
-                buf.extend(chunk)
-                if marker_bytes in buf:
+                window = tail + chunk
+                if marker_bytes in window:
                     log.info("Marker '%s' found", marker)
                     return True
+                if len(window) >= marker_len:
+                    tail = window[-marker_len:]
+                else:
+                    tail = window
             time.sleep(0.05)
     log.warning("Timeout waiting for marker '%s'", marker)
     return False
