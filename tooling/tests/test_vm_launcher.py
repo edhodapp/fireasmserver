@@ -12,16 +12,24 @@ from qemu_harness.vm_launcher import (
     _get_proc,
     _kill_via_pid,
     _kill_via_proc,
+    _proc_registry,
     _qemu_args,
     _qemu_binary,
     _register_proc,
     _try_waitpid,
-    _unregister_proc,
     has_kvm,
     kill_vm,
     launch_vm,
     wait_for_ready,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry():  # type: ignore[no-untyped-def]
+    """Clear the proc registry before and after each test."""
+    _proc_registry.clear()
+    yield
+    _proc_registry.clear()
 
 
 class TestQemuBinary:
@@ -200,17 +208,14 @@ class TestProcRegistry:
         proc = MagicMock(pid=99999)
         _register_proc(proc)
         assert _get_proc(99999) is proc
-        _unregister_proc(99999)
 
     def test_get_missing(self) -> None:
         assert _get_proc(88888) is None
 
-    def test_unregister_missing(self) -> None:
-        _unregister_proc(77777)
-
     def test_unregister_cleans_up(self) -> None:
         proc = MagicMock(pid=66666)
         _register_proc(proc)
+        from qemu_harness.vm_launcher import _unregister_proc
         _unregister_proc(66666)
         assert _get_proc(66666) is None
 
@@ -220,9 +225,9 @@ class TestLaunchVm:
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_qemu_launch(
-        self, mock_popen: MagicMock, tmp_path: object,
+        self, mock_popen: MagicMock, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        serial = str(tmp_path / "serial.log")
         mock_proc = MagicMock(pid=12345)
         mock_popen.return_value = mock_proc
         config = VMConfig(
@@ -234,13 +239,12 @@ class TestLaunchVm:
         assert handle.serial_path == serial
         assert handle.stderr_path == serial + ".stderr"
         mock_popen.assert_called_once()
-        _unregister_proc(12345)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_stderr_captured_to_file(
-        self, mock_popen: MagicMock, tmp_path: object,
+        self, mock_popen: MagicMock, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        serial = str(tmp_path / "serial.log")
         mock_proc = MagicMock(pid=22222)
         mock_popen.return_value = mock_proc
         config = VMConfig(
@@ -251,13 +255,12 @@ class TestLaunchVm:
         assert Path(handle.stderr_path).exists()
         call_kwargs = mock_popen.call_args[1]
         assert call_kwargs["stderr"] is not subprocess.DEVNULL
-        _unregister_proc(22222)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_truncates_serial_on_launch(
-        self, mock_popen: MagicMock, tmp_path: object,
+        self, mock_popen: MagicMock, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        serial = str(tmp_path / "serial.log")
         Path(serial).write_text("STALE READY MARKER")
         mock_proc = MagicMock(pid=33333)
         mock_popen.return_value = mock_proc
@@ -267,13 +270,12 @@ class TestLaunchVm:
         )
         launch_vm(config)
         assert Path(serial).read_text() == ""
-        _unregister_proc(33333)
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_registers_proc(
-        self, mock_popen: MagicMock, tmp_path: object,
+        self, mock_popen: MagicMock, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        serial = str(tmp_path / "serial.log")
         mock_proc = MagicMock(pid=11111)
         mock_popen.return_value = mock_proc
         config = VMConfig(
@@ -282,12 +284,11 @@ class TestLaunchVm:
         )
         launch_vm(config)
         assert _get_proc(11111) is mock_proc
-        _unregister_proc(11111)
 
     def test_firecracker_no_kvm_raises(
-        self, tmp_path: object,
+        self, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        serial = str(tmp_path / "serial.log")
         config = VMConfig(
             image_path="/img", arch="x86_64",
             platform="firecracker", serial_path=serial,
@@ -300,9 +301,9 @@ class TestLaunchVm:
                 launch_vm(config)
 
     def test_firecracker_with_kvm_not_implemented(
-        self, tmp_path: object,
+        self, tmp_path: Path,
     ) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+        serial = str(tmp_path / "serial.log")
         config = VMConfig(
             image_path="/img", arch="x86_64",
             platform="firecracker", serial_path=serial,
@@ -318,8 +319,8 @@ class TestLaunchVm:
 class TestWaitForReady:
     """Tests for wait_for_ready()."""
 
-    def test_marker_found(self, tmp_path: object) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+    def test_marker_found(self, tmp_path: Path) -> None:
+        serial = str(tmp_path / "serial.log")
         Path(serial).write_bytes(b"booting...\nREADY\n")
         handle = VMHandle(
             pid=1, serial_path=serial, stderr_path="/s.err",
@@ -327,8 +328,8 @@ class TestWaitForReady:
         )
         assert wait_for_ready(handle, "READY", 1.0) is True
 
-    def test_timeout(self, tmp_path: object) -> None:
-        serial = str(tmp_path) + "/serial.log"  # type: ignore[operator]
+    def test_timeout(self, tmp_path: Path) -> None:
+        serial = str(tmp_path / "serial.log")
         Path(serial).write_bytes(b"booting...")
         handle = VMHandle(
             pid=1, serial_path=serial, stderr_path="/s.err",
