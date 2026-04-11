@@ -353,12 +353,20 @@ def _signal_pid(pid: int, sig: int) -> bool:
 
 
 def _try_waitpid(pid: int) -> bool:
-    """Try to reap a child process. Return True if reaped."""
+    """Try to reap a child process. Return True if reaped.
+
+    Returns False for the "not a child of ours" case
+    (ChildProcessError) so the caller can fall through to a
+    signal-based existence check via _signal_pid(pid, 0). The
+    previous "True on ChildProcessError" behavior caused
+    _poll_pid_exit to declare orphaned PIDs exited without
+    actually checking.
+    """
     try:
         result, _ = os.waitpid(pid, os.WNOHANG)
         return result != 0
     except ChildProcessError:
-        return True
+        return False
 
 
 def _poll_pid_exit(pid: int, timeout: float) -> bool:

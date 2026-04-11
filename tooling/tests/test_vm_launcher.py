@@ -507,9 +507,14 @@ class TestTryWaitpid:
         assert _try_waitpid(123) is False
 
     @patch("qemu_harness.vm_launcher.os.waitpid")
-    def test_not_child(self, mock_wait: MagicMock) -> None:
+    def test_not_child_returns_false(
+        self, mock_wait: MagicMock,
+    ) -> None:
+        # Non-child PIDs cannot be reaped via waitpid; the
+        # caller must fall through to a signal-based check
+        # rather than assume "not waitable" means "exited."
         mock_wait.side_effect = ChildProcessError
-        assert _try_waitpid(123) is True
+        assert _try_waitpid(123) is False
 
 
 class TestKillViaPid:
