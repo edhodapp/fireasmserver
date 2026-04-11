@@ -1,5 +1,6 @@
 """Tests for cli module."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -55,8 +56,8 @@ class TestParseArgs:
 class TestLoadSuite:
     """Tests for _load_suite()."""
 
-    def test_valid_json(self, tmp_path: object) -> None:
-        p = tmp_path / "suite.json"  # type: ignore[operator]
+    def test_valid_json(self, tmp_path: Path) -> None:
+        p = tmp_path / "suite.json"
         p.write_text(
             '{"arch":"x86_64","platform":"qemu",'
             '"source_dir":"/src","cases":[]}'
@@ -64,8 +65,8 @@ class TestLoadSuite:
         suite = _load_suite(str(p))
         assert suite.arch == "x86_64"
 
-    def test_invalid_json(self, tmp_path: object) -> None:
-        p = tmp_path / "bad.json"  # type: ignore[operator]
+    def test_invalid_json(self, tmp_path: Path) -> None:
+        p = tmp_path / "bad.json"
         p.write_text("not json")
         with pytest.raises(Exception):
             _load_suite(str(p))
@@ -74,17 +75,17 @@ class TestLoadSuite:
 class TestPrintResult:
     """Tests for _print_result()."""
 
-    def test_all_pass(self, capsys: object) -> None:
+    def test_all_pass(self, capsys: pytest.CaptureFixture[str]) -> None:
         sr = SuiteResult(
             arch="x86_64", platform="qemu",
             results=[TestResult(name="t1", passed=True)],
         )
         _print_result(sr)
-        out = capsys.readouterr().out  # type: ignore[union-attr]
+        out = capsys.readouterr().out
         assert "PASS" in out
         assert "ALL PASSED" in out
 
-    def test_failure(self, capsys: object) -> None:
+    def test_failure(self, capsys: pytest.CaptureFixture[str]) -> None:
         sr = SuiteResult(
             arch="x86_64", platform="qemu",
             results=[TestResult(
@@ -92,7 +93,7 @@ class TestPrintResult:
             )],
         )
         _print_result(sr)
-        out = capsys.readouterr().out  # type: ignore[union-attr]
+        out = capsys.readouterr().out
         assert "FAIL" in out
         assert "bad" in out
 

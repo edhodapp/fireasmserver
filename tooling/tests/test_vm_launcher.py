@@ -5,8 +5,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from qemu_harness.vm_launcher import (
+    _unregister_proc,
     VMConfig,
     VMHandle,
     _get_proc,
@@ -61,7 +63,7 @@ class TestQemuArgs:
         assert "file:/serial" in args
         assert "-machine" in args
         idx = args.index("-machine")
-        assert args[idx + 1] == "microvm"
+        assert args[idx + 1] == "pc"
 
     def test_aarch64_args(self) -> None:
         config = VMConfig(
@@ -96,7 +98,6 @@ class TestExtraArgsValidation:
         assert config.extra_args == ["-m", "128", "-smp", "2"]
 
     def test_monitor_blocked(self) -> None:
-        from pydantic import ValidationError
         with pytest.raises(ValidationError, match="Blocked"):
             VMConfig(
                 image_path="/img", arch="x86_64",
@@ -105,7 +106,6 @@ class TestExtraArgsValidation:
             )
 
     def test_vnc_blocked(self) -> None:
-        from pydantic import ValidationError
         with pytest.raises(ValidationError, match="Blocked"):
             VMConfig(
                 image_path="/img", arch="x86_64",
@@ -114,7 +114,6 @@ class TestExtraArgsValidation:
             )
 
     def test_chardev_blocked(self) -> None:
-        from pydantic import ValidationError
         with pytest.raises(ValidationError, match="Blocked"):
             VMConfig(
                 image_path="/img", arch="x86_64",
@@ -134,7 +133,6 @@ class TestPathValidation:
         assert "guest.elf" in config.image_path
 
     def test_image_path_traversal_rejected(self) -> None:
-        from pydantic import ValidationError
         with pytest.raises(ValidationError, match="traversal"):
             VMConfig(
                 image_path="/tmp/../etc/shadow", arch="x86_64",
@@ -142,7 +140,6 @@ class TestPathValidation:
             )
 
     def test_serial_path_traversal_rejected(self) -> None:
-        from pydantic import ValidationError
         with pytest.raises(ValidationError, match="traversal"):
             VMConfig(
                 image_path="/tmp/guest.elf", arch="x86_64",
@@ -177,11 +174,10 @@ class TestPlatformValidation:
         assert config.platform == "firecracker"
 
     def test_invalid_rejects(self) -> None:
-        from pydantic import ValidationError
         with pytest.raises(ValidationError):
             VMConfig(
                 image_path="/img", arch="x86_64",
-                platform="docker", serial_path="/s",
+                platform="docker", serial_path="/s",  # type: ignore[arg-type]
             )
 
 
@@ -215,7 +211,6 @@ class TestProcRegistry:
     def test_unregister_cleans_up(self) -> None:
         proc = MagicMock(pid=66666)
         _register_proc(proc)
-        from qemu_harness.vm_launcher import _unregister_proc
         _unregister_proc(66666)
         assert _get_proc(66666) is None
 
@@ -261,7 +256,7 @@ class TestLaunchVm:
         self, mock_popen: MagicMock, tmp_path: Path,
     ) -> None:
         serial = str(tmp_path / "serial.log")
-        Path(serial).write_text("STALE READY MARKER")
+        Path(serial).write_text("STALE READY MARKER", encoding="utf-8")
         mock_proc = MagicMock(pid=33333)
         mock_popen.return_value = mock_proc
         config = VMConfig(
@@ -269,7 +264,8 @@ class TestLaunchVm:
             platform="qemu", serial_path=serial,
         )
         launch_vm(config)
-        assert Path(serial).read_text() == ""
+        content = Path(serial).read_text(encoding="utf-8")
+        assert content == ""
 
     @patch("qemu_harness.vm_launcher.subprocess.Popen")
     def test_registers_proc(
@@ -387,8 +383,9 @@ class TestKillViaPid:
     @patch("qemu_harness.vm_launcher.os.kill")
     def test_already_dead(
         self, mock_kill: MagicMock,
-        mock_wait: MagicMock,
+        mock_wait_unused: MagicMock,
     ) -> None:
+        del mock_wait_unused
         mock_kill.side_effect = ProcessLookupError
         _kill_via_pid(1)
         mock_kill.assert_called_once_with(1, 15)
@@ -400,9 +397,10 @@ class TestKillViaPid:
     def test_exits_after_sigterm(
         self, mock_kill: MagicMock,
         mock_time: MagicMock,
-        mock_sleep: MagicMock,
+        mock_sleep_unused: MagicMock,
         mock_wait: MagicMock,
     ) -> None:
+        del mock_sleep_unused
         mock_wait.return_value = True
         mock_kill.return_value = None
         mock_time.side_effect = [0.0, 0.0]

@@ -1,5 +1,7 @@
 """Tests for test_runner module."""
 
+import subprocess
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -22,15 +24,15 @@ from qemu_harness.vm_launcher import VMHandle
 class TestCheckSerial:
     """Tests for check_serial()."""
 
-    def test_found(self, tmp_path: object) -> None:
-        p = str(tmp_path) + "/serial.log"  # type: ignore[operator]
-        Path(p).write_text("boot OK\nREADY\n")
+    def test_found(self, tmp_path: Path) -> None:
+        p = str(tmp_path / "serial.log")
+        Path(p).write_text("boot OK\nREADY\n", encoding="utf-8")
         r = check_serial(p, "READY")
         assert r.passed is True
 
-    def test_not_found(self, tmp_path: object) -> None:
-        p = str(tmp_path) + "/serial.log"  # type: ignore[operator]
-        Path(p).write_text("boot OK\n")
+    def test_not_found(self, tmp_path: Path) -> None:
+        p = str(tmp_path / "serial.log")
+        Path(p).write_text("boot OK\n", encoding="utf-8")
         r = check_serial(p, "READY")
         assert r.passed is False
         assert "not found" in r.message
@@ -76,7 +78,6 @@ class TestCheckHttp:
     def test_url_error(
         self, mock_open: MagicMock,
     ) -> None:
-        import urllib.error
         mock_open.side_effect = urllib.error.URLError("DNS")
         r = check_http("localhost", 8080, "Hello")
         assert r.passed is False
@@ -86,9 +87,9 @@ class TestCheckHttp:
 class TestRunCase:
     """Tests for _run_case()."""
 
-    def test_serial_check(self, tmp_path: object) -> None:
-        p = str(tmp_path) + "/serial.log"  # type: ignore[operator]
-        Path(p).write_text("READY")
+    def test_serial_check(self, tmp_path: Path) -> None:
+        p = str(tmp_path / "serial.log")
+        Path(p).write_text("READY", encoding="utf-8")
         handle = VMHandle(
             pid=1, serial_path=p, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
@@ -180,7 +181,6 @@ class TestBuildImage:
     def test_called_process_error(
         self, mock_build: MagicMock,
     ) -> None:
-        import subprocess
         mock_build.side_effect = subprocess.CalledProcessError(
             1, "as",
         )
@@ -216,11 +216,11 @@ class TestBootAndTest:
 
     @patch("qemu_harness.test_runner.wait_for_ready")
     def test_runs_cases(
-        self, mock_wait: MagicMock, tmp_path: object,
+        self, mock_wait: MagicMock, tmp_path: Path,
     ) -> None:
         mock_wait.return_value = True
-        p = str(tmp_path) + "/serial.log"  # type: ignore[operator]
-        Path(p).write_text("READY")
+        p = str(tmp_path / "serial.log")
+        Path(p).write_text("READY", encoding="utf-8")
         handle = VMHandle(
             pid=1, serial_path=p, stderr_path="/s.err",
             arch="x86_64", platform="qemu",
@@ -305,11 +305,11 @@ class TestRunSuite:
         mock_launch: MagicMock,
         mock_wait: MagicMock,
         mock_kill: MagicMock,
-        tmp_path: object,
+        tmp_path: Path,
     ) -> None:
         mock_build.return_value = Path("/img")
-        serial = str(tmp_path) + "/s.log"  # type: ignore[operator]
-        Path(serial).write_text("READY")
+        serial = str(tmp_path / "s.log")
+        Path(serial).write_text("READY", encoding="utf-8")
         mock_launch.return_value = VMHandle(
             pid=1, serial_path=serial, stderr_path="/s.err",
             arch="x86_64", platform="qemu",

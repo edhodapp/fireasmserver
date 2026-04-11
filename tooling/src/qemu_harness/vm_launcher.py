@@ -120,7 +120,7 @@ def _qemu_args(config: VMConfig) -> list[str]:
         "-kernel", config.image_path,
     ]
     if config.arch == "x86_64":
-        args.extend(["-machine", "microvm"])
+        args.extend(["-machine", "pc"])
     elif config.arch == "aarch64":
         args.extend(["-machine", "virt", "-cpu", "cortex-a76"])
     args.extend(config.extra_args)
