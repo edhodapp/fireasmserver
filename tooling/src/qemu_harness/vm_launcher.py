@@ -147,13 +147,12 @@ def launch_vm(config: VMConfig) -> VMHandle:
     stderr_path = config.serial_path + ".stderr"
     Path(stderr_path).write_bytes(b"")
     args = _qemu_args(config)
-    stderr_file = open(stderr_path, "w")  # noqa: SIM115
-    proc = subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=stderr_file,
-    )
-    stderr_file.close()
+    with open(stderr_path, "w", encoding="utf-8") as stderr_file:
+        proc = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_file,
+        )
     _register_proc(proc)
     log.info("VM launched, pid=%d", proc.pid)
     return VMHandle(
