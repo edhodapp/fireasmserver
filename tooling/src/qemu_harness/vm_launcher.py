@@ -79,11 +79,29 @@ class VMConfig(BaseModel):
     def no_blocked_args(
         cls, v: list[str],
     ) -> list[str]:
-        """Reject QEMU flags that could open services."""
+        """Reject QEMU flags that could open services.
+
+        QEMU accepts both space-separated (-vnc :0) and
+        '='-attached (-vnc=:0) forms; the validator must catch
+        both. Some QEMU builds also accept the long-option
+        '--vnc=:0' form, which we normalize to single-dash
+        before checking. We deliberately do NOT do a generic
+        prefix match (-vncfoo would falsely trip).
+
+        This is a blocklist, not an allowlist -- it does NOT
+        cover -object/-global/-readconfig backdoors that can
+        instantiate the same dangerous backends without naming
+        the blocked top-level flag. Tracked as a follow-up.
+        """
         for arg in v:
-            if arg in _BLOCKED_ARGS:
+            normalized = arg[1:] if arg.startswith("--") else arg
+            if normalized in _BLOCKED_ARGS:
                 msg = f"Blocked QEMU argument: {arg}"
                 raise ValueError(msg)
+            for blocked in _BLOCKED_ARGS:
+                if normalized.startswith(blocked + "="):
+                    msg = f"Blocked QEMU argument: {arg}"
+                    raise ValueError(msg)
         return v
 
     @model_validator(mode="after")

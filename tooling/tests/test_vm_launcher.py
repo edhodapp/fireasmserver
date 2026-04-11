@@ -128,6 +128,60 @@ class TestExtraArgsValidation:
                 extra_args=["-chardev", "socket,id=foo"],
             )
 
+    def test_vnc_equals_form_blocked(self) -> None:
+        # The '='-attached form (-vnc=:0) must also be rejected
+        # alongside the space-separated form (-vnc :0).
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["-vnc=:0"],
+            )
+
+    def test_monitor_equals_form_blocked(self) -> None:
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["-monitor=stdio"],
+            )
+
+    def test_netdev_equals_form_blocked(self) -> None:
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["-netdev=user,id=net0"],
+            )
+
+    def test_lookalike_prefix_not_blocked(self) -> None:
+        # -vncfoo is not -vnc; we deliberately don't prefix-match
+        # without the '=' separator.
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="qemu", serial_path="/s",
+            extra_args=["-vncfoo"],
+        )
+        assert config.extra_args == ["-vncfoo"]
+
+    def test_long_option_double_dash_form_blocked(self) -> None:
+        # Some QEMU builds accept --vnc=:0 as an alias for the
+        # single-dash form. Normalize and reject.
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["--vnc=:0"],
+            )
+
+    def test_long_option_double_dash_space_form_blocked(self) -> None:
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["--monitor", "stdio"],
+            )
+
     def test_extra_args_rejected_on_firecracker(self) -> None:
         with pytest.raises(ValidationError, match="qemu-only"):
             VMConfig(
