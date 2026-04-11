@@ -3,6 +3,9 @@
 Chronological record of design decisions for fireasmserver.
 Each entry captures: the decision, the justification, and the date/time.
 Entries are numbered sequentially (D001, D002, ...) and never renumbered.
+**Entries are immutable.** If a decision is revised or reversed, add a new
+entry that references the original (e.g., "Supersedes D003"). Never edit
+or delete a prior entry — the log is a historical record.
 Review this log before making new decisions to avoid re-litigating settled questions.
 
 ## 2026-04-09
