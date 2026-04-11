@@ -75,6 +75,45 @@ class TestQemuArgs:
         assert "128" in args
 
 
+class TestExtraArgsValidation:
+    """Tests for blocked QEMU argument validation."""
+
+    def test_safe_args_accepted(self) -> None:
+        config = VMConfig(
+            image_path="/img", arch="x86_64",
+            platform="qemu", serial_path="/s",
+            extra_args=["-m", "128", "-smp", "2"],
+        )
+        assert config.extra_args == ["-m", "128", "-smp", "2"]
+
+    def test_monitor_blocked(self) -> None:
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["-monitor", "tcp::4444"],
+            )
+
+    def test_vnc_blocked(self) -> None:
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["-vnc", ":0"],
+            )
+
+    def test_chardev_blocked(self) -> None:
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="Blocked"):
+            VMConfig(
+                image_path="/img", arch="x86_64",
+                platform="qemu", serial_path="/s",
+                extra_args=["-chardev", "socket,id=foo"],
+            )
+
+
 class TestPathValidation:
     """Tests for path traversal rejection."""
 

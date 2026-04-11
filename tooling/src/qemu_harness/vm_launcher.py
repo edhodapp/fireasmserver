@@ -21,6 +21,13 @@ def _reject_traversal(path: str) -> str:
     return str(Path(path).resolve())
 
 
+# QEMU flags that could open network services or escape the VM.
+_BLOCKED_ARGS = frozenset({
+    "-monitor", "-vnc", "-chardev",
+    "-netdev", "-nic", "-spice",
+})
+
+
 # Registry of Popen objects keyed by PID.
 # Popen is not Pydantic-serializable, so VMHandle stays
 # as a BaseModel with bare pid, and we look up the Popen
@@ -57,6 +64,18 @@ class VMConfig(BaseModel):
     def no_traversal(cls, v: str) -> str:
         """Reject path traversal in file paths."""
         return _reject_traversal(v)
+
+    @field_validator("extra_args")
+    @classmethod
+    def no_blocked_args(
+        cls, v: list[str],
+    ) -> list[str]:
+        """Reject QEMU flags that could open services."""
+        for arg in v:
+            if arg in _BLOCKED_ARGS:
+                msg = f"Blocked QEMU argument: {arg}"
+                raise ValueError(msg)
+        return v
 
 
 class VMHandle(BaseModel):
