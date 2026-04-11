@@ -188,7 +188,7 @@ def wait_for_ready(
     with open(handle.serial_path, "rb") as f:
         tail = b""
         while time.monotonic() < deadline:
-            chunk = f.read()
+            chunk = f.read(4096)
             if chunk:
                 window = tail + chunk
                 if marker_bytes in window:
