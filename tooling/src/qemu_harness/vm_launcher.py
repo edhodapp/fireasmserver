@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import time
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, field_validator
+
+log = logging.getLogger(__name__)
 
 Platform = Literal["qemu", "firecracker"]
 
@@ -130,6 +133,10 @@ def launch_vm(config: VMConfig) -> VMHandle:
     Returns a handle with pid and serial output path.
     Does not block -- caller must poll for readiness.
     """
+    log.info(
+        "Launching %s/%s: %s",
+        config.arch, config.platform, config.image_path,
+    )
     Path(config.serial_path).write_bytes(b"")
     if config.platform == "firecracker":
         if not has_kvm():
@@ -148,6 +155,7 @@ def launch_vm(config: VMConfig) -> VMHandle:
     )
     stderr_file.close()
     _register_proc(proc)
+    log.info("VM launched, pid=%d", proc.pid)
     return VMHandle(
         pid=proc.pid,
         serial_path=config.serial_path,
@@ -167,6 +175,9 @@ def wait_for_ready(
     Opens the file once, reads incrementally in binary mode.
     Returns True if ready, False if timed out.
     """
+    log.debug(
+        "Waiting for marker '%s' (timeout=%.1fs)", marker, timeout_sec,
+    )
     marker_bytes = marker.encode()
     deadline = time.monotonic() + timeout_sec
     with open(handle.serial_path, "rb") as f:
@@ -176,8 +187,10 @@ def wait_for_ready(
             if chunk:
                 buf += chunk
                 if marker_bytes in buf:
+                    log.info("Marker '%s' found", marker)
                     return True
             time.sleep(0.05)
+    log.warning("Timeout waiting for marker '%s'", marker)
     return False
 
 
@@ -228,9 +241,12 @@ def kill_vm(handle: VMHandle) -> None:
     recycling), falls back to bare PID signals.
     Reaps the child process to prevent zombies.
     """
+    log.info("Killing VM pid=%d", handle.pid)
     proc = _get_proc(handle.pid)
     if proc is not None:
         _kill_via_proc(proc)
         _unregister_proc(handle.pid)
+        log.info("VM pid=%d terminated via Popen", handle.pid)
     else:
+        log.warning("No Popen for pid=%d, using bare PID", handle.pid)
         _kill_via_pid(handle.pid)
