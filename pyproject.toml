@@ -38,4 +38,4 @@ testpaths = ["tooling/tests"]
 pythonpath = ["tooling/src"]
 
 [tool.pylint.main]
-rcfile = "~/.claude/pylintrc"
+rcfile = ".pylintrc"
