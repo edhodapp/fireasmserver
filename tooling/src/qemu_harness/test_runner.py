@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -9,6 +11,7 @@ from pydantic import BaseModel
 
 from qemu_harness.guest_builder import build_guest
 from qemu_harness.vm_launcher import (
+    Platform,
     VMConfig,
     VMHandle,
     has_kvm,
@@ -40,7 +43,7 @@ class TestSuite(BaseModel):
     """Collection of test cases for a target."""
 
     arch: str
-    platform: str
+    platform: Platform
     source_dir: str
     ready_marker: str = "READY"
     boot_timeout: float = 10.0
@@ -88,7 +91,7 @@ def check_http(
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
             body = resp.read().decode()
-    except Exception as exc:
+    except (OSError, urllib.error.URLError) as exc:
         return TestResult(
             name="http_check",
             passed=False,
@@ -150,7 +153,9 @@ def _build_image(
             suite.arch, suite.platform, suite.source_dir,
             build_dir=build_dir,
         )
-    except Exception as exc:
+    except (
+        FileNotFoundError, subprocess.CalledProcessError,
+    ) as exc:
         return TestResult(
             name="build",
             passed=False,

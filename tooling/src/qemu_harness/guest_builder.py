@@ -33,7 +33,7 @@ def toolchain_for_arch(
 
 def build_guest(
     arch: str,
-    platform: str,
+    platform: str,  # pylint: disable=unused-argument
     source_dir: str,
     build_dir: str | None = None,
 ) -> Path:

@@ -72,6 +72,16 @@ class TestCheckHttp:
         assert r.passed is False
         assert "failed" in r.message
 
+    @patch("qemu_harness.test_runner.urllib.request.urlopen")
+    def test_url_error(
+        self, mock_open: MagicMock,
+    ) -> None:
+        import urllib.error
+        mock_open.side_effect = urllib.error.URLError("DNS")
+        r = check_http("localhost", 8080, "Hello")
+        assert r.passed is False
+        assert "failed" in r.message
+
 
 class TestRunCase:
     """Tests for _run_case()."""
@@ -165,6 +175,23 @@ class TestBuildImage:
         result = _build_image(suite, None)
         assert isinstance(result, TestResult)
         assert result.passed is False
+
+    @patch("qemu_harness.test_runner.build_guest")
+    def test_called_process_error(
+        self, mock_build: MagicMock,
+    ) -> None:
+        import subprocess
+        mock_build.side_effect = subprocess.CalledProcessError(
+            1, "as",
+        )
+        suite = TestSuite(
+            arch="x86_64", platform="qemu",
+            source_dir="/src",
+        )
+        result = _build_image(suite, None)
+        assert isinstance(result, TestResult)
+        assert result.passed is False
+        assert "Build failed" in result.message
 
 
 class TestBootAndTest:

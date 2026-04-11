@@ -1,0 +1,41 @@
+[project]
+name = "fireasmserver-tooling"
+version = "0.1.0"
+description = "CD pipeline tooling for fireasmserver"
+requires-python = ">=3.11"
+license = "AGPL-3.0-or-later"
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "flake8",
+    "flake8-pyproject",
+    "pylint",
+    "mypy",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-randomly",
+]
+
+[project.scripts]
+qemu-harness = "qemu_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["tooling/src"]
+
+[tool.flake8]
+max-complexity = 5
+max-line-length = 79
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tooling/tests"]
+pythonpath = ["tooling/src"]
+
+[tool.pylint.main]
+rcfile = "~/.claude/pylintrc"

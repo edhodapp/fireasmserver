@@ -33,7 +33,7 @@ def _print_result(result: SuiteResult) -> None:
 
 def _load_suite(path: str) -> TestSuite:
     """Load a test suite from a JSON file."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return TestSuite.model_validate(data)
 
