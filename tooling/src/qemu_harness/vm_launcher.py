@@ -219,10 +219,21 @@ def _signal_pid(pid: int, sig: int) -> bool:
     return True
 
 
+def _try_waitpid(pid: int) -> bool:
+    """Try to reap a child process. Return True if reaped."""
+    try:
+        result, _ = os.waitpid(pid, os.WNOHANG)
+        return result != 0
+    except ChildProcessError:
+        return True
+
+
 def _poll_pid_exit(pid: int, timeout: float) -> bool:
     """Poll until PID exits or timeout. True if exited."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if _try_waitpid(pid):
+            return True
         if not _signal_pid(pid, 0):
             return True
         time.sleep(0.1)
@@ -236,6 +247,7 @@ def _kill_via_pid(pid: int) -> None:
     if _poll_pid_exit(pid, 5.0):
         return
     _signal_pid(pid, 9)
+    _try_waitpid(pid)
 
 
 def kill_vm(handle: VMHandle) -> None:

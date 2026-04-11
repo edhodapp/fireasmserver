@@ -15,6 +15,7 @@ from qemu_harness.vm_launcher import (
     _qemu_args,
     _qemu_binary,
     _register_proc,
+    _try_waitpid,
     _unregister_proc,
     has_kvm,
     kill_vm,
@@ -359,17 +360,39 @@ class TestKillViaProc:
         assert proc.wait.call_count == 2
 
 
+class TestTryWaitpid:
+    """Tests for _try_waitpid()."""
+
+    @patch("qemu_harness.vm_launcher.os.waitpid")
+    def test_reaped(self, mock_wait: MagicMock) -> None:
+        mock_wait.return_value = (123, 0)
+        assert _try_waitpid(123) is True
+
+    @patch("qemu_harness.vm_launcher.os.waitpid")
+    def test_not_exited(self, mock_wait: MagicMock) -> None:
+        mock_wait.return_value = (0, 0)
+        assert _try_waitpid(123) is False
+
+    @patch("qemu_harness.vm_launcher.os.waitpid")
+    def test_not_child(self, mock_wait: MagicMock) -> None:
+        mock_wait.side_effect = ChildProcessError
+        assert _try_waitpid(123) is True
+
+
 class TestKillViaPid:
     """Tests for _kill_via_pid()."""
 
+    @patch("qemu_harness.vm_launcher._try_waitpid")
     @patch("qemu_harness.vm_launcher.os.kill")
     def test_already_dead(
         self, mock_kill: MagicMock,
+        mock_wait: MagicMock,
     ) -> None:
         mock_kill.side_effect = ProcessLookupError
         _kill_via_pid(1)
         mock_kill.assert_called_once_with(1, 15)
 
+    @patch("qemu_harness.vm_launcher._try_waitpid")
     @patch("qemu_harness.vm_launcher.time.sleep")
     @patch("qemu_harness.vm_launcher.time.monotonic")
     @patch("qemu_harness.vm_launcher.os.kill")
@@ -377,14 +400,14 @@ class TestKillViaPid:
         self, mock_kill: MagicMock,
         mock_time: MagicMock,
         mock_sleep: MagicMock,
+        mock_wait: MagicMock,
     ) -> None:
-        mock_kill.side_effect = [
-            None,
-            ProcessLookupError,
-        ]
+        mock_wait.return_value = True
+        mock_kill.return_value = None
         mock_time.side_effect = [0.0, 0.0]
         _kill_via_pid(1)
-        assert mock_kill.call_count == 2
+        mock_kill.assert_called_with(1, 15)
+        mock_wait.assert_called()
 
 
 class TestKillVm:
