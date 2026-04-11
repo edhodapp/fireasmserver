@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build the ontology DAG for the QEMU test harness."""
+"""Build the ontology DAG for the QEMU test harness.
+
+Regenerated 2026-04-10 to match code after 16 review-driven fixes.
+"""
 
 from python_agent.dag_utils import save_dag, save_snapshot
 from python_agent.ontology import (
@@ -30,7 +33,11 @@ guest_image = Entity(
         Property(
             name="path",
             property_type=PropertyType(kind="str"),
-            description="Filesystem path to the ELF/flat binary",
+            description=(
+                "Filesystem path to the ELF/flat binary. "
+                "Validated: no '..' traversal, resolved "
+                "to absolute."
+            ),
         ),
         Property(
             name="arch",
@@ -45,7 +52,10 @@ guest_image = Entity(
                 kind="enum",
                 reference=["qemu", "firecracker"],
             ),
-            description="Target VM platform",
+            description=(
+                "Target VM platform. Literal type -- "
+                "Pydantic rejects invalid values."
+            ),
         ),
     ],
 )
@@ -57,21 +67,36 @@ vm_instance = Entity(
         "A running QEMU or Firecracker process hosting a "
         "guest image. Launched in the background, polled for "
         "readiness, killed cleanly after tests complete. "
-        "Never use timeout to kill QEMU -- background + "
-        "poll + kill."
+        "Popen object tracked in a thread-safe registry "
+        "keyed by PID. Never use timeout to kill QEMU -- "
+        "background + poll + kill."
     ),
     properties=[
         Property(
             name="pid",
             property_type=PropertyType(kind="int"),
-            description="Host OS process ID of the VM",
+            description=(
+                "Host OS process ID. Popen object stored "
+                "separately in _proc_registry (not "
+                "Pydantic-serializable)."
+            ),
         ),
         Property(
             name="serial_path",
             property_type=PropertyType(kind="str"),
             description=(
                 "Path to serial output file "
-                "(-serial file:<path>)"
+                "(-serial file:<path>). Validated: no "
+                "'..' traversal. Truncated on launch."
+            ),
+        ),
+        Property(
+            name="stderr_path",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "Path to QEMU stderr capture file. "
+                "Created alongside serial_path as "
+                "<serial_path>.stderr. Truncated on launch."
             ),
         ),
         Property(
@@ -191,7 +216,9 @@ constraints = [
         description=(
             "Never use timeout to kill QEMU. Launch in "
             "background, poll serial output file, then kill "
-            "cleanly. Use -serial file:<path> not "
+            "cleanly via Popen.terminate/kill when registry "
+            "entry exists, or bare PID signals with waitpid "
+            "as fallback. Use -serial file:<path> not "
             "-serial mon:stdio."
         ),
         entity_ids=["vm-instance"],
@@ -202,7 +229,8 @@ constraints = [
             "All test verification is from the host side. "
             "The guest has no test infrastructure inside "
             "it -- it just does what it does, and the host "
-            "observes."
+            "observes. Serial output read in binary mode "
+            "with errors='replace' to handle non-UTF-8."
         ),
         entity_ids=["test-case", "test-result"],
     ),
@@ -212,6 +240,37 @@ constraints = [
             "Firecracker requires /dev/kvm and only works "
             "for the native architecture. Skip gracefully "
             "if KVM is not available."
+        ),
+        entity_ids=["vm-instance"],
+    ),
+    DomainConstraint(
+        name="path-traversal-rejected",
+        description=(
+            "All file paths (image_path, serial_path) are "
+            "validated to reject '..' components and "
+            "resolved to absolute form. Pydantic "
+            "field_validator enforces at construction."
+        ),
+        entity_ids=["guest-image", "vm-instance"],
+    ),
+    DomainConstraint(
+        name="blocked-qemu-args",
+        description=(
+            "extra_args on VMConfig are validated against "
+            "a blocklist of dangerous QEMU flags: "
+            "-monitor, -vnc, -chardev, -netdev, -nic, "
+            "-spice. Pydantic field_validator rejects "
+            "at construction."
+        ),
+        entity_ids=["vm-instance"],
+    ),
+    DomainConstraint(
+        name="thread-safe-registry",
+        description=(
+            "The Popen process registry is protected by "
+            "threading.Lock. The Python harness runs on "
+            "Linux where concurrent launch_vm/kill_vm "
+            "from different threads is a real scenario."
         ),
         entity_ids=["vm-instance"],
     ),
@@ -225,30 +284,95 @@ vm_launcher_mod = ModuleSpec(
         "Launch QEMU or Firecracker VMs in the background, "
         "poll for readiness via serial output file, and "
         "kill cleanly. Handles both x86_64 and aarch64 "
-        "with appropriate QEMU system binary and flags."
+        "with appropriate QEMU system binary and flags. "
+        "Maintains a thread-safe Popen registry for safe "
+        "process lifecycle management. Validates paths "
+        "and QEMU arguments. Logs all lifecycle events."
     ),
     classes=[
         ClassSpec(
             name="VMConfig",
             description=(
-                "Immutable configuration for launching a VM"
+                "Immutable configuration for launching a VM. "
+                "Platform is Literal['qemu','firecracker']. "
+                "Pydantic validators reject path traversal "
+                "and blocked QEMU arguments."
             ),
             bases=["pydantic.BaseModel"],
-            methods=[],
+            methods=[
+                FunctionSpec(
+                    name="no_traversal",
+                    parameters=[("v", "str")],
+                    return_type="str",
+                    docstring=(
+                        "field_validator: reject '..' in "
+                        "image_path and serial_path, resolve "
+                        "to absolute."
+                    ),
+                ),
+                FunctionSpec(
+                    name="no_blocked_args",
+                    parameters=[("v", "list[str]")],
+                    return_type="list[str]",
+                    docstring=(
+                        "field_validator: reject QEMU flags "
+                        "in _BLOCKED_ARGS set."
+                    ),
+                ),
+            ],
+        ),
+        ClassSpec(
+            name="VMHandle",
+            description=(
+                "Handle to a running VM process. Includes "
+                "pid, serial_path, stderr_path, arch, "
+                "platform. Popen object stored separately "
+                "in _proc_registry."
+            ),
+            bases=["pydantic.BaseModel"],
         ),
     ],
     functions=[
         FunctionSpec(
-            name="launch_vm",
+            name="_reject_traversal",
+            parameters=[("path", "str")],
+            return_type="str",
+            docstring=(
+                "Reject paths with '..' components. "
+                "Return resolved absolute path."
+            ),
+        ),
+        FunctionSpec(
+            name="_register_proc",
             parameters=[
-                ("config", "VMConfig"),
+                ("proc", "subprocess.Popen[bytes]"),
             ],
+            return_type="None",
+            docstring=(
+                "Register a Popen in the thread-safe "
+                "registry."
+            ),
+        ),
+        FunctionSpec(
+            name="_get_proc",
+            parameters=[("pid", "int")],
+            return_type="subprocess.Popen[bytes] | None",
+            docstring="Look up a registered Popen by PID.",
+        ),
+        FunctionSpec(
+            name="_unregister_proc",
+            parameters=[("pid", "int")],
+            return_type="None",
+            docstring="Remove a Popen from the registry.",
+        ),
+        FunctionSpec(
+            name="launch_vm",
+            parameters=[("config", "VMConfig")],
             return_type="VMHandle",
             docstring=(
-                "Launch a VM in the background. Returns a "
-                "handle with pid and serial output path. "
-                "Does not block -- caller must poll for "
-                "readiness."
+                "Launch a VM in the background. Truncates "
+                "serial and stderr files. Registers Popen. "
+                "Returns handle. Does not block."
             ),
             preconditions=[
                 "Guest image exists at config.image_path",
@@ -256,7 +380,8 @@ vm_launcher_mod = ModuleSpec(
             ],
             postconditions=[
                 "VM process is running in background",
-                "Serial output file exists (may be empty)",
+                "Serial and stderr files exist (truncated)",
+                "Popen registered in _proc_registry",
             ],
         ),
         FunctionSpec(
@@ -268,9 +393,61 @@ vm_launcher_mod = ModuleSpec(
             ],
             return_type="bool",
             docstring=(
-                "Poll serial output file until marker "
-                "string appears or timeout. Returns True "
-                "if ready, False if timed out."
+                "Poll serial output until marker appears "
+                "or timeout. Opens file once, reads in "
+                "binary mode with 4KB chunks, uses sliding "
+                "window of marker_len bytes to avoid O(N^2) "
+                "search. Returns True if ready."
+            ),
+        ),
+        FunctionSpec(
+            name="_kill_via_proc",
+            parameters=[
+                ("proc", "subprocess.Popen[bytes]"),
+            ],
+            return_type="None",
+            docstring=(
+                "Kill using Popen API: terminate, wait 5s, "
+                "kill if needed. Immune to PID recycling."
+            ),
+        ),
+        FunctionSpec(
+            name="_try_waitpid",
+            parameters=[("pid", "int")],
+            return_type="bool",
+            docstring=(
+                "Try to reap a child process via "
+                "os.waitpid with WNOHANG. Returns True "
+                "if reaped or not a child."
+            ),
+        ),
+        FunctionSpec(
+            name="_signal_pid",
+            parameters=[("pid", "int"), ("sig", "int")],
+            return_type="bool",
+            docstring=(
+                "Send signal to PID. Return False if "
+                "process gone."
+            ),
+        ),
+        FunctionSpec(
+            name="_poll_pid_exit",
+            parameters=[
+                ("pid", "int"), ("timeout", "float"),
+            ],
+            return_type="bool",
+            docstring=(
+                "Poll until PID exits or timeout via "
+                "waitpid + signal check."
+            ),
+        ),
+        FunctionSpec(
+            name="_kill_via_pid",
+            parameters=[("pid", "int")],
+            return_type="None",
+            docstring=(
+                "Fallback kill using bare PID. SIGTERM, "
+                "wait, SIGKILL, reap via waitpid."
             ),
         ),
         FunctionSpec(
@@ -278,12 +455,14 @@ vm_launcher_mod = ModuleSpec(
             parameters=[("handle", "VMHandle")],
             return_type="None",
             docstring=(
-                "Kill the VM process cleanly via SIGTERM, "
-                "then SIGKILL if needed. Wait for process "
-                "to exit."
+                "Kill VM cleanly. Uses Popen API if "
+                "registered, falls back to bare PID. "
+                "Unregisters from _proc_registry. "
+                "Reaps child to prevent zombies."
             ),
             postconditions=[
                 "VM process no longer running",
+                "Popen removed from registry",
             ],
         ),
         FunctionSpec(
@@ -293,13 +472,20 @@ vm_launcher_mod = ModuleSpec(
             docstring="Check if /dev/kvm is available.",
         ),
     ],
-    dependencies=["subprocess", "pathlib", "time"],
+    dependencies=[
+        "subprocess", "pathlib", "time",
+        "threading", "logging", "os",
+    ],
     test_strategy=(
-        "Unit test with mock subprocess. Functional test "
-        "with a minimal guest image that writes a known "
-        "marker to serial output, then verifies "
-        "wait_for_ready and kill_vm work correctly. Test "
-        "the KVM-not-available path by mocking os.access."
+        "Unit test with mock subprocess. Autouse fixture "
+        "clears _proc_registry before/after each test. "
+        "Tests verify: launch registers Popen, stderr "
+        "captured to file, serial truncated on launch, "
+        "path traversal rejected, blocked args rejected, "
+        "platform Literal validated, marker found/timeout "
+        "in wait_for_ready, kill via Popen vs bare PID "
+        "fallback, waitpid reaps zombies. Random test "
+        "order verified via pytest-randomly."
     ),
 )
 
@@ -318,6 +504,7 @@ guest_builder_mod = ModuleSpec(
                 ("arch", "str"),
                 ("platform", "str"),
                 ("source_dir", "str"),
+                ("build_dir", "str | None"),
             ],
             return_type="Path",
             docstring=(
@@ -339,9 +526,7 @@ guest_builder_mod = ModuleSpec(
             return_type="tuple[str, str]",
             docstring=(
                 "Return (assembler, linker) binary names "
-                "for the target arch. E.g., "
-                "('aarch64-linux-gnu-as', "
-                "'aarch64-linux-gnu-ld')."
+                "for the target arch."
             ),
         ),
     ],
@@ -360,8 +545,9 @@ test_runner_mod = ModuleSpec(
     responsibility=(
         "Orchestrate the full test cycle: build guest, "
         "launch VM, wait for ready, run test cases, kill "
-        "VM, report results. This is the entry point for "
-        "both pre-commit and CI."
+        "VM, report results. Serial output read in binary "
+        "mode with errors='replace'. This is the entry "
+        "point for both pre-commit and CI."
     ),
     classes=[
         ClassSpec(
@@ -371,7 +557,10 @@ test_runner_mod = ModuleSpec(
         ),
         ClassSpec(
             name="SuiteResult",
-            description="Aggregate results for a test suite run",
+            description=(
+                "Aggregate results for a test suite run. "
+                "Has all_passed property."
+            ),
             bases=["pydantic.BaseModel"],
         ),
     ],
@@ -380,13 +569,14 @@ test_runner_mod = ModuleSpec(
             name="run_suite",
             parameters=[
                 ("suite", "TestSuite"),
-                ("arch", "str"),
-                ("platform", "str"),
+                ("build_dir", "str | None"),
+                ("serial_path", "str | None"),
             ],
             return_type="SuiteResult",
             docstring=(
                 "Run a complete test suite: build, boot, "
-                "test, kill, report."
+                "test, kill, report. Skips gracefully if "
+                "Firecracker without KVM."
             ),
         ),
         FunctionSpec(
@@ -397,8 +587,8 @@ test_runner_mod = ModuleSpec(
             ],
             return_type="TestResult",
             docstring=(
-                "Check serial output file for expected "
-                "content."
+                "Check serial output for expected content. "
+                "Reads in binary mode with errors='replace'."
             ),
         ),
         FunctionSpec(
@@ -414,17 +604,59 @@ test_runner_mod = ModuleSpec(
                 "body matches expected."
             ),
         ),
+        FunctionSpec(
+            name="_build_image",
+            parameters=[
+                ("suite", "TestSuite"),
+                ("build_dir", "str | None"),
+            ],
+            return_type="Path | TestResult",
+            docstring=(
+                "Build guest image. Return Path on success "
+                "or TestResult on failure."
+            ),
+        ),
+        FunctionSpec(
+            name="_boot_and_test",
+            parameters=[
+                ("handle", "VMHandle"),
+                ("suite", "TestSuite"),
+            ],
+            return_type="list[TestResult]",
+            docstring=(
+                "Wait for ready, run cases, return results."
+            ),
+        ),
+        FunctionSpec(
+            name="_should_skip",
+            parameters=[("suite", "TestSuite")],
+            return_type="str | None",
+            docstring=(
+                "Return skip reason if suite can't run, "
+                "or None if runnable."
+            ),
+        ),
+        FunctionSpec(
+            name="_run_case",
+            parameters=[
+                ("case", "TestCase"),
+                ("handle", "VMHandle"),
+            ],
+            return_type="TestResult",
+            docstring=(
+                "Run a single test case against a booted VM."
+            ),
+        ),
     ],
     dependencies=[
         "vm_launcher", "guest_builder", "urllib.request",
     ],
     test_strategy=(
         "Unit test check_serial and check_http with "
-        "fixtures. Integration test run_suite with a "
-        "minimal guest that boots, emits a serial marker, "
-        "and optionally serves HTTP. Test all failure "
-        "paths: build failure, boot timeout, check "
-        "mismatch, VM crash."
+        "fixtures. Integration test run_suite with mocked "
+        "build/launch/wait/kill. Test all failure paths: "
+        "build failure, boot timeout, check mismatch, "
+        "Firecracker skip without KVM."
     ),
 )
 
@@ -446,12 +678,30 @@ cli_mod = ModuleSpec(
                 "report, return exit code."
             ),
         ),
+        FunctionSpec(
+            name="parse_args",
+            parameters=[("argv", "list[str] | None")],
+            return_type="argparse.Namespace",
+            docstring="Parse command-line arguments.",
+        ),
+        FunctionSpec(
+            name="_load_suite",
+            parameters=[("path", "str")],
+            return_type="TestSuite",
+            docstring="Load a test suite from a JSON file.",
+        ),
+        FunctionSpec(
+            name="_print_result",
+            parameters=[("result", "SuiteResult")],
+            return_type="None",
+            docstring="Print test results for one suite.",
+        ),
     ],
-    dependencies=["argparse", "test_runner"],
+    dependencies=["argparse", "json", "test_runner"],
     test_strategy=(
         "Test argument parsing. Test exit codes for "
         "all-pass and any-failure scenarios with mocked "
-        "test_runner."
+        "test_runner. Test suite loading from JSON."
     ),
 )
 
@@ -461,7 +711,12 @@ ext_deps = [
     ExternalDependency(
         name="pydantic",
         version_constraint=">=2.0",
-        reason="Data models for VMConfig, TestSuite, results",
+        reason=(
+            "Data models for VMConfig, VMHandle, "
+            "TestSuite, TestCase, TestResult, SuiteResult. "
+            "field_validator for path/args validation. "
+            "Literal type for platform."
+        ),
     ),
 ]
 
@@ -479,7 +734,7 @@ ontology = Ontology(
 )
 
 dag = OntologyDAG(project_name="fireasmserver-qemu-harness")
-save_snapshot(dag, ontology, "initial-design")
+save_snapshot(dag, ontology, "post-review-v2")
 save_dag(dag, "tooling/qemu-harness.json")
 
 print("Saved ontology DAG to tooling/qemu-harness.json")
@@ -488,5 +743,10 @@ print(f"  Relationships: {len(ontology.relationships)}")
 print(f"  Constraints: {len(ontology.domain_constraints)}")
 print(f"  Modules: {len(ontology.modules)}")
 print(
-    f"  Functions: {sum(len(m.functions) for m in ontology.modules)}"
+    f"  Functions: "
+    f"{sum(len(m.functions) for m in ontology.modules)}"
+)
+print(
+    f"  Classes: "
+    f"{sum(len(m.classes) for m in ontology.modules)}"
 )

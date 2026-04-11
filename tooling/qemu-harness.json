@@ -2,7 +2,7 @@
   "project_name": "fireasmserver-qemu-harness",
   "nodes": [
     {
-      "id": "f7d0f335-e84e-4442-b4c4-75a87e7b3343",
+      "id": "277081e0-f43b-4e40-8591-a6551e8b2786",
       "ontology": {
         "entities": [
           {
@@ -16,7 +16,7 @@
                   "kind": "str",
                   "reference": null
                 },
-                "description": "Filesystem path to the ELF/flat binary",
+                "description": "Filesystem path to the ELF/flat binary. Validated: no '..' traversal, resolved to absolute.",
                 "required": true,
                 "constraints": []
               },
@@ -42,7 +42,7 @@
                     "firecracker"
                   ]
                 },
-                "description": "Target VM platform",
+                "description": "Target VM platform. Literal type -- Pydantic rejects invalid values.",
                 "required": true,
                 "constraints": []
               }
@@ -51,7 +51,7 @@
           {
             "id": "vm-instance",
             "name": "VMInstance",
-            "description": "A running QEMU or Firecracker process hosting a guest image. Launched in the background, polled for readiness, killed cleanly after tests complete. Never use timeout to kill QEMU -- background + poll + kill.",
+            "description": "A running QEMU or Firecracker process hosting a guest image. Launched in the background, polled for readiness, killed cleanly after tests complete. Popen object tracked in a thread-safe registry keyed by PID. Never use timeout to kill QEMU -- background + poll + kill.",
             "properties": [
               {
                 "name": "pid",
@@ -59,7 +59,7 @@
                   "kind": "int",
                   "reference": null
                 },
-                "description": "Host OS process ID of the VM",
+                "description": "Host OS process ID. Popen object stored separately in _proc_registry (not Pydantic-serializable).",
                 "required": true,
                 "constraints": []
               },
@@ -69,7 +69,17 @@
                   "kind": "str",
                   "reference": null
                 },
-                "description": "Path to serial output file (-serial file:<path>)",
+                "description": "Path to serial output file (-serial file:<path>). Validated: no '..' traversal. Truncated on launch.",
+                "required": true,
+                "constraints": []
+              },
+              {
+                "name": "stderr_path",
+                "property_type": {
+                  "kind": "str",
+                  "reference": null
+                },
+                "description": "Path to QEMU stderr capture file. Created alongside serial_path as <serial_path>.stderr. Truncated on launch.",
                 "required": true,
                 "constraints": []
               },
@@ -214,7 +224,7 @@
           },
           {
             "name": "clean-vm-kill",
-            "description": "Never use timeout to kill QEMU. Launch in background, poll serial output file, then kill cleanly. Use -serial file:<path> not -serial mon:stdio.",
+            "description": "Never use timeout to kill QEMU. Launch in background, poll serial output file, then kill cleanly via Popen.terminate/kill when registry entry exists, or bare PID signals with waitpid as fallback. Use -serial file:<path> not -serial mon:stdio.",
             "entity_ids": [
               "vm-instance"
             ],
@@ -222,7 +232,7 @@
           },
           {
             "name": "host-side-verification",
-            "description": "All test verification is from the host side. The guest has no test infrastructure inside it -- it just does what it does, and the host observes.",
+            "description": "All test verification is from the host side. The guest has no test infrastructure inside it -- it just does what it does, and the host observes. Serial output read in binary mode with errors='replace' to handle non-UTF-8.",
             "entity_ids": [
               "test-case",
               "test-result"
@@ -236,16 +246,76 @@
               "vm-instance"
             ],
             "expression": ""
+          },
+          {
+            "name": "path-traversal-rejected",
+            "description": "All file paths (image_path, serial_path) are validated to reject '..' components and resolved to absolute form. Pydantic field_validator enforces at construction.",
+            "entity_ids": [
+              "guest-image",
+              "vm-instance"
+            ],
+            "expression": ""
+          },
+          {
+            "name": "blocked-qemu-args",
+            "description": "extra_args on VMConfig are validated against a blocklist of dangerous QEMU flags: -monitor, -vnc, -chardev, -netdev, -nic, -spice. Pydantic field_validator rejects at construction.",
+            "entity_ids": [
+              "vm-instance"
+            ],
+            "expression": ""
+          },
+          {
+            "name": "thread-safe-registry",
+            "description": "The Popen process registry is protected by threading.Lock. The Python harness runs on Linux where concurrent launch_vm/kill_vm from different threads is a real scenario.",
+            "entity_ids": [
+              "vm-instance"
+            ],
+            "expression": ""
           }
         ],
         "modules": [
           {
             "name": "vm_launcher",
-            "responsibility": "Launch QEMU or Firecracker VMs in the background, poll for readiness via serial output file, and kill cleanly. Handles both x86_64 and aarch64 with appropriate QEMU system binary and flags.",
+            "responsibility": "Launch QEMU or Firecracker VMs in the background, poll for readiness via serial output file, and kill cleanly. Handles both x86_64 and aarch64 with appropriate QEMU system binary and flags. Maintains a thread-safe Popen registry for safe process lifecycle management. Validates paths and QEMU arguments. Logs all lifecycle events.",
             "classes": [
               {
                 "name": "VMConfig",
-                "description": "Immutable configuration for launching a VM",
+                "description": "Immutable configuration for launching a VM. Platform is Literal['qemu','firecracker']. Pydantic validators reject path traversal and blocked QEMU arguments.",
+                "bases": [
+                  "pydantic.BaseModel"
+                ],
+                "methods": [
+                  {
+                    "name": "no_traversal",
+                    "parameters": [
+                      [
+                        "v",
+                        "str"
+                      ]
+                    ],
+                    "return_type": "str",
+                    "docstring": "field_validator: reject '..' in image_path and serial_path, resolve to absolute.",
+                    "preconditions": [],
+                    "postconditions": []
+                  },
+                  {
+                    "name": "no_blocked_args",
+                    "parameters": [
+                      [
+                        "v",
+                        "list[str]"
+                      ]
+                    ],
+                    "return_type": "list[str]",
+                    "docstring": "field_validator: reject QEMU flags in _BLOCKED_ARGS set.",
+                    "preconditions": [],
+                    "postconditions": []
+                  }
+                ]
+              },
+              {
+                "name": "VMHandle",
+                "description": "Handle to a running VM process. Includes pid, serial_path, stderr_path, arch, platform. Popen object stored separately in _proc_registry.",
                 "bases": [
                   "pydantic.BaseModel"
                 ],
@@ -253,6 +323,58 @@
               }
             ],
             "functions": [
+              {
+                "name": "_reject_traversal",
+                "parameters": [
+                  [
+                    "path",
+                    "str"
+                  ]
+                ],
+                "return_type": "str",
+                "docstring": "Reject paths with '..' components. Return resolved absolute path.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_register_proc",
+                "parameters": [
+                  [
+                    "proc",
+                    "subprocess.Popen[bytes]"
+                  ]
+                ],
+                "return_type": "None",
+                "docstring": "Register a Popen in the thread-safe registry.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_get_proc",
+                "parameters": [
+                  [
+                    "pid",
+                    "int"
+                  ]
+                ],
+                "return_type": "subprocess.Popen[bytes] | None",
+                "docstring": "Look up a registered Popen by PID.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_unregister_proc",
+                "parameters": [
+                  [
+                    "pid",
+                    "int"
+                  ]
+                ],
+                "return_type": "None",
+                "docstring": "Remove a Popen from the registry.",
+                "preconditions": [],
+                "postconditions": []
+              },
               {
                 "name": "launch_vm",
                 "parameters": [
@@ -262,14 +384,15 @@
                   ]
                 ],
                 "return_type": "VMHandle",
-                "docstring": "Launch a VM in the background. Returns a handle with pid and serial output path. Does not block -- caller must poll for readiness.",
+                "docstring": "Launch a VM in the background. Truncates serial and stderr files. Registers Popen. Returns handle. Does not block.",
                 "preconditions": [
                   "Guest image exists at config.image_path",
                   "For firecracker: /dev/kvm is available"
                 ],
                 "postconditions": [
                   "VM process is running in background",
-                  "Serial output file exists (may be empty)"
+                  "Serial and stderr files exist (truncated)",
+                  "Popen registered in _proc_registry"
                 ]
               },
               {
@@ -289,7 +412,80 @@
                   ]
                 ],
                 "return_type": "bool",
-                "docstring": "Poll serial output file until marker string appears or timeout. Returns True if ready, False if timed out.",
+                "docstring": "Poll serial output until marker appears or timeout. Opens file once, reads in binary mode with 4KB chunks, uses sliding window of marker_len bytes to avoid O(N^2) search. Returns True if ready.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_kill_via_proc",
+                "parameters": [
+                  [
+                    "proc",
+                    "subprocess.Popen[bytes]"
+                  ]
+                ],
+                "return_type": "None",
+                "docstring": "Kill using Popen API: terminate, wait 5s, kill if needed. Immune to PID recycling.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_try_waitpid",
+                "parameters": [
+                  [
+                    "pid",
+                    "int"
+                  ]
+                ],
+                "return_type": "bool",
+                "docstring": "Try to reap a child process via os.waitpid with WNOHANG. Returns True if reaped or not a child.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_signal_pid",
+                "parameters": [
+                  [
+                    "pid",
+                    "int"
+                  ],
+                  [
+                    "sig",
+                    "int"
+                  ]
+                ],
+                "return_type": "bool",
+                "docstring": "Send signal to PID. Return False if process gone.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_poll_pid_exit",
+                "parameters": [
+                  [
+                    "pid",
+                    "int"
+                  ],
+                  [
+                    "timeout",
+                    "float"
+                  ]
+                ],
+                "return_type": "bool",
+                "docstring": "Poll until PID exits or timeout via waitpid + signal check.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_kill_via_pid",
+                "parameters": [
+                  [
+                    "pid",
+                    "int"
+                  ]
+                ],
+                "return_type": "None",
+                "docstring": "Fallback kill using bare PID. SIGTERM, wait, SIGKILL, reap via waitpid.",
                 "preconditions": [],
                 "postconditions": []
               },
@@ -302,10 +498,11 @@
                   ]
                 ],
                 "return_type": "None",
-                "docstring": "Kill the VM process cleanly via SIGTERM, then SIGKILL if needed. Wait for process to exit.",
+                "docstring": "Kill VM cleanly. Uses Popen API if registered, falls back to bare PID. Unregisters from _proc_registry. Reaps child to prevent zombies.",
                 "preconditions": [],
                 "postconditions": [
-                  "VM process no longer running"
+                  "VM process no longer running",
+                  "Popen removed from registry"
                 ]
               },
               {
@@ -320,9 +517,12 @@
             "dependencies": [
               "subprocess",
               "pathlib",
-              "time"
+              "time",
+              "threading",
+              "logging",
+              "os"
             ],
-            "test_strategy": "Unit test with mock subprocess. Functional test with a minimal guest image that writes a known marker to serial output, then verifies wait_for_ready and kill_vm work correctly. Test the KVM-not-available path by mocking os.access.",
+            "test_strategy": "Unit test with mock subprocess. Autouse fixture clears _proc_registry before/after each test. Tests verify: launch registers Popen, stderr captured to file, serial truncated on launch, path traversal rejected, blocked args rejected, platform Literal validated, marker found/timeout in wait_for_ready, kill via Popen vs bare PID fallback, waitpid reaps zombies. Random test order verified via pytest-randomly.",
             "status": "not_started"
           },
           {
@@ -344,6 +544,10 @@
                   [
                     "source_dir",
                     "str"
+                  ],
+                  [
+                    "build_dir",
+                    "str | None"
                   ]
                 ],
                 "return_type": "Path",
@@ -365,7 +569,7 @@
                   ]
                 ],
                 "return_type": "tuple[str, str]",
-                "docstring": "Return (assembler, linker) binary names for the target arch. E.g., ('aarch64-linux-gnu-as', 'aarch64-linux-gnu-ld').",
+                "docstring": "Return (assembler, linker) binary names for the target arch.",
                 "preconditions": [],
                 "postconditions": []
               }
@@ -379,7 +583,7 @@
           },
           {
             "name": "test_runner",
-            "responsibility": "Orchestrate the full test cycle: build guest, launch VM, wait for ready, run test cases, kill VM, report results. This is the entry point for both pre-commit and CI.",
+            "responsibility": "Orchestrate the full test cycle: build guest, launch VM, wait for ready, run test cases, kill VM, report results. Serial output read in binary mode with errors='replace'. This is the entry point for both pre-commit and CI.",
             "classes": [
               {
                 "name": "TestSuite",
@@ -391,7 +595,7 @@
               },
               {
                 "name": "SuiteResult",
-                "description": "Aggregate results for a test suite run",
+                "description": "Aggregate results for a test suite run. Has all_passed property.",
                 "bases": [
                   "pydantic.BaseModel"
                 ],
@@ -407,16 +611,16 @@
                     "TestSuite"
                   ],
                   [
-                    "arch",
-                    "str"
+                    "build_dir",
+                    "str | None"
                   ],
                   [
-                    "platform",
-                    "str"
+                    "serial_path",
+                    "str | None"
                   ]
                 ],
                 "return_type": "SuiteResult",
-                "docstring": "Run a complete test suite: build, boot, test, kill, report.",
+                "docstring": "Run a complete test suite: build, boot, test, kill, report. Skips gracefully if Firecracker without KVM.",
                 "preconditions": [],
                 "postconditions": []
               },
@@ -433,7 +637,7 @@
                   ]
                 ],
                 "return_type": "TestResult",
-                "docstring": "Check serial output file for expected content.",
+                "docstring": "Check serial output for expected content. Reads in binary mode with errors='replace'.",
                 "preconditions": [],
                 "postconditions": []
               },
@@ -457,6 +661,70 @@
                 "docstring": "Make HTTP GET request and verify response body matches expected.",
                 "preconditions": [],
                 "postconditions": []
+              },
+              {
+                "name": "_build_image",
+                "parameters": [
+                  [
+                    "suite",
+                    "TestSuite"
+                  ],
+                  [
+                    "build_dir",
+                    "str | None"
+                  ]
+                ],
+                "return_type": "Path | TestResult",
+                "docstring": "Build guest image. Return Path on success or TestResult on failure.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_boot_and_test",
+                "parameters": [
+                  [
+                    "handle",
+                    "VMHandle"
+                  ],
+                  [
+                    "suite",
+                    "TestSuite"
+                  ]
+                ],
+                "return_type": "list[TestResult]",
+                "docstring": "Wait for ready, run cases, return results.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_should_skip",
+                "parameters": [
+                  [
+                    "suite",
+                    "TestSuite"
+                  ]
+                ],
+                "return_type": "str | None",
+                "docstring": "Return skip reason if suite can't run, or None if runnable.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_run_case",
+                "parameters": [
+                  [
+                    "case",
+                    "TestCase"
+                  ],
+                  [
+                    "handle",
+                    "VMHandle"
+                  ]
+                ],
+                "return_type": "TestResult",
+                "docstring": "Run a single test case against a booted VM.",
+                "preconditions": [],
+                "postconditions": []
               }
             ],
             "dependencies": [
@@ -464,7 +732,7 @@
               "guest_builder",
               "urllib.request"
             ],
-            "test_strategy": "Unit test check_serial and check_http with fixtures. Integration test run_suite with a minimal guest that boots, emits a serial marker, and optionally serves HTTP. Test all failure paths: build failure, boot timeout, check mismatch, VM crash.",
+            "test_strategy": "Unit test check_serial and check_http with fixtures. Integration test run_suite with mocked build/launch/wait/kill. Test all failure paths: build failure, boot timeout, check mismatch, Firecracker skip without KVM.",
             "status": "not_started"
           },
           {
@@ -484,13 +752,53 @@
                 "docstring": "Entry point. Parse args, run tests, report, return exit code.",
                 "preconditions": [],
                 "postconditions": []
+              },
+              {
+                "name": "parse_args",
+                "parameters": [
+                  [
+                    "argv",
+                    "list[str] | None"
+                  ]
+                ],
+                "return_type": "argparse.Namespace",
+                "docstring": "Parse command-line arguments.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_load_suite",
+                "parameters": [
+                  [
+                    "path",
+                    "str"
+                  ]
+                ],
+                "return_type": "TestSuite",
+                "docstring": "Load a test suite from a JSON file.",
+                "preconditions": [],
+                "postconditions": []
+              },
+              {
+                "name": "_print_result",
+                "parameters": [
+                  [
+                    "result",
+                    "SuiteResult"
+                  ]
+                ],
+                "return_type": "None",
+                "docstring": "Print test results for one suite.",
+                "preconditions": [],
+                "postconditions": []
               }
             ],
             "dependencies": [
               "argparse",
+              "json",
               "test_runner"
             ],
-            "test_strategy": "Test argument parsing. Test exit codes for all-pass and any-failure scenarios with mocked test_runner.",
+            "test_strategy": "Test argument parsing. Test exit codes for all-pass and any-failure scenarios with mocked test_runner. Test suite loading from JSON.",
             "status": "not_started"
           }
         ],
@@ -499,16 +807,16 @@
           {
             "name": "pydantic",
             "version_constraint": ">=2.0",
-            "reason": "Data models for VMConfig, TestSuite, results"
+            "reason": "Data models for VMConfig, VMHandle, TestSuite, TestCase, TestResult, SuiteResult. field_validator for path/args validation. Literal type for platform."
           }
         ],
         "open_questions": []
       },
-      "created_at": "2026-04-10T07:11:14.287473+00:00",
-      "label": "initial-design",
-      "integrity_hash": "1f76895ec6b09c2cd42252eaf0611b684d9d3b00d9f59c1c31e4fd23ee377316"
+      "created_at": "2026-04-11T01:39:19.039010+00:00",
+      "label": "post-review-v2",
+      "integrity_hash": "26d37503bf5dafd4cb84e1768869432d52a8404958a4ac7d5c8262d5ff09a238"
     }
   ],
   "edges": [],
-  "current_node_id": "f7d0f335-e84e-4442-b4c4-75a87e7b3343"
+  "current_node_id": "277081e0-f43b-4e40-8591-a6551e8b2786"
 }
