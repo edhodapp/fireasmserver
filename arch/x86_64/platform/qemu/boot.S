@@ -2,9 +2,10 @@
 # Copyright (c) 2026 Ed Hodapp
 #
 # Minimal x86_64 QEMU guest stub for pipeline verification.
-# End-to-end pipeline test: this comment triggers the full flow.
 # Multiboot entry — QEMU boots this in 32-bit protected mode.
 # Writes "READY\n" to serial port 0x3F8 (COM1) and halts.
+
+.intel_syntax noprefix
 
 .set MB_MAGIC, 0x1BADB002
 .set MB_FLAGS, 0x0
@@ -22,26 +23,25 @@
 
 _start:
     # Serial port COM1 = 0x3F8
-    # In protected mode, use outb via 'out' instruction
+    mov dx, 0x3F8
 
-    mov $'R', %al
-    mov $0x3F8, %dx
-    out %al, %dx
+    mov al, 'R'
+    out dx, al
 
-    mov $'E', %al
-    out %al, %dx
+    mov al, 'E'
+    out dx, al
 
-    mov $'A', %al
-    out %al, %dx
+    mov al, 'A'
+    out dx, al
 
-    mov $'D', %al
-    out %al, %dx
+    mov al, 'D'
+    out dx, al
 
-    mov $'Y', %al
-    out %al, %dx
+    mov al, 'Y'
+    out dx, al
 
-    mov $'\n', %al
-    out %al, %dx
+    mov al, '\n'
+    out dx, al
 
     cli
 .loop:
