@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -36,21 +37,25 @@ _BLOCKED_ARGS = frozenset({
 # as a BaseModel with bare pid, and we look up the Popen
 # here for process management (wait, poll, terminate).
 _proc_registry: dict[int, subprocess.Popen[bytes]] = {}
+_proc_lock = threading.Lock()
 
 
 def _register_proc(proc: subprocess.Popen[bytes]) -> None:
     """Register a Popen object for later lookup."""
-    _proc_registry[proc.pid] = proc
+    with _proc_lock:
+        _proc_registry[proc.pid] = proc
 
 
 def _get_proc(pid: int) -> subprocess.Popen[bytes] | None:
     """Look up a registered Popen by PID."""
-    return _proc_registry.get(pid)
+    with _proc_lock:
+        return _proc_registry.get(pid)
 
 
 def _unregister_proc(pid: int) -> None:
     """Remove a Popen from the registry."""
-    _proc_registry.pop(pid, None)
+    with _proc_lock:
+        _proc_registry.pop(pid, None)
 
 
 class VMConfig(BaseModel):
