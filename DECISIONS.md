@@ -168,6 +168,75 @@ entry. Linker emits both `PT_LOAD` (containing `.note.Xen` and `.text`) and
   generation, `--no-api` invocation, stdout-to-serial redirection, VMM logger
   diverted to a sibling `.fc-log` file
 
+## 2026-04-12
+
+### D021: Ontology-driven gates with incremental constraint discovery
+
+**Decision:** Domain constraints in the project ontology (`tooling/qemu-harness.json`)
+drive the quality gate runner. The gate runner reads the ontology, extracts domain
+constraints, and for each constraint verifies three things:
+
+1. **Traceability** — a test exists whose name matches the constraint (naming convention:
+   test function name contains the constraint's `name` field with hyphens converted to
+   underscores).
+2. **Structural coverage** — the linked test actually executes the code that enforces the
+   constraint (coverage scoped to the enforcement function).
+3. **Mutation verification** — mutating the enforcement code causes the linked test to fail,
+   proving the test depends on the constraint being enforced, not just on nearby code running.
+
+Verification is bidirectional: the gate runner also checks that every function declared in
+the ontology's module specs exists in the implementation with a matching signature, and
+flags functions in code that are not declared in the ontology. Drift in either direction
+is surfaced at commit time.
+
+**Ontology lifecycle — draft first, discover as you go:**
+
+The ontology is NOT a waterfall spec written before implementation begins. The workflow is:
+
+1. Draft an initial ontology with rough entities, relationships, and module specs based on
+   what is known before coding starts. This provides direction, not certainty.
+2. Implement incrementally toward the draft. Testability, measurement, and observability
+   challenges emerge during this work and cannot be fully anticipated in the draft.
+3. When implementation reveals a new constraint — a safety invariant, a platform quirk, a
+   failure mode caught by review — crystallize it immediately: add a `DomainConstraint` to
+   the ontology, write the enforcement code, write the test (named to match), regenerate
+   the DAG via `build_qemu_harness_ontology.py`.
+4. The gate runner picks up the new constraint automatically on the next commit. From that
+   point forward it is verified on every commit, forever.
+5. When the code changes in a way that makes the ontology inaccurate, the conformance
+   check flags the delta. Update whichever side is lagging — ontology or code — and
+   resolve the disagreement explicitly.
+
+The ontology and the code co-evolve. Each reinforces the other: the ontology keeps the
+code honest (constraints are checked); the code keeps the ontology honest (conformance
+drift is detected). Neither leads permanently.
+
+**Justification:**
+
+- fireasmserver's existing 7 domain constraints were all discovered AFTER initial
+  implementation, not predicted before it. `path-traversal-rejected` emerged from a
+  security review. `clean-vm-kill` emerged from discovering QEMU's serial-flush behavior.
+  `kvm-required-for-firecracker` emerged from CI failures on runners without KVM. The
+  ontology is a record of discovered truth, not a prediction of future requirements.
+- The three-level verification chain (traceability → coverage → mutation) is the same
+  methodology used in aerospace systems engineering (DO-178C: requirements traceability
+  matrix + structural coverage analysis + fault injection), adapted for a continuous
+  integration context where verification runs on every commit rather than at milestone
+  reviews.
+- Constraints that are too abstract to verify automatically (e.g., D013 "build correct
+  foundational abstractions") stay in the ontology as documentation for humans and LLMs
+  but are not wired into the gate runner. Only constraints that are concrete enough to
+  have a testable enforcement artifact participate in automated verification.
+
+**Scope:** This decision governs fireasmserver's `qemu_harness` tooling and will inform
+the design of `aofire-asm-agent`'s gate runner (`gates.py`), which will implement the
+constraint-driven verification chain as a reusable tool consumable by all bare-metal
+assembly projects in the product line.
+
+**Implementation status:** The ontology and constraints exist. The gate runner that reads
+them and performs the three-level verification does not yet exist — it is the next piece
+to build in `aofire-asm-agent`.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
