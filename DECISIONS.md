@@ -382,6 +382,197 @@ and the forthcoming AArch64 ARM64 Linux boot protocol decision).
   userspace to discount when diagnosing failures. Debian could re-enter as a
   second meta-rootfs if glibc-specific behavior ever needs to be tested.
 
+### D028: Python provisioning — apt + laptop-built aarch64 wheelhouse
+
+**Decision:** Pi 5 image gets a working Python venv from first boot, populated
+without ever needing internet on the Pi. Layered approach:
+
+- pi-gen apt-installs `python3`, `python3-venv`, `python3-pip`, `python3-dev`
+  during image build. PiOS Bookworm ships Python 3.11, meeting the CLAUDE.md
+  project floor.
+- pi-gen custom stage creates `/opt/pi5_harness/venv/` and seeds it from a
+  laptop-built aarch64 wheelhouse bundled as a stage asset. The wheelhouse
+  is produced inside an aarch64 Docker container on the laptop (via
+  `qemu-user-static`) so the resolver picks correct ABI tags for C-extension
+  packages like `pydantic-core`.
+- Post-flash dep updates: scp a new wheelhouse to the Pi, run
+  `pip install --upgrade --no-index --find-links=wheelhouse/ -r requirements.txt`
+  inside the venv. No image rebuild needed.
+
+**Justification:**
+- venv is pure Python; no internet required to use one, only to populate.
+- Cross-arch wheel resolution from x86_64 to aarch64 via plain `pip download`
+  silently mis-resolves C-extension wheels; in-arch resolver via a Docker
+  container is the robust fix.
+- Hybrid (apt for the runtime, wheelhouse for venv contents) gives a working
+  harness from first boot AND fast iteration on dependency changes.
+- Bake-everything-into-image (alternative considered) was rejected: every dep
+  change forces a full image rebuild.
+- Pure-apt (alternative considered) was rejected: limits us to Debian-version
+  Python packages, often well behind PyPI.
+
+### D029: Layer-by-layer network bring-up toolchain on Pi 5
+
+**Decision:** Pi 5 image includes a comprehensive network diagnostic toolchain
+that exercises each OSI layer in isolation. Bring-up and debugging proceed
+layer by layer; tools at layer N test only layer N.
+
+**Tools by layer:**
+
+| Layer | Verifies | Tools |
+|-------|----------|-------|
+| L1 physical | link state, speed, CRC errors | `ethtool`, `ip link` |
+| L2 frame | bridge state, TAP carrier, ARP resolution | `bridge` (iproute2), `arping`, `tcpdump` |
+| L3 IP | reachability both directions, routing | `iputils-ping`, `mtr-tiny`, `traceroute`, `ip route` |
+| L4 TCP/UDP | listen/connect, payload integrity, port state | `ncat`, `socat`, `iperf3`, `nmap`, `ss` |
+| L5/6 TLS | handshake, cert chain, cipher negotiation, alerts | `openssl`, `gnutls-bin`, `testssl.sh` (scp'd) |
+| L7 HTTP(S) | GET/POST, keep-alive, chunked, status codes | `curl`, `wget` |
+
+Plus `tcpdump` for capture at any layer (run on Pi to observe guest↔bridge,
+on laptop to observe wire-level), with pcap files scp'd to laptop for
+Wireshark offline. `scapy` lives in the `pi5_harness` Python venv (per D028)
+for programmatic L2/L3/L4 packet crafting from harness code.
+
+**Justification:**
+- Direct application of CLAUDE.md "isolate what you test": when a test fails
+  at layer N, the diagnostic at layer N tells you whether the problem is at
+  N or below — not entangled with higher layers.
+- All tools are standard Debian packages — installed via apt during pi-gen.
+- `scapy` in Python (rather than shell-tool spawning) lets the harness craft
+  precise frames inline, the same approach used on ws_pi5 for L2 testing.
+- Comprehensive list rather than minimal set: 128 GB SD card per D023, no
+  disk pressure, and missing tools at debug time cost more than the disk.
+
+### D030: Full GNU dev env on Pi 5 + BPF observability
+
+**Decision:** Pi 5 image includes a complete native dev environment, enabling
+"scp source and build" as a recovery path for any tool we discover we need.
+Installed via apt during pi-gen.
+
+**Toolchain:**
+- `build-essential` (gcc, g++, make, libc6-dev), `gdb`, `gdbserver`,
+  `strace`, `ltrace`, `lsof`.
+- Build systems: `cmake`, `ninja-build`, `meson`, `autoconf`, `automake`,
+  `libtool`, `pkg-config`, `git`.
+
+**Common dev libraries (headers for build-from-source workflow):**
+- `libssl-dev`, `zlib1g-dev`, `liblzma-dev`, `libzstd-dev`,
+  `libcurl4-openssl-dev`, `libsqlite3-dev`, `libreadline-dev`,
+  `libedit-dev`, `python3-dev`.
+
+**Profile and observability:**
+- `linux-perf` (Pi-kernel-matched variant) for CPU profiling.
+- `valgrind` for memory analysis.
+- `bpftrace` for ad-hoc kernel tracing.
+- `bpftool` for low-level BPF program inspection.
+- `bpfcc-tools` — BCC's prebuilt suite (`tcpconnect`, `tcplife`, `execsnoop`,
+  `bindsnoop`, `biolatency`, `trace`, etc.).
+
+**Utilities:** `vim`, `tmux`, `less`, `rsync`, `jq`, `yq`.
+
+**Justification:**
+- Pi 5 is a DUT (device under test) — observability tooling earns its weight
+  there in a way it wouldn't on a stripped-down production node.
+- BCC and bpftrace give live kernel/process visibility essential when
+  diagnosing bare-metal-guest failures from the host side.
+- 128 GB SD card per D023 — disk usage is rounding error.
+- "scp + build" as a recovery path: if we discover at debug time we need a
+  tool that isn't installed, having the toolchain on the Pi means we can
+  build it locally without bouncing back to the laptop and re-flashing.
+- Compatible with D026: Firecracker still cross-built on the laptop per that
+  decision; this dev env is for ad-hoc auxiliary tools, not production-
+  pinned binaries.
+
+### D031: TLS scope — production-ready TLS 1.2 + 1.3 stack, 2013-onwards compatibility
+
+**Decision:** fireasmserver implements a production-ready TLS server stack in
+100% assembly per D003. Full feature set from the start; no scope deferrals.
+Client compatibility window: approximately 2013 onwards.
+
+**Protocols:** TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246), both fully
+supported. Configuration profile per RFC 7525 + RFC 9325 BCP. Excluded:
+SSLv3, TLS 1.0, TLS 1.1 (pre-2013 / actively unsafe).
+
+**Key exchange:** ECDHE (x25519, secp256r1, secp384r1); FFDHE (ffdhe2048,
+ffdhe3072, ffdhe4096; RFC 7919); RSA kex in 1.2 (still dominant in 2013;
+required for OEM long-tail compat). Per-deployment profile configurable;
+forward-secrecy-only is the recommended default.
+
+**Cipher suites:**
+- TLS 1.3: all five MTI suites (AES-128/256-GCM, ChaCha20-Poly1305,
+  AES-128-CCM variants).
+- TLS 1.2: ECDHE-ECDSA / ECDHE-RSA / DHE-RSA with AES-GCM, AES-CBC-HMAC-SHA,
+  ChaCha20-Poly1305.
+- Excluded: RC4, 3DES, EXPORT, anonymous, static-DH (all actively broken).
+
+**Signature algorithms:** ECDSA (P-256/P-384/P-521), RSA-PSS, RSA-PKCS1 v1.5
+(1.2 compat), Ed25519.
+
+**Features:**
+- mTLS (client certificate authentication).
+- Session resumption: PSK (1.3), session ID + session ticket (1.2).
+- 0-RTT early data with replay protection.
+- SNI (RFC 6066), ALPN (RFC 7301), OCSP stapling, secure renegotiation
+  (RFC 5746), key update (1.3).
+- Extended Master Secret (RFC 7627) for 1.2 — required hygiene.
+- Encrypt-then-MAC (RFC 7366) for 1.2 CBC suites — preferred when peer
+  supports.
+- Heartbeat extension (RFC 6520) explicitly NOT implemented (Heartbleed
+  mitigation).
+
+**Certificate lifecycle:**
+- ACMEv2 client (RFC 8555) for Let's Encrypt and other ACME-compatible CAs.
+- Private CA injection path (OEM provisioning scenarios).
+- Full chain validation with configurable trust anchors.
+- Hostname matching per RFC 6125.
+
+**Hardware acceleration (per CLAUDE.md "check accelerations first"):**
+- AArch64: ARMv8 AES (`AESE`/`AESD`/`AESMC`), SHA-256 (`SHA256H`/`SHA256SU0`),
+  `PMULL`/`PMULL2` for GHASH, NEON for ChaCha20/Poly1305.
+- x86_64: AES-NI (`AESENC`/`AESENCLAST`), `PCLMULQDQ` for GHASH, SHA-NI where
+  available (SSSE3/AVX2 fallback), AVX2 for ChaCha20/Poly1305.
+- Modular exponentiation (RSA, FFDHE): bignum routines optimized for each
+  arch's multiply-accumulate primitives.
+
+**Layer-by-layer bring-up:**
+
+1. **Crypto primitives** — AES-{128,256}-{GCM,CBC,CCM}, SHA-{256,384,512},
+   HMAC, ChaCha20-Poly1305, x25519, secp{256,384,521}r1 point ops, Ed25519,
+   RSA modexp/PSS/PKCS1, HKDF, TLS 1.2 PRF, CSPRNG. Verified against NIST
+   CAVP, Wycheproof, RFC test vectors.
+2. **ASN.1/DER + X.509 parser** — DER decoder, certificate chain parser,
+   signature verification, hostname matching. Hand-crafted certs + real
+   Let's Encrypt certs as positive tests; Wycheproof corpus as negative.
+3. **Record layer** — TLS 1.3 AEAD; TLS 1.2 AEAD + CBC-HMAC (Encrypt-then-
+   MAC preferred, MAC-then-encrypt with constant-time anti-Lucky13 fallback).
+   Fixed-key vectors from RFC 8448 (1.3) and RFC 5246 §6.2 (1.2).
+4. **Handshake state machine** — full and resumed flows for both versions;
+   mTLS path; 0-RTT path with replay protection; key update; secure
+   renegotiation; Extended Master Secret. RFC 8448 byte-accurate tests for
+   1.3; RFC 5246 + custom vectors for 1.2.
+5. **Certificate lifecycle** — ACMEv2 issuance flow; private CA injection;
+   OCSP stapling fetch + cache + serve; cert reload without service
+   interruption.
+6. **End-to-end interop** — `openssl s_client` (multi-version, multi-suite),
+   `gnutls-cli`, `curl`, `testssl.sh` clean run, real browser interop matrix.
+
+**Justification:**
+- fireasmserver targets OEM commercial deployment; the OEM channel cannot
+  dictate client compatibility windows. Full spec coverage within the
+  2013-onwards window is a market requirement, not a luxury.
+- Implementing the full stack from the start is cheaper than retrofitting
+  later — TLS internals (record layer, key schedule, state machine) deeply
+  shape higher-layer structure.
+- 100% assembly + HW-accelerated crypto is a defensible commercial
+  differentiator: the implementation effort is the moat. ISA-native
+  AES/SHA/PMULL instructions map directly to crypto operations, per D003.
+- RFC 8448 (1.3) and RFC 5246 (1.2) byte-accurate test vectors enable
+  deterministic per-layer unit tests without a live peer, matching
+  CLAUDE.md "repro before fix" discipline.
+- Exclusions (SSLv3, TLS 1.0/1.1, RC4, 3DES, EXPORT, anonymous, static-DH,
+  Heartbeat) are not deferrals — they are explicit exclusions on safety or
+  compatibility-window grounds.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
