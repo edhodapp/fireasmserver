@@ -795,6 +795,60 @@ with no perceptible difference from a developer's perspective.
 reachability remains blocked per D024; apt-cacher-ng does not open a general
 outbound path.
 
+### D036: Pi 5 backup strategy — two-tier rsync + hot-dd over SSH
+
+**Decision:** Pi 5 backups are taken over SSH from the laptop with the Pi
+running. No SD card removal for routine backup operations. Two tools cover
+different cadences:
+
+1. `tooling/pi5_build/backup_pi_rsync.sh` — fast, file-level, hardlink-
+   snapshotted under `build/pi-backup/snapshots/`. Run frequently. Covers
+   "I broke something, put me back" via rsync-restore without reflashing.
+2. `tooling/pi5_build/backup_pi_dd.sh` — slow, block-level hot SSH-dd,
+   produces a sparse `.img` under `build/pi-backup/images/` that
+   `flash_sd_card.sh` restores to a new SD card. Run weekly or after
+   major changes. Covers SD card death.
+
+**Why not cold-dd via SD-in-laptop-reader:** The Pi 5 sits in a Vilros case
+with a fan shroud; SD removal requires smooth-jaw needle-nose pliers and
+has real risk of damaging the card. Routine operations cannot require SD
+pulling. Cold-dd is retained as a tool (`flash_sd_card.sh` is unchanged)
+but only for the one-time restore-to-new-card path that an SD death or
+replacement already implies.
+
+**Consistency model:**
+- rsync: file-level snapshot with rsync's normal "read-while-open"
+  semantics. Active writes to specific files may produce inconsistent
+  captures of those files; the rootfs as a whole is otherwise consistent
+  enough for file-level restore.
+- hot-dd: crash-consistent (equivalent to pulling power during the read).
+  ext4 journal is whatever state it happened to be; normal fsck replay on
+  restore boot handles it.
+
+**Performance:**
+- rsync after first sync: seconds to minutes (delta-only).
+- hot-dd: full card-size transfer over the laptop↔Pi USB NIC, realistic
+  throughput ~20–30 min for a 120 GB card.
+- Periodic `--zerofill` on `backup_pi_dd.sh` fills the rootfs free space
+  with zeros so `conv=sparse` produces a compact image. Run monthly, not
+  per-backup — it writes the full card and consumes SD write endurance.
+
+**Restore paths:**
+- rsync: `rsync --delete <snapshot>/ ed@pi:/` (over SSH with sudo-rsync).
+  Test by SSH first, then selectively restore paths, then whole-tree.
+- hot-dd: `IMG_PATH=<.img> ./flash_sd_card.sh /dev/sdX` against a new or
+  replacement card in a USB reader — the only SD-in-laptop event in the
+  normal lifecycle.
+
+**Rejected alternatives:**
+- Cold-dd routine backup: mechanical risk in the Vilros case per above.
+- Tar + partition-rebuild restore: complex restore script, fragile.
+  Bit-perfect hot-dd plus existing `flash_sd_card.sh` handles the same
+  failure mode more simply.
+- rsync-only (no block-level path): cannot reconstruct a bootable card
+  from file-level backup alone; SD-death recovery would still require a
+  pi-gen rebuild, defeating the "avoid pi-gen" motivation.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
