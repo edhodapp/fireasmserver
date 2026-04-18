@@ -31,6 +31,14 @@ _start:
     .long   0                   // reserved (PE-COFF offset, unused)
 
 _entry:
+    // Per the Linux arm64 boot protocol, all vCPUs enter here. Park any
+    // secondary CPU (non-zero MPIDR_EL1.Aff0) at the WFE loop — the
+    // primary does the UART work alone to avoid interleaved writes.
+    // Firecracker assigns Aff0 = vCPU index, so Aff0=0 is the primary.
+    mrs     x5, mpidr_el1
+    and     x5, x5, #0xff
+    cbnz    x5, .Ldone
+
     // PL011 UART base in x0.
     // movz #0x0900, lsl #16  == x0 = 0x0900_0000 (single instruction,
     // no literal pool — keeps the stub position-independent and small).
@@ -43,10 +51,13 @@ _entry:
     mov     w2, #(ready_msg_end - ready_msg)
 
 .Lwrite:
-    cbz     w2, .Ldone
+    cbz     w2, .Lflush
 
     // Poll FR (offset 0x18), bit 5 = TXFF. Wait until TX FIFO has room.
+    // `yield` is a HINT on AArch64 — no semantic effect, just tells the
+    // hypervisor this CPU is in a spin-wait so it can schedule elsewhere.
 .Lwait:
+    yield
     ldr     w3, [x0, #0x18]
     tbnz    w3, #5, .Lwait
 
@@ -58,8 +69,13 @@ _entry:
     sub     w2, w2, #1
     b       .Lwrite
 
+    // Drain any outstanding UART writes before halting. Secondary CPUs
+    // that branched directly to .Ldone skip this — they never wrote.
+.Lflush:
+    dsb     sy
+
 .Ldone:
-    // WFE forever — Firecracker will see halt via MMIO quiescence.
+    // WFE forever — Firecracker sees halt via MMIO quiescence.
     wfe
     b       .Ldone
 
