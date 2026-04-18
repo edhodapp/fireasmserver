@@ -573,6 +573,108 @@ forward-secrecy-only is the recommended default.
   Heartbeat) are not deferrals — they are explicit exclusions on safety or
   compatibility-window grounds.
 
+### D032: Crypto math implementation strategy — ISA-idiomatic, macros-first, constant-time, cache-aware
+
+**Decision:** Cryptographic primitives for fireasmserver (supporting D031's
+TLS stack) are implemented under four binding design principles:
+
+**1. ISA-idiomatic code.** Each arch uses its full native primitive set
+rather than a least-common-denominator interface across arches.
+- **AArch64:** 31 GPRs; UMULH + MUL for 128-bit products; MADD/MSUB for
+  multiply-accumulate; ADCS chains for carry propagation; ARMv8 crypto
+  (AESE/AESD/AESMC, SHA256H/SHA256SU0, PMULL/PMULL2 for GHASH); NEON for
+  ChaCha20/Poly1305 SIMD; LDP/STP paired load/store.
+- **x86_64:** MULX (BMI2) + ADCX/ADOX (ADX) for two parallel carry chains
+  per multiply step; AES-NI (AESENC/AESENCLAST); PCLMULQDQ for GHASH; SHA
+  extensions where available (SSSE3/AVX2 fallback); AVX2 for ChaCha20/
+  Poly1305 SIMD.
+
+**2. Macros-first, subroutines later.** Bignum and other performance-
+critical primitives are implemented as assembler macros that inline at each
+call site, not as subroutines. A subroutine ABI would force both arches
+into LCD register usage; macros let each arch use its full register file
+and idiomatic instruction sequences without ABI constraints. If code size
+becomes an issue (instruction-cache pressure, deployment footprint),
+specific primitives can be refactored to subroutines — but optimize for
+speed first, size later.
+
+**3. Constant-time is mandatory.** No data-dependent branches in crypto
+code. No data-dependent memory access patterns. No T-tables (use hardware
+AES instructions instead). Scalar multiplication uses Montgomery ladder,
+not sliding-window or other variable-time algorithms. Modular arithmetic
+uses constant-time comparisons. This is a correctness requirement, not an
+optimization — timing side channels (Bernstein 2005 on AES T-tables;
+Tromer/Osvik/Shamir 2010) defeat TLS when violated.
+
+**4. Cache-aware layout.** Hot crypto data is aligned to cache-line
+boundaries (`.balign 64`) and structured to minimize working-set size:
+- AES round keys (240 B for AES-256) → 4 contiguous cache lines.
+- SHA state (32 B) → 1 cache line.
+- Bignum operands (32 B for 256-bit) → 1 cache line.
+- Hot/cold field separation in per-connection state.
+- Prefetch instructions used deliberately (`PRFM PLDL1KEEP` on ARM,
+  `PREFETCHT0` on x86).
+
+**What we control inside a Firecracker guest:** alignment, structure
+layout, prefetch-instruction behavior, working-set sizing. Cache geometry
+is the host CPU's, not virtualized — Pi 5's Cortex-A76: 64 KB L1I +
+64 KB L1D + 512 KB L2, 64-byte lines.
+
+**What we do not control:** physical page mapping, host scheduling
+preemption, co-tenant cache pressure, TLB shootdowns. We reason about
+relative cache behavior, not absolute state from cycle 0.
+
+**Justification:**
+- ISA-idiomatic is the whole point of 100% assembly per D003. A compiler
+  would emit generic code that sacrifices each arch's specific strengths.
+  If we are writing assembly, we write each arch's *best* assembly.
+- Macros expose the full register file to each primitive operation. A
+  256-bit ECDHE keygen fully inlined is ~5000–10000 bignum ops, each
+  saving ~30–50 instructions of call overhead; cumulative savings are
+  significant. Code size grows proportionally but Cortex-A76's 64 KB L1I
+  absorbs it.
+- Constant-time is non-negotiable for production TLS. All cipher suites
+  and protocols in D031 assume constant-time underlying primitives.
+- Cache-awareness is simultaneously a performance concern (working-set
+  fits in L1) and a security concern (no data-dependent cache misses).
+  The same layout discipline satisfies both.
+- Firecracker virtualizes the CPU but passes cache geometry through; we
+  can reason about the Pi 5's specific cache hierarchy and design for it.
+
+### D033: PiOS Trixie base image — supersedes D023's Bookworm clause
+
+**Decision:** D023's "PiOS Lite 64-bit *Bookworm*" clause is superseded by
+"PiOS Lite 64-bit *Trixie*" to follow the current-stable pi-gen, which
+stopped advancing Bookworm tags in November 2025 and now targets only
+Trixie. All other D023 terms (pi-gen at pinned tag, single custom stage,
+custom KVM-enabled kernel, hostname `fireasm-test`, user `ed`, fresh scoped
+SSH key, password-login disabled, single 128 GB ext4, no runtime DNS)
+carry forward unchanged.
+
+**Version pins (current stable at 2026-04-17):**
+- pi-gen tag: `2026-04-13-raspios-trixie-arm64`
+- raspberrypi/linux branch: `rpi-6.12.y` (project default; Linux 6.12 LTS)
+- Alpine meta-rootfs (per D027): v3.23.4
+- Firecracker (per D026): v1.15.1
+
+**Knock-on effects:**
+- Python on Pi shifts from Bookworm's 3.11 to Trixie's 3.13. Still above
+  the CLAUDE.md >=3.11 floor. D008's "PiOS Bookworm ships 3.11" clause is
+  now historical context, not a live pin.
+- systemd, apt package versions, and kernel patches across the image
+  advance forward. No expected compatibility breaks for the tooling in
+  D028–D030.
+- Wheelhouse (per D028) must be built against Python 3.13 ABI tags
+  (`cp313` rather than `cp311`) — the aarch64 Docker container used to
+  resolve wheels must run Python 3.13.
+
+**Justification:**
+- Follows Ed's "current stable" directive (2026-04-17).
+- Bookworm pi-gen tags are stale (latest from Nov 2025); Trixie is
+  actively maintained.
+- Trixie has been Debian stable since mid-2025 — no bleeding-edge risk.
+- Python 3.13 is a quiet upgrade with no project-level blockers.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
