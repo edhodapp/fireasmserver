@@ -237,6 +237,151 @@ assembly projects in the product line.
 them and performs the three-level verification does not yet exist — it is the next piece
 to build in `aofire-asm-agent`.
 
+## 2026-04-17
+
+### D022: Pi 5 as local-only AArch64 test host
+
+**Decision:** The Raspberry Pi 5 is a local-only AArch64 test platform, not a
+GitHub Actions self-hosted runner. It sits on a direct Ethernet link to the
+laptop via USB NIC, with static addresses: Pi 5 `10.0.0.2/24`, laptop
+`10.0.0.1/24`. No GitHub access from the Pi. fireasmserver AArch64 build
+artifacts are produced on the laptop and delivered to the Pi via `scp`. CI
+continues to live in GitHub Actions. Supersedes the "Pi 5 self-hosted runner
+setup" item previously listed under "Future decisions."
+
+**Justification:**
+- Removes network-path failure modes (LAN flakes, GitHub outages, PAT/deploy-
+  key rotation) from the AArch64 integration test path.
+- Keeps credentials off the device — simpler security model.
+- The Pi's role is pre-push integration tests and perf measurements, not
+  per-commit fan-out; GitHub Actions handles the latter.
+- Direct Ethernet gives deterministic, isolated network behavior — no LAN
+  broadcast traffic, no DHCP, no NAT between laptop and VMs.
+
+### D023: Pi 5 image via pi-gen at pinned tag plus one custom stage
+
+**Decision:** The Pi 5 boot image is PiOS Lite 64-bit, built via pi-gen pinned
+to a specific git tag, running on the laptop (x86_64; pi-gen uses
+`qemu-user-static` for chroot stages). A single custom pi-gen stage layered on
+top of stages 0–2 performs:
+
+- Installs a custom KVM-enabled kernel built from `raspberrypi/linux` at the
+  branch matching the PiOS kernel version. Kernel config explicitly enables
+  `CONFIG_KVM=y`, `CONFIG_VIRTUALIZATION=y`, `CONFIG_ARM64_VHE=y`.
+- Sets hostname `fireasm-test`; creates user `ed` (SSH key only, password
+  login disabled).
+- Generates a fresh SSH keypair scoped to Pi-5-access during the image build.
+  Public key baked into `/home/ed/.ssh/authorized_keys`; private key written
+  to laptop `~/.ssh/` with a distinct filename.
+- `PasswordAuthentication no` in `sshd_config` from first boot.
+- Single ext4 rootfs filling the 128 GB card; no disk-usage optimization.
+- No DNS configured on the Pi at runtime (per D022's runtime-isolation scope).
+
+**Migration path:** after the image is in real use and we know what we
+actually need, revisit moving to a from-scratch debootstrap assembly (option
+(i) from the 2026-04-17 design discussion). That migration earns its own
+decision entry if/when it happens.
+
+**Justification:**
+- pi-gen encodes Pi-boot correctness that would otherwise be rediscovered by
+  breaking things: firmware blob placement, `config.txt`, `/boot/firmware`
+  layout, `kernel_2712.img` path, DTB + overlay placement.
+- Pinned tag gives reproducibility; a single custom stage keeps all project-
+  specific customization in one readable place.
+- Custom kernel (not stock) removes ambiguity about whether the shipped
+  kernel has KVM enabled, and allows offline KVM-readiness verification
+  (extract kernel config, check modules) before burning a boot cycle.
+- First-time Pi 5 bring-up from scratch trades fireasmserver progress for
+  image-assembly expertise we don't currently need.
+
+### D024: VM network — isolated bridge, routed, no NAT
+
+**Decision:** Firecracker guests on the Pi 5 attach to a Linux bridge `br1`
+(network `10.0.1.0/24`, Pi as gateway at `10.0.1.1`). The Pi sets
+`net.ipv4.ip_forward=1`. The laptop adds a static route
+`ip route add 10.0.1.0/24 via 10.0.0.2`. No MASQUERADE/NAT between `br1` and
+`eth0`. Guests get stable per-test IPs assigned by the harness; the laptop
+reaches each guest directly by IP.
+
+**Justification:**
+- Rejected option A (bridge `eth0` directly, guests on `10.0.0.0/24`): weak
+  isolation, guest ARP/DHCP leaks onto the wire, silent `br_netfilter` cost
+  if the module is loaded.
+- Rejected option B (isolated bridge + MASQUERADE NAT): conntrack per-packet
+  cost is real at high PPS on a Pi-class host; per-VM port-forwarding needed
+  for laptop→guest reachability adds friction for parallel test VMs.
+- Option C (chosen): per-VM stable addressability, direct laptop↔guest paths,
+  no conntrack overhead, no port-forward gymnastics. Cost is one static route
+  on the laptop and one sysctl on the Pi.
+
+### D025: Flexible VM parallelism with opt-in CPU pinning
+
+**Decision:** The number of concurrent Firecracker VMs is a runtime parameter
+of the test harness, not baked into the image. Functional tests run unpinned
+— kernel scheduler places vCPUs across the Pi's four cores. Performance tests
+pin vCPUs per-run via cgroups v2 and `taskset`. The host kernel command line
+does **not** set `isolcpus`.
+
+**Justification:**
+- Matches the separation between functional and performance test regimes
+  (per ~/.claude/CLAUDE.md).
+- Keeps the image single-purpose; perf-vs-functional is a runtime decision,
+  not an image-build decision.
+- `isolcpus` would make the Pi unsuitable for anything but pinned-core
+  workloads and waste host cores when not running perf tests. Cgroups +
+  `taskset` provide the same isolation on demand without the host-wide cost.
+
+### D026: Firecracker built from upstream source, pinned tags, multi-version
+
+**Decision:** Firecracker is built from `github.com/firecracker-microvm/
+firecracker` at specific release tags. Both architectures are produced on the
+laptop:
+
+- **x86_64**: native `cargo build --release`.
+- **aarch64**: cross-compiled against `aarch64-unknown-linux-musl` for a
+  static binary (no runtime libc dependency on the Pi).
+
+Multiple versioned binaries are installed side-by-side at
+`/opt/firecracker/v<ver>/firecracker`. The test harness selects a version per
+test. Starting pin = upstream stable at first build (exact tag recorded in
+the build script once chosen). "Keep up to date" = adding a new
+`/opt/firecracker/v<newver>/` alongside existing ones, never replacing the
+pinned primary. Pi 5 receives built binaries via `scp`; the Rust toolchain
+stays off the Pi.
+
+**Justification:**
+- Precise version control across the two-arch × multi-version matrix.
+- Patch capability if we ever need to fix or instrument Firecracker itself.
+- Rust builds are reproducible with a locked `Cargo.lock`; the same source
+  tree yields the same binary.
+- Laptop-only build keeps the Pi lean.
+- Prebuilt GitHub Release binaries (the simpler alternative) were rejected
+  because the multi-version + future-patch requirements are better served by
+  a first-class source build from the start.
+
+### D027: Alpine minimal rootfs for meta-testing, both arches
+
+**Decision:** The minimal guest Linux rootfs used for meta-testing is Alpine
+Linux (musl libc, busybox userspace), built for both AArch64 (Firecracker on
+Pi 5) and x86_64 (Firecracker on laptop). Image built from `alpine-minirootfs`
+tarballs at a pinned Alpine version.
+
+**Scope:** Applies only to the meta-test rootfs. fireasmserver guests remain
+bare-metal assembly images per the arch-specific boot decisions (D014, D020,
+and the forthcoming AArch64 ARM64 Linux boot protocol decision).
+
+**Justification:**
+- Alpine is essentially init + shell + networking tools — exactly the surface
+  meta-tests exercise (bridge, routing, virtio-net, CPU pinning).
+- Small footprint (~5 MB compressed, ~15 MB uncompressed) keeps VM boot
+  times low and memory cost minimal when running many in parallel.
+- Clean separation from "application" behavior: nothing in Alpine resembles
+  fireasmserver, so passing meta-tests cleanly indicate the host/VMM/network
+  path is healthy, independent of any assembly code.
+- Debian slim considered and rejected for this role: too large, too much
+  userspace to discount when diagnosing failures. Debian could re-enter as a
+  second meta-rootfs if glibc-specific behavior ever needs to be tested.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
