@@ -751,6 +751,50 @@ conservative builds.
   at build time rather than relying on conditional macros scattered
   through the code.
 
+## 2026-04-18
+
+### D035: Pi 5 package source — apt-cacher-ng on the laptop
+
+**Decision:** The Pi 5 gets Debian packages through an `apt-cacher-ng` proxy
+running on the laptop at `10.0.0.1:3142`. The Pi's APT configuration
+(`/etc/apt/apt.conf.d/00proxy`) points at that proxy. Laptop has internet;
+Pi does not. Running `sudo apt install foo` on the Pi transparently flows
+requests to the laptop, which fetches from `deb.debian.org`, caches locally,
+and serves the `.deb` back to the Pi. D024's "no direct internet route from
+the Pi" constraint is preserved — the Pi only ever talks to the laptop.
+
+**What this replaces:** The implicit "rerun pi-gen to add a package" flow.
+That's a 30–60 minute cycle per package change and is unsuitable for routine
+development. apt-cacher-ng turns it into a normal `apt install` on the Pi
+with no perceptible difference from a developer's perspective.
+
+**Setup:**
+1. Laptop: `sudo apt install apt-cacher-ng`; service listens on port 3142.
+2. Laptop: firewall rule to allow only `10.0.0.0/24` on port 3142 (isolate
+   the cache from the LAN).
+3. Pi: write `/etc/apt/apt.conf.d/00proxy` with
+   `Acquire::http::Proxy "http://10.0.0.1:3142";`.
+4. Next pi-gen rebuild bakes the proxy config into the image so it's present
+   from first boot. For the already-running Pi, the laptop ships the file in
+   via `scp` once.
+
+**Justification:**
+- **Preserves D022 + D024.** Pi stays on the isolated bridge, no credentials,
+  no direct internet route. Only new traffic is Pi → laptop on one TCP port.
+- **Rejects direct `.deb` fetch + `scp` + `dpkg -i`.** Works for one-off
+  cases but requires dependency resolution on the laptop against a
+  Trixie-arm64 chroot — reimplementing apt's job. apt-cacher-ng is apt doing
+  its own job via a proxy, which is strictly less code to own.
+- **Rejects temporary NAT / MASQUERADE during apt ops.** Ugly toggle state,
+  easy to forget on, contradicts D024 intermittently.
+- **Caching is a bonus.** Repeated `apt install` across rebuilds hits the
+  laptop cache, not the internet — faster, and works offline for anything
+  seen before.
+
+**Scope note:** D035 is about APT traffic only. Generic Pi → internet
+reachability remains blocked per D024; apt-cacher-ng does not open a general
+outbound path.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
