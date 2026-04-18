@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 Ed Hodapp
+//
+// Minimal aarch64 Firecracker guest stub for pipeline verification.
+// Writes "READY\n" to PL011 UART at 0x09000000, then WFE-halts.
+//
+// Image format: Linux arm64 Image (per the Firecracker aarch64 boot
+// protocol — kernel file is a Linux Image header + code, loaded at
+// RAM_BASE + text_offset).
+//
+// Firecracker aarch64 defaults:
+//   RAM base  = 0x8000_0000
+//   text_off  = 0x0008_0000
+//   load addr = 0x8008_0000
+//   PL011 UART MMIO = 0x0900_0000
+
+.section .text, "ax"
+.globl _start
+
+_start:
+    // ----- Linux arm64 Image header (64 bytes) -----
+    b       _entry              // code0: branch past the header to entry
+    // code1: in the EFI-stub variant this is a second valid instruction;
+    // Firecracker doesn't EFI-boot, so 0 is fine.
+    .long   0                   // code1: reserved (non-EFI boot path)
+    .quad   0x80000             // text_offset: offset from RAM base
+    .quad   _image_end - _start // image_size
+    .quad   0                   // flags (4K pages, little-endian)
+    .quad   0, 0, 0             // reserved
+    .long   0x644D5241          // magic ("ARM\x64")
+    .long   0                   // reserved (PE-COFF offset, unused)
+
+_entry:
+    // PL011 UART base in x0.
+    // movz #0x0900, lsl #16  == x0 = 0x0900_0000 (single instruction,
+    // no literal pool — keeps the stub position-independent and small).
+    movz    x0, #0x0900, lsl #16
+
+    // Message pointer in x1, remaining byte count in w2.
+    adr     x1, ready_msg
+    mov     w2, #6               // "READY\n" length
+
+.Lwrite:
+    cbz     w2, .Ldone
+
+    // Poll FR (offset 0x18), bit 5 = TXFF. Wait until TX FIFO has room.
+.Lwait:
+    ldr     w3, [x0, #0x18]
+    tbnz    w3, #5, .Lwait
+
+    // Write one byte to DR (offset 0x00). strb matches the ldrb width —
+    // upper bits of w4 are zero from the load, so a full-word str would
+    // also work, but strb is idiomatic and safer if the load ever changes.
+    ldrb    w4, [x1], #1
+    strb    w4, [x0]
+    sub     w2, w2, #1
+    b       .Lwrite
+
+.Ldone:
+    // WFE forever — Firecracker will see halt via MMIO quiescence.
+    wfe
+    b       .Ldone
+
+ready_msg:
+    .ascii  "READY\n"
+
+_image_end:
