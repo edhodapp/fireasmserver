@@ -22,8 +22,8 @@ arch/
   aarch64/
     Makefile
     platform/
-      firecracker/          # Linux arm64 Image format — tracer-bullet
-        boot.S              # PL011 UART at 0x09000000, WFE halt
+      firecracker/          # Linux arm64 Image format — tracer-bullet GREEN
+        boot.S              # 8250 UART at 0x40002000, WFE halt
         linker.ld
       qemu/                 # (future; Pi 5 is Firecracker-only in scope)
 ```
@@ -53,7 +53,7 @@ Two hosts cooperate during development:
 
 Snapshot strategy for the Pi (D036): `backup_pi_rsync.sh` for fast incremental hardlink snapshots, `backup_pi_dd.sh` for crash-consistent block-level images that `flash_sd_card.sh` can restore. Both run with the Pi up — no SD removal for routine backups.
 
-See [DECISIONS.md](DECISIONS.md) for the full architecture decision log (D001–D036).
+See [DECISIONS.md](DECISIONS.md) for the full architecture decision log (D001–D037).
 
 ## Building
 
@@ -94,11 +94,11 @@ python3.11 -m venv .venv
 Early implementation. What's in place:
 
 - **x86_64** — Multiboot1 stub (QEMU) and PVH ELF64 stub (Firecracker) both boot and emit `READY\n` on serial under their respective VMMs. VM launcher and test harness wire up launch + ready-marker polling + clean teardown. 100+ Python tests passing, CI green.
-- **AArch64** — Firecracker tracer-bullet stub built as a valid Linux arm64 Image (138 B, PL011 UART writer, MPIDR-gated, DSB-flushed). Integration onto the Pi 5 Firecracker host is the next milestone.
-- **Pi 5 local test host** — PiOS Trixie 64-bit custom-built via pi-gen with a KVM-enabled kernel, static `10.0.0.2/24` on USB NIC, pubkey-only SSH, first-user password random-per-build. `apt-cacher-ng` proxy on the laptop makes the Pi's package world work through a single bridge hop (D035). Two-tier backup strategy (D036) keeps snapshots without SD removal.
-- **Decision log** currently at D001–D036; all load-bearing architectural choices recorded as immutable entries in [DECISIONS.md](DECISIONS.md).
+- **AArch64 tracer bullet GREEN** — 142-byte Linux arm64 Image stub boots under Firecracker on the Pi 5, writes `READY\n` to the emulated 8250 UART (at `0x40002000`), and the laptop observes the marker through SSH-captured serial in roughly 2 s wall-clock from `make`. Orchestration in [`tooling/tracer_bullet/pi_aarch64_firecracker.sh`](tooling/tracer_bullet/pi_aarch64_firecracker.sh).
+- **Pi 5 local test host** — PiOS Trixie 64-bit custom-built via pi-gen with a KVM-enabled kernel, static `10.0.0.2/24` on USB NIC, pubkey-only SSH, first-user password random-per-build. Firecracker v1.15.1 installed from the upstream prebuilt release (D037 amends D026 during bring-up). `apt-cacher-ng` proxy on the laptop makes the Pi's package world work through a single bridge hop (D035). Two-tier backup strategy (D036) keeps snapshots without SD removal.
+- **Decision log** currently at D001–D037; all load-bearing architectural choices recorded as immutable entries in [DECISIONS.md](DECISIONS.md).
 
-Next milestones: Firecracker cross-build or install on Pi 5, SSH-orchestrated AArch64 tracer-bullet run, branch-coverage tool, full arch × platform CI matrix, then the VMIO engine, virtio-net driver, TCP stack, and HTTP server in assembly.
+Next milestones: branch-coverage tool (capstone + pyelftools-based, run on the `guest.elf` against QEMU `-d exec` traces), full arch × platform CI matrix in GitHub Actions, then the VMIO automaton engine, virtio-net driver, TCP stack, and HTTP server in assembly — AArch64 pulled up from [ws_pi5](https://github.com/edhodapp/ws_pi5) at the L2/L3 boundary, x86_64 implemented in parallel.
 
 ## License
 
