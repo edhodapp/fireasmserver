@@ -675,6 +675,82 @@ carry forward unchanged.
 - Trixie has been Debian stable since mid-2025 — no bleeding-edge risk.
 - Python 3.13 is a quiet upgrade with no project-level blockers.
 
+### D034: Hardware platform profiles — parameterized cache and ISA features
+
+**Decision:** Cache constants and ISA feature gates in fireasmserver crypto
+code are parameterized by a build-time hardware *profile*, not hardcoded.
+Supersedes the Pi 5-concrete cache numbers cited in D032 while keeping
+D032's principles (ISA-idiomatic, macros-first, constant-time, cache-aware)
+intact.
+
+**Initial profile set:**
+
+| Profile | CPU core | Role |
+|---------|----------|------|
+| `pi5` | Cortex-A76 | dev/test per D022 |
+| `graviton2` | Neoverse N1 | AWS production |
+| `graviton3` | Neoverse V1 | AWS production |
+| `graviton4` | Neoverse V2 | AWS production; also Google Axion, Azure Cobalt, Ampere AltraMax |
+| `intel-skylake` | Skylake-SP | Intel production (baseline) |
+| `intel-icelake` | Ice Lake-SP | Intel production |
+| `intel-sapphire-rapids` | Sapphire Rapids | Intel production |
+| `intel-emerald-rapids` | Emerald Rapids | Intel production |
+| `intel-granite-rapids` | Granite Rapids | Intel production |
+| `amd-zen3` | Milan | AMD EPYC production |
+| `amd-zen4` | Genoa | AMD EPYC production |
+| `amd-zen5` | Turin | AMD EPYC production |
+| `generic-aarch64` | — | conservative fallback |
+| `generic-x86_64` | — | conservative fallback |
+
+**Per-profile parameters** (exposed as `.equ` constants via a profile-
+specific `.S` include file):
+- `CACHE_LINE_SIZE` (bytes; 64 on every currently listed profile).
+- `L1I_SIZE`, `L1D_SIZE`, `L2_SIZE` (bytes, per-core).
+- `L1D_ASSOCIATIVITY`, `L2_ASSOCIATIVITY`.
+- `PREFETCH_DISTANCE` (bytes ahead, tuned per microarchitecture).
+- ISA feature flags:
+  - **AArch64:** `HAS_ARMV8_AES`, `HAS_ARMV8_SHA256`, `HAS_ARMV8_SHA512`,
+    `HAS_PMULL`, `HAS_SVE`, `HAS_SVE2`.
+  - **x86_64:** `HAS_AES_NI`, `HAS_PCLMULQDQ`, `HAS_SHA_NI`, `HAS_AVX2`,
+    `HAS_AVX512F`, `HAS_VAES`, `HAS_VPCLMULQDQ`, `HAS_BMI2`, `HAS_ADX`.
+
+**Selection:** build-time via Makefile variable, e.g.
+`make ARCH=aarch64 PROFILE=graviton3`. Default profiles: `pi5` for AArch64
+dev, a locally-appropriate Intel/AMD profile for the x86_64 laptop;
+`generic-aarch64` and `generic-x86_64` for "build once, run anywhere"
+conservative builds.
+
+**No runtime CPU dispatch in the initial implementation:**
+- Adds branches to crypto hot paths.
+- Typical Firecracker deployment is homogeneous (AWS spins only Gravitons;
+  Fly chooses specific host pools). Build-time profile matches deployment
+  reality.
+- Runtime-selected dispatch stubs can be introduced later if deployment
+  patterns demand it — that would be a separate decision.
+
+**Profile conformance with D031 crypto requirements:**
+- Every AArch64 profile must expose ARMv8 AES + SHA-256 + PMULL at minimum.
+  Cortex-A55 and A72 (no SHA extensions) are explicitly excluded from
+  server profiles.
+- Every x86_64 profile must expose AES-NI + PCLMULQDQ at minimum. SHA-NI,
+  AVX2, AVX-512, VAES, VPCLMULQDQ enable faster paths where present.
+
+**Justification:**
+- Hardcoding Pi 5's 64 KB L1D or Cortex-A76's prefetch distance into crypto
+  code creates a false dependency and risks incorrect performance on
+  production hardware.
+- The production deployment surface is AWS Graviton + Intel/AMD server
+  families. Pi 5 is a dev target per D022. D032's layout principles were
+  right; its concrete numbers were parochial.
+- Build-time profiling keeps generated code as tight as ISA-specific
+  assembly should be, without runtime dispatch overhead.
+- Cache line size is 64 bytes on every profile listed. Apple Silicon
+  (128 B) and POWER (128 B) are not Firecracker deployment targets and
+  therefore not in profile scope.
+- ISA feature flags make the "use AVX-512 where present" pattern explicit
+  at build time rather than relying on conditional macros scattered
+  through the code.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
