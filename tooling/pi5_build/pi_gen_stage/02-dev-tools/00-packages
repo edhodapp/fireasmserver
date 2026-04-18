@@ -1,0 +1,6 @@
+build-essential gdb gdbserver strace ltrace lsof
+cmake ninja-build meson autoconf automake libtool pkg-config
+libssl-dev zlib1g-dev liblzma-dev libzstd-dev
+libcurl4-openssl-dev libsqlite3-dev libreadline-dev libedit-dev
+valgrind
+vim tmux less rsync jq

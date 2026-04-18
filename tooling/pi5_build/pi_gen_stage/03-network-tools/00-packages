@@ -1,0 +1,6 @@
+ethtool iproute2 bridge-utils
+iputils-arping iputils-ping tcpdump
+mtr-tiny traceroute
+ncat socat iperf3 nmap
+openssl gnutls-bin
+curl wget

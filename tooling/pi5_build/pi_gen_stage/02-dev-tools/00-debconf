@@ -1,0 +1,2 @@
+debconf debconf/frontend select noninteractive
+debconf debconf/priority select critical

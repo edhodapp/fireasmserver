@@ -1,0 +1,7 @@
+# Preseed packages that fire debconf dialogs even with the parent script's
+# DEBIAN_FRONTEND=noninteractive set, because they have no recorded default.
+# iperf3: "run as a daemon at boot?" — we invoke it on demand from tests.
+iperf3 iperf3/start_daemon boolean false
+# wireshark-common: pulled as a Recommends by nmap/tcpdump on Debian.
+# "Allow non-superusers to capture packets?" — no; test host runs tools as root.
+wireshark-common wireshark-common/install-setuid boolean false
