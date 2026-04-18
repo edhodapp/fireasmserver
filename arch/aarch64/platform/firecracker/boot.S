@@ -36,9 +36,11 @@ _entry:
     // no literal pool — keeps the stub position-independent and small).
     movz    x0, #0x0900, lsl #16
 
-    // Message pointer in x1, remaining byte count in w2.
+    // Message pointer in x1, remaining byte count in w2. The length is
+    // a link-time constant so editing ready_msg doesn't require keeping
+    // a numeric count in sync.
     adr     x1, ready_msg
-    mov     w2, #6               // "READY\n" length
+    mov     w2, #(ready_msg_end - ready_msg)
 
 .Lwrite:
     cbz     w2, .Ldone
@@ -63,5 +65,6 @@ _entry:
 
 ready_msg:
     .ascii  "READY\n"
+ready_msg_end:
 
 _image_end:
