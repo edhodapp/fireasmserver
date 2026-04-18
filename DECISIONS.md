@@ -849,6 +849,40 @@ replacement already implies.
   from file-level backup alone; SD-death recovery would still require a
   pi-gen rebuild, defeating the "avoid pi-gen" motivation.
 
+### D037: Firecracker install — prebuilt binary for now, build-from-source deferred
+
+**Decision:** Install Firecracker on the Pi 5 (and reuse the same upstream
+tarball convention on the laptop when needed) from the **official GitHub
+release tarball**, not from source. This amends — does not supersede —
+D026's "build from upstream source, pinned tags, multi-version" policy.
+D026's long-term target remains valid; the amendment is temporal.
+
+**Version pin:** `v1.15.1` across both hosts for protocol symmetry during
+tracer-bullet bring-up.
+
+**Rationale:**
+- Time-to-first-green matters while the AArch64 tracer bullet is the
+  critical-path artifact. Prebuilt shaves ~30–60 min of Pi-side Rust
+  toolchain install + cargo build off the cycle.
+- The multi-version story D026 anticipates (running several Firecracker
+  releases side-by-side in CI) isn't yet load-bearing. A single pinned
+  prebuilt fulfills every current test.
+- Patching Firecracker source isn't needed — upstream v1.15.1 exposes
+  everything we use (PVH x86_64, Linux Image aarch64, `--no-api`,
+  serial → file, `--config-file`).
+
+**Migration trigger — revisit D026 when any applies:**
+- CI needs >1 Firecracker version concurrently (e.g., compat matrix
+  for downstream deployments).
+- A Firecracker bug surfaces that requires a source-level patch or
+  custom build-time config.
+- Upstream stops providing binary tarballs for either target arch.
+
+**Security notes:** The install script downloads from
+`github.com/firecracker-microvm/firecracker/releases`, verifies SHA256
+against the published checksum, and does a final `firecracker --version`
+sanity check on the Pi post-install.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
