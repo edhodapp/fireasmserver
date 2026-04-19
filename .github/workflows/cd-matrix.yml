@@ -1,0 +1,88 @@
+name: CD matrix (arch × platform)
+
+# Build-only MVP per D005. Every commit to main (and every PR against
+# main) builds the four (arch, platform) cells from a clean checkout.
+# Validates the cross-toolchain + Makefile + linker-script triad on
+# fresh GitHub-hosted runners. VM-launch-level coverage in CI is
+# follow-up work; today the per-cell guest-boot is exercised by the
+# local pytest harness + the Pi-side tracer-bullet orchestration.
+#
+# `aarch64/firecracker` is marked experimental: Firecracker requires
+# /dev/kvm, and /dev/kvm availability on the free ubuntu-24.04-arm
+# hosted runner is not yet confirmed. The cell builds regardless
+# (binutils cross-toolchain is independent of KVM); the probe step
+# surfaces whether a subsequent boot step would be viable. Drop the
+# experimental flag once the probe is consistently green.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            platform: qemu
+            runner: ubuntu-latest
+            experimental: false
+          - arch: x86_64
+            platform: firecracker
+            runner: ubuntu-latest
+            experimental: false
+          - arch: aarch64
+            platform: qemu
+            runner: ubuntu-latest
+            experimental: false
+          - arch: aarch64
+            platform: firecracker
+            runner: ubuntu-24.04-arm
+            experimental: true
+    name: build/${{ matrix.arch }}/${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross-toolchain
+        run: |
+          sudo apt-get update
+          case "${{ matrix.arch }}" in
+            x86_64)  sudo apt-get install -y binutils-x86-64-linux-gnu ;;
+            aarch64) sudo apt-get install -y binutils-aarch64-linux-gnu ;;
+          esac
+
+      - name: Build guest
+        run: make -C arch/${{ matrix.arch }} PLATFORM=${{ matrix.platform }}
+
+      - name: Verify artifact exists and has non-zero size
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)  ARTIFACT=arch/x86_64/build/${{ matrix.platform }}/guest.elf ;;
+            aarch64) ARTIFACT=arch/aarch64/build/${{ matrix.platform }}/guest.bin ;;
+          esac
+          if [ ! -s "$ARTIFACT" ]; then
+            echo "ERROR: $ARTIFACT missing or empty"
+            exit 1
+          fi
+          ls -la "$ARTIFACT"
+          file "$ARTIFACT"
+
+      - name: Probe /dev/kvm (informational, firecracker cells only)
+        if: matrix.platform == 'firecracker'
+        run: |
+          if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+            echo "::notice::KVM available on ${{ matrix.runner }} — firecracker boot viable"
+          else
+            echo "::warning::KVM NOT available on ${{ matrix.runner }} — firecracker boot would fail here"
+          fi

@@ -25,7 +25,9 @@ arch/
       firecracker/          # Linux arm64 Image format — tracer-bullet GREEN
         boot.S              # 8250 UART at 0x40002000, WFE halt
         linker.ld
-      qemu/                 # (future; Pi 5 is Firecracker-only in scope)
+      qemu/                 # Linux arm64 Image format — tracer-bullet GREEN
+        boot.S              # PL011 UART at 0x09000000, WFE halt
+        linker.ld
 ```
 
 Two implementations, one design. Each arch is ISA-idiomatic — not "C in assembly."
@@ -39,10 +41,9 @@ Every commit passes through a multi-gate pipeline before reaching `main`:
 - Independent Gemini CLI code review (advisory)
 - Independent clean Claude code review (advisory, within Claude Code sessions)
 
-**GitHub CI (on push):**
-- Lint + type check + pylint (collapsed job)
-- Test matrix: Python 3.11 + 3.12 with branch coverage
-- Arch × platform matrix (x86_64/qemu, x86_64/firecracker, aarch64/qemu, aarch64/firecracker) — planned
+**GitHub Actions (on push):**
+- `python-gates.yml` — flake8 + mypy --strict + pylint + pytest with branch coverage, on Python 3.11 and 3.12.
+- `cd-matrix.yml` — four-cell arch × platform build matrix: x86_64/qemu, x86_64/firecracker, aarch64/qemu all on `ubuntu-latest` (x86_64 hosted), plus aarch64/firecracker on `ubuntu-24.04-arm` (experimental until the free arm64 hosted runner's `/dev/kvm` availability is confirmed).
 
 ## Development topology
 
@@ -94,7 +95,7 @@ python3.11 -m venv .venv
 Early implementation. What's in place:
 
 - **x86_64** — Multiboot1 stub (QEMU) and PVH ELF64 stub (Firecracker) both boot and emit `READY\n` on serial under their respective VMMs. VM launcher and test harness wire up launch + ready-marker polling + clean teardown. 100+ Python tests passing, CI green.
-- **AArch64 tracer bullet GREEN** — 142-byte Linux arm64 Image stub boots under Firecracker on the Pi 5, writes `READY\n` to the emulated 8250 UART (at `0x40002000`), and the laptop observes the marker through SSH-captured serial in roughly 2 s wall-clock from `make`. Orchestration in [`tooling/tracer_bullet/pi_aarch64_firecracker.sh`](tooling/tracer_bullet/pi_aarch64_firecracker.sh).
+- **AArch64 tracer bullet GREEN** — 142-byte Linux arm64 Image stubs on both platforms. `aarch64/firecracker` boots under Firecracker on the Pi 5, writing `READY\n` to the emulated 8250 UART at `0x40002000`; the laptop sees the marker via SSH-captured serial in ~2 s wall-clock from `make`. Orchestration: [`tooling/tracer_bullet/pi_aarch64_firecracker.sh`](tooling/tracer_bullet/pi_aarch64_firecracker.sh). `aarch64/qemu` boots under `qemu-system-aarch64 -M virt`, writing to PL011 at `0x09000000` — proves the cross-toolchain + Image format + PC-relative code against a second VMM.
 - **Pi 5 local test host** — PiOS Trixie 64-bit custom-built via pi-gen with a KVM-enabled kernel, static `10.0.0.2/24` on USB NIC, pubkey-only SSH, first-user password random-per-build. Firecracker v1.15.1 installed from the upstream prebuilt release (D037 amends D026 during bring-up). `apt-cacher-ng` proxy on the laptop makes the Pi's package world work through a single bridge hop (D035). Two-tier backup strategy (D036) keeps snapshots without SD removal.
 - **Decision log** currently at D001–D037; all load-bearing architectural choices recorded as immutable entries in [DECISIONS.md](DECISIONS.md).
 
