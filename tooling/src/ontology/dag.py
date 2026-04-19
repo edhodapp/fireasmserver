@@ -51,6 +51,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from pydantic import BaseModel
+
 from ontology.models import (
     DAGEdge,
     DAGNode,
@@ -150,21 +152,44 @@ def save_snapshot(
     return node_id
 
 
-def ontology_content_hash(ontology: Ontology) -> str:
-    """SHA-256 hex digest over a stable JSON serialization.
+def _canonical_hash(model: BaseModel) -> str:
+    """Shared canonicalize-and-hash primitive for pydantic models.
 
-    ``sort_keys=True`` means key order can't drift between Python
-    versions; ``separators=(',', ':')`` removes whitespace so
-    formatting tweaks don't churn the hash. Output is the full
-    hex digest — not truncated — so an auditor can paste it
-    directly into grep against DAG labels or cross-check tools.
+    The canonicalization step sorts keys so two models serialize
+    to bytewise-equal JSON if their semantic content matches even
+    when field-declaration order drifts between pydantic or model
+    versions. SHA-256 hex digest, full 64 chars — callers can
+    grep it against DAG labels or cross-check files directly.
+
+    Why not just ``model.model_dump_json()``? Pydantic 2.x emits
+    keys in field-declaration order, which IS deterministic
+    within a single schema version but changes when a field is
+    inserted between existing ones. The ``sort_keys=True``
+    re-emit decouples the hash from schema-field order so hashes
+    stay comparable across schema evolutions that don't change
+    the semantic content of a specific snapshot.
+
+    Cost: one ``model_dump`` into a dict (cheap), one
+    ``json.dumps(sort_keys=True)``. Single pass, no reparse.
+    Earlier versions of this code went ``model_dump_json`` →
+    ``json.loads`` → ``json.dumps`` which was 3× the work for the
+    same output.
     """
-    payload = json.dumps(
-        ontology.model_dump(),
+    canonical = json.dumps(
+        model.model_dump(),
         sort_keys=True,
         separators=(",", ":"),
+        default=str,
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def ontology_content_hash(ontology: Ontology) -> str:
+    """SHA-256 hex digest over a single ontology snapshot.
+
+    See ``_canonical_hash`` for the canonicalization contract.
+    """
+    return _canonical_hash(ontology)
 
 
 def _git_head_sha(short: bool = True) -> str | None:
@@ -272,53 +297,105 @@ def dag_transaction(
 ) -> Iterator[OntologyDAG]:
     """Process-safe load-modify-save transaction on a DAG file.
 
-    Acquires an exclusive advisory lock (``fcntl.flock``
-    ``LOCK_EX``) on a sidecar lock file before loading the DAG;
-    holds the lock for the duration of the yielded block; saves
-    the DAG and releases the lock on normal exit.
-
     Usage::
 
         with dag_transaction(path, project_name) as dag:
             snapshot_if_changed(dag, ontology, label)
         # DAG saved here; lock released.
 
-    Concurrency contract: two processes contending for the same
-    DAG file serialize — the second blocks on ``flock`` until the
-    first's ``save_dag`` completes and the with-block exits. No
-    lost updates, no torn reads.
+    **Concurrency contract.** Two processes contending for the
+    same DAG file serialize: the second blocks on ``flock`` until
+    the first's ``save_dag`` completes and the with-block exits.
+    No lost updates, no torn reads.
 
-    On an exception raised inside the yielded block the DAG is
-    NOT saved — the in-memory state may be inconsistent — but the
-    lock is still released via the ``with open`` exit. Callers
-    that want to commit a partial state must save explicitly
-    before the exception escapes.
+    **Exception-rollback contract (explicit).** If anything
+    inside the yielded block raises — or if ``load_dag`` /
+    ``save_dag`` themselves raise — the transaction rolls back:
+    the on-disk DAG is NOT updated beyond what was already there
+    when the lock was acquired, AND the flock is released so a
+    subsequent transaction can proceed. The two outcomes are
+    wired as follows:
 
-    Concurrency limitations:
+    * **Rollback (no save):** the call to ``save_dag`` sits
+      after the ``yield`` inside a ``try`` block; an exception
+      raised in the yielded block short-circuits around the
+      save. The save only runs when the yielded block returns
+      normally.
+    * **Lock release:** the ``finally`` clause calls
+      ``fcntl.flock(LOCK_UN)`` explicitly and the outer
+      ``with open`` closes the lock file's descriptor. Either
+      path releases the advisory lock; both running is
+      idempotent. This is explicit (a ``finally``) rather than
+      implicit (relying only on file-descriptor close) so the
+      release-on-exception semantics are self-evident to a
+      future reader auditing the concurrency story.
+
+    **Save-on-no-change elision.** The builder often runs against
+    unchanged content (a developer regenerating to verify state).
+    The transaction hashes the ontology on load and again after
+    yield returns; if nothing changed it skips ``save_dag``. The
+    flock is still taken and released — another writer cannot
+    sneak in between the load and the hash comparison — so the
+    correctness invariant holds regardless of whether the save
+    fired.
+
+    **Concurrency limitations:**
 
     - Lock is advisory (``flock``), not mandatory. A cooperating
       process that doesn't use this wrapper can still trample
       the file. Every builder must use ``dag_transaction`` for
       the guarantee to hold.
-    - Lock is per-file-description on Linux; this function
-      acquires a fresh descriptor each call, so nested
-      ``dag_transaction`` calls in the same process on the same
-      path will self-deadlock. Don't nest.
+    - Lock is per-file-description; this function acquires a
+      fresh descriptor each call, so nested ``dag_transaction``
+      calls in the same process on the same path will
+      self-deadlock. Don't nest.
     - Advisory locks don't survive ``os.unlink`` of the lock
       file itself. Don't delete the sidecar.
+    - Linux-only (``fcntl.flock``). Our target platforms
+      (x86_64 laptop, Pi 5, ubuntu-latest CI) are all Linux; we
+      accept the portability tradeoff for the simpler semantics.
 
     The sidecar lock file lives at ``path + ".lock"`` and
     persists across runs deliberately — creating and deleting the
     lock file on every transaction would open a TOCTOU race of
-    its own. The file is empty; we never write content to it.
+    its own. Opened in append mode (``"a"``) rather than write
+    mode (``"w"``) so we don't pay truncation + metadata-update
+    IO on every transaction start; the file stays empty either
+    way.
     """
     lock_path = path + ".lock"
     parent_dir = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(parent_dir, exist_ok=True)
-    with open(lock_path, "w", encoding="utf-8") as lock_fh:
+    with open(lock_path, "a", encoding="utf-8") as lock_fh:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        dag = load_dag(path, project_name)
-        yield dag
-        # Only reached on normal exit; exceptions propagate
-        # without saving.
-        save_dag(dag, path)
+        try:
+            dag = load_dag(path, project_name)
+            pre_hash = _dag_content_hash(dag)
+            # Rollback-on-exception: if the yield raises,
+            # control jumps to the `finally` below (which
+            # releases the flock) and the exception propagates.
+            # Crucially, the post_hash comparison + save_dag
+            # BELOW are skipped — the on-disk DAG remains at
+            # its pre-transaction state.
+            yield dag
+            # Save-elision: only persist when something changed.
+            post_hash = _dag_content_hash(dag)
+            if pre_hash != post_hash:
+                save_dag(dag, path)
+        finally:
+            # Explicit release. The outer `with open`'s
+            # fd-close would also release the advisory lock,
+            # but the finally spells out the guarantee for any
+            # reader auditing the concurrency story.
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def _dag_content_hash(dag: OntologyDAG) -> str:
+    """SHA-256 over the DAG's full content — used inside
+    ``dag_transaction`` to decide whether the in-memory state
+    differs from what was loaded, so unchanged-content saves can
+    be skipped. Distinct from ``ontology_content_hash`` because
+    this one covers the entire DAG (nodes + edges +
+    current_node_id + project_name), not just a single ontology
+    snapshot. Delegates to the shared ``_canonical_hash``."""
+    return _canonical_hash(dag)
