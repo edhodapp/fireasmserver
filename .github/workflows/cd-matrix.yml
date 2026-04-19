@@ -33,6 +33,30 @@ env:
   FIRECRACKER_VERSION: v1.15.1
 
 jobs:
+  pytest:
+    # Arch-neutral Python test suite — tooling/tests/. Runs once,
+    # not per matrix cell, because pytest itself doesn't care
+    # about the target arch; the tests exercise host-side Python
+    # code that drives the build/test infrastructure (ontology
+    # module, branch-cov, CRC-32 pytest wrapper, derive-fold-
+    # constants verifier, QEMU harness, CLI). Promotes a class
+    # of regressions — test-breaking code slipping in via non-
+    # Python commits or --no-verify — from "someone notices
+    # eventually" to "CI blocks the push."
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install package + dev extras
+        run: pip install -e ".[dev]"
+      - name: pytest
+        run: pytest -q --no-header
+
   build:
     strategy:
       fail-fast: false

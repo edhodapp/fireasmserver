@@ -76,6 +76,22 @@ run_crc_tests() {
     make -C tooling/crypto_tests -s test
 }
 
+run_pytest_suite() {
+    echo
+    echo "=== pre-push: full pytest suite ==="
+    # Covers every pytest file under tooling/tests/ — ontology,
+    # branch-cov, CRC-32 wrapper, CLI, QEMU harness, side-session
+    # derive_fold_constants, and concurrent-safety tests. The
+    # per-commit quality gate runs pytest too, but only when .py
+    # files are staged; this gate makes sure no commit (e.g., a
+    # pure .S or .md one) can slip past without the suite running.
+    if [[ ! -x "$REPO_ROOT/.venv/bin/pytest" ]]; then
+        echo "SKIP: no .venv/bin/pytest (run: pip install -e .[dev])"
+        return 0
+    fi
+    "$REPO_ROOT/.venv/bin/pytest" -q --no-header
+}
+
 echo "=== fireasmserver pre-push integration tests ==="
 
 run_local_cell x86_64  firecracker   || fail=1
@@ -86,6 +102,7 @@ run_local_cell x86_64  firecracker   || fail=1
 run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
 run_crc_tests                        || fail=1
+run_pytest_suite                     || fail=1
 
 echo
 if [[ $fail -ne 0 ]]; then
