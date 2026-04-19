@@ -451,15 +451,17 @@ capable.
 
 ### 11.3 Jumbo frames
 
-- `L2_MAX_FRAME` is a build-time `.equ`. MVP value: `1518` (or
-  `1522` once VLAN-tag insertion runs).
+- `ETH_MAX_FRAME` (the current L2 is Ethernet-only; a non-Ethernet
+  L2, if ever added — e.g., PPP for a cellular gateway — would be
+  its own module with its own constant) is a build-time `.equ`.
+  MVP value: `1518` (or `1522` once VLAN-tag insertion runs).
 - `RX_BUF_SIZE`, frame-length compares (`ETH-003`, `ETH-004`,
   `ETH-010`, `ETH-011`), and the TX descriptor sizing all derive
-  from `L2_MAX_FRAME`.
-- OEM deployments that need 9000-byte jumbo override `L2_MAX_FRAME`
+  from `ETH_MAX_FRAME`.
+- OEM deployments that need 9000-byte jumbo override `ETH_MAX_FRAME`
   at build time. The RX hot path is structurally identical; only
   the compare constants change.
-- Buffer-pool memory footprint scales linearly with `L2_MAX_FRAME ×
+- Buffer-pool memory footprint scales linearly with `ETH_MAX_FRAME ×
   RX_BUF_COUNT`. Customers sizing jumbo need to co-tune
   `RX_BUF_COUNT` to stay within the RAM budget.
 
