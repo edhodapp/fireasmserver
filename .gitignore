@@ -14,3 +14,4 @@ arch/*/build/
 
 # DAG signing key
 tooling/.dag-key
+*.lock

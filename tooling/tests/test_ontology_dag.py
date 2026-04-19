@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import pytest
 
-from ontology import Entity, Ontology, OntologyDAG
+from ontology import Decision, Entity, Ontology, OntologyDAG
 from ontology.dag import (
     _git_head_sha,
     _git_is_dirty,
@@ -40,6 +40,8 @@ def _ontology_with(name: str) -> Ontology:
 
 
 class TestMakeNodeId:
+    """Coverage for the UUID-based node ID generator."""
+
     def test_returns_uuid_shape(self) -> None:
         node_id = make_node_id()
         # uuid4 canonical form: 8-4-4-4-12 hex with hyphens.
@@ -51,6 +53,8 @@ class TestMakeNodeId:
 
 
 class TestOntologyContentHash:
+    """Determinism + collision behaviour of ontology_content_hash."""
+
     def test_hash_is_deterministic(self) -> None:
         left = _ontology_with("A")
         right = _ontology_with("A")
@@ -69,6 +73,8 @@ class TestOntologyContentHash:
 
 
 class TestGitHeadSha:
+    """Success + fallback branches of _git_head_sha."""
+
     def test_returns_sha_when_git_succeeds(self) -> None:
         fake = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="deadbee\n", stderr="",
@@ -114,6 +120,8 @@ class TestGitHeadSha:
 
 
 class TestGitIsDirty:
+    """Success + fallback branches of _git_is_dirty."""
+
     def test_clean_tree(self) -> None:
         fake = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr="",
@@ -152,6 +160,8 @@ class TestGitIsDirty:
 
 
 class TestGitSnapshotLabel:
+    """Label-shape coverage for git_snapshot_label."""
+
     def test_label_with_clean_sha(self) -> None:
         with patch("ontology.dag._git_head_sha", return_value="cafef00"), \
              patch("ontology.dag._git_is_dirty", return_value=False):
@@ -181,6 +191,8 @@ class TestGitSnapshotLabel:
 
 
 class TestSaveAndLoadDag:
+    """Round-trip + bootstrap + atomic-write failure paths."""
+
     def test_roundtrip_preserves_content(self, tmp_path: Path) -> None:
         dag_path = str(tmp_path / "dag.json")
         dag = OntologyDAG(project_name="roundtrip")
@@ -201,6 +213,9 @@ class TestSaveAndLoadDag:
 
 
 class TestSnapshotIfChanged:
+    """Idempotent-append behaviour: bootstrap, no-op on identical
+    content, and real change-detection."""
+
     def test_bootstrap_appends_first_node(self) -> None:
         dag = OntologyDAG(project_name="bootstrap")
         onto = _ontology_with("A")
@@ -238,10 +253,9 @@ class TestSnapshotIfChanged:
         """Covers the ``decision is not None`` branch in
         ``save_snapshot`` where the caller supplies its own
         Decision (the typical case for a branching audit trail)."""
-        from ontology import Decision as Dec  # avoid top-level dup
         dag = OntologyDAG(project_name="explicit")
         snapshot_if_changed(dag, _ontology_with("A"), "first")
-        chosen = Dec(
+        chosen = Decision(
             question="add entity B?",
             options=["add", "skip"],
             chosen="add",
