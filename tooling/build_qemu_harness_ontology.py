@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Build the ontology DAG for the QEMU test harness.
 
-Regenerated 2026-04-10 to match code after 16 review-driven fixes.
+Now importing from the forked ``ontology`` module under
+``tooling/src/ontology/`` (O1, 2026-04-19) instead of
+``python_agent.ontology``. See O-series commits on ``main`` for
+the fork rationale; short version is the SysE-grade schema
+extensions need to land in this project without coordination
+through the python_agent session.
 """
 
-from python_agent.dag_utils import save_dag, save_snapshot
-from python_agent.ontology import (
+from ontology import (
     ClassSpec,
     DomainConstraint,
     Entity,
@@ -18,6 +22,7 @@ from python_agent.ontology import (
     PropertyType,
     Relationship,
 )
+from ontology.dag import save_dag, save_snapshot
 
 # -- Problem Domain: Entities --
 
