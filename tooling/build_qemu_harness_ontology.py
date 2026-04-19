@@ -322,6 +322,20 @@ constraints = [
             "(QEMU or Firecracker)."
         ),
         entity_ids=["guest-image", "vm-instance"],
+        rationale=(
+            "D003 (100% assembly) — host-native execution of "
+            "bare-metal targets is undefined and dangerous; "
+            "a VM is the boundary."
+        ),
+        implementation_refs=[
+            "tooling/src/qemu_harness/vm_launcher.py:launch_vm",
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        verification_refs=[
+            "tooling/tests/test_vm_launcher.py",
+            "tooling/hooks/pre_push.sh",
+        ],
+        status="implemented",
     ),
     DomainConstraint(
         name="clean-vm-kill",
@@ -334,6 +348,19 @@ constraints = [
             "-serial mon:stdio."
         ),
         entity_ids=["vm-instance"],
+        rationale=(
+            "CLAUDE.md QEMU gotchas: `timeout` doesn't flush "
+            "`-serial file:` output; mon:stdio breaks under "
+            "stdout redirection."
+        ),
+        implementation_refs=[
+            "tooling/src/qemu_harness/vm_launcher.py:kill_vm",
+            "tooling/src/qemu_harness/vm_launcher.py:_proc_registry",
+        ],
+        verification_refs=[
+            "tooling/tests/test_vm_launcher.py",
+        ],
+        status="implemented",
     ),
     DomainConstraint(
         name="host-side-verification",
@@ -345,6 +372,20 @@ constraints = [
             "with errors='replace' to handle non-UTF-8."
         ),
         entity_ids=["test-case", "test-result"],
+        rationale=(
+            "Bare-metal assembly targets can't host pytest; "
+            "the host observes serial output + exit signals "
+            "and interprets them as test outcomes."
+        ),
+        implementation_refs=[
+            "tooling/src/qemu_harness/test_runner.py",
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        verification_refs=[
+            "tooling/tests/test_test_runner.py",
+            "tooling/tests/test_crc32_ieee.py",
+        ],
+        status="implemented",
     ),
     DomainConstraint(
         name="kvm-required-for-firecracker",
@@ -354,6 +395,21 @@ constraints = [
             "if KVM is not available."
         ),
         entity_ids=["vm-instance"],
+        rationale=(
+            "GHA hosted arm64 runners don't expose /dev/kvm, "
+            "so the aarch64/firecracker cell can't run in CI; "
+            "it's exercised locally via the Pi-side tracer "
+            "bullet instead."
+        ),
+        implementation_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+            ".github/workflows/cd-matrix.yml",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/pi_aarch64_firecracker.sh",
+            "tooling/hooks/pre_push.sh",
+        ],
+        status="implemented",
     ),
     DomainConstraint(
         name="path-traversal-rejected",
@@ -364,6 +420,20 @@ constraints = [
             "field_validator enforces at construction."
         ),
         entity_ids=["guest-image", "vm-instance"],
+        rationale=(
+            "Defensive against accidental or adversarial "
+            "path traversal in test-harness inputs; pydantic "
+            "validation is the single chokepoint all VM "
+            "configs pass through."
+        ),
+        implementation_refs=[
+            "tooling/src/qemu_harness/vm_launcher.py:_reject_traversal",
+            "tooling/src/qemu_harness/vm_launcher.py:VMConfig",
+        ],
+        verification_refs=[
+            "tooling/tests/test_vm_launcher.py",
+        ],
+        status="implemented",
     ),
     DomainConstraint(
         name="blocked-qemu-args",
@@ -375,6 +445,20 @@ constraints = [
             "at construction."
         ),
         entity_ids=["vm-instance"],
+        rationale=(
+            "Blocklist prevents test harnesses from opening "
+            "monitor/vnc/network surfaces that could expose "
+            "the host. Noted as brittle (allowlist would be "
+            "stronger) in Gemini review; developer-tool scope "
+            "keeps blocklist acceptable for now."
+        ),
+        implementation_refs=[
+            "tooling/src/qemu_harness/vm_launcher.py:VMConfig",
+        ],
+        verification_refs=[
+            "tooling/tests/test_vm_launcher.py",
+        ],
+        status="implemented",
     ),
     DomainConstraint(
         name="thread-safe-registry",
@@ -385,6 +469,24 @@ constraints = [
             "from different threads is a real scenario."
         ),
         entity_ids=["vm-instance"],
+        rationale=(
+            "Python harness is host-side code running on "
+            "Linux under stdlib threading; concurrent "
+            "launch_vm/kill_vm from different threads is a "
+            "real scenario (pytest-xdist, concurrent "
+            "integration runs). Bare-metal single-threaded "
+            "FSA reasoning does NOT apply here per "
+            "`feedback_tooling_is_not_target.md`."
+        ),
+        implementation_refs=[
+            "tooling/src/qemu_harness/vm_launcher.py:_proc_lock",
+            "tooling/src/qemu_harness/vm_launcher.py:_register_proc",
+            "tooling/src/qemu_harness/vm_launcher.py:_unregister_proc",
+        ],
+        verification_refs=[
+            "tooling/tests/test_vm_launcher.py",
+        ],
+        status="implemented",
     ),
 ]
 
