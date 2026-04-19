@@ -3,13 +3,20 @@ top-level ``validate_ontology_strict`` function. These round out
 branch / statement coverage on the forked module."""
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from ontology import (
     DAGEdge,
     DAGNode,
+    DataModel,
     Decision,
+    DomainConstraint,
     Entity,
     Ontology,
     OntologyDAG,
+    PerformanceConstraint,
+    Relationship,
     validate_ontology_strict,
 )
 
@@ -116,6 +123,8 @@ class TestOntologyDAGSerialization:
 
 
 class TestValidateOntologyStrict:
+    """Coverage for the top-level validate_ontology_strict helper."""
+
     def test_valid_ontology_returns_empty_list(self) -> None:
         valid = Ontology(entities=[_entity("x")]).model_dump()
         assert validate_ontology_strict(valid) == []
@@ -127,3 +136,108 @@ class TestValidateOntologyStrict:
         errors = validate_ontology_strict(bad)
         assert errors
         assert all(isinstance(msg, str) for msg in errors)
+
+
+class TestReferentialIntegrity:
+    """The `Ontology` @model_validator refuses to construct a graph
+    with dangling cross-references. These tests exercise each
+    reference-emitting model type against a known-entity set."""
+
+    def test_valid_references_construct_cleanly(self) -> None:
+        Ontology(
+            entities=[_entity("a"), _entity("b")],
+            relationships=[Relationship(
+                source_entity_id="a", target_entity_id="b",
+                name="rel", cardinality="one_to_one",
+            )],
+            domain_constraints=[DomainConstraint(
+                name="dc", description="", entity_ids=["a"],
+            )],
+            performance_constraints=[PerformanceConstraint(
+                name="pc", description="", entity_ids=["b"],
+                metric="x", budget=1.0, unit="ns", direction="max",
+            )],
+            data_models=[DataModel(
+                entity_id="a", storage="memory", class_name="A",
+            )],
+        )
+
+    def test_dangling_relationship_source_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                relationships=[Relationship(
+                    source_entity_id="ghost", target_entity_id="a",
+                    name="bad", cardinality="one_to_one",
+                )],
+            )
+        assert "'ghost'" in str(exc.value)
+        assert "source" in str(exc.value)
+
+    def test_dangling_relationship_target_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                relationships=[Relationship(
+                    source_entity_id="a", target_entity_id="ghost",
+                    name="bad", cardinality="one_to_one",
+                )],
+            )
+        assert "'ghost'" in str(exc.value)
+        assert "target" in str(exc.value)
+
+    def test_dangling_domain_constraint_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                domain_constraints=[DomainConstraint(
+                    name="dc", description="",
+                    entity_ids=["a", "ghost"],
+                )],
+            )
+        assert "DomainConstraint" in str(exc.value)
+        assert "'ghost'" in str(exc.value)
+
+    def test_dangling_performance_constraint_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                performance_constraints=[PerformanceConstraint(
+                    name="pc", description="", entity_ids=["ghost"],
+                    metric="x", budget=0.0, unit="ns",
+                    direction="max",
+                )],
+            )
+        assert "PerformanceConstraint" in str(exc.value)
+        assert "'ghost'" in str(exc.value)
+
+    def test_dangling_data_model_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                data_models=[DataModel(
+                    entity_id="ghost", storage="mem", class_name="X",
+                )],
+            )
+        assert "DataModel" in str(exc.value)
+        assert "'ghost'" in str(exc.value)
+
+    def test_all_dangling_refs_surface_together(self) -> None:
+        """When multiple cross-references are broken, the error
+        lists all of them, not just the first. Lets an auditor
+        see the full picture in one validation pass."""
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                relationships=[Relationship(
+                    source_entity_id="x", target_entity_id="y",
+                    name="r", cardinality="one_to_one",
+                )],
+                data_models=[DataModel(
+                    entity_id="z", storage="mem", class_name="Z",
+                )],
+            )
+        message = str(exc.value)
+        assert "'x'" in message
+        assert "'y'" in message
+        assert "'z'" in message

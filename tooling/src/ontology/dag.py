@@ -370,17 +370,21 @@ def dag_transaction(
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
             dag = load_dag(path, project_name)
-            pre_hash = _dag_content_hash(dag)
+            # Deep copy of the loaded state so we can detect
+            # changes by pydantic equality at transaction end.
+            # Cheaper than the earlier canonical-JSON hash pair
+            # because it skips serialization entirely; pydantic's
+            # BaseModel.__eq__ walks field-by-field in one pass.
+            pre_state = dag.model_copy(deep=True)
             # Rollback-on-exception: if the yield raises,
             # control jumps to the `finally` below (which
             # releases the flock) and the exception propagates.
-            # Crucially, the post_hash comparison + save_dag
-            # BELOW are skipped — the on-disk DAG remains at
-            # its pre-transaction state.
+            # The equality check + save_dag BELOW are skipped —
+            # the on-disk DAG remains at its pre-transaction state.
             yield dag
-            # Save-elision: only persist when something changed.
-            post_hash = _dag_content_hash(dag)
-            if pre_hash != post_hash:
+            # Save-elision: only persist when the in-memory DAG
+            # diverges from the pre-transaction deep copy.
+            if dag != pre_state:
                 save_dag(dag, path)
         finally:
             # Explicit release. The outer `with open`'s
@@ -388,14 +392,3 @@ def dag_transaction(
             # but the finally spells out the guarantee for any
             # reader auditing the concurrency story.
             fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-
-
-def _dag_content_hash(dag: OntologyDAG) -> str:
-    """SHA-256 over the DAG's full content — used inside
-    ``dag_transaction`` to decide whether the in-memory state
-    differs from what was loaded, so unchanged-content saves can
-    be skipped. Distinct from ``ontology_content_hash`` because
-    this one covers the entire DAG (nodes + edges +
-    current_node_id + project_name), not just a single ontology
-    snapshot. Delegates to the shared ``_canonical_hash``."""
-    return _canonical_hash(dag)

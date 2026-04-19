@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, model_validator
 
 from ontology.types import (
     Cardinality,
@@ -209,7 +209,17 @@ class OpenQuestion(BaseModel):
 
 
 class Ontology(BaseModel):
-    """Complete ontology snapshot."""
+    """Complete ontology snapshot.
+
+    Enforces referential integrity across the three cross-referential
+    shapes at construction time: every ``Relationship``'s source and
+    target IDs, every ``DomainConstraint.entity_ids`` and
+    ``PerformanceConstraint.entity_ids`` value, and every
+    ``DataModel.entity_id`` must name an ``Entity`` that is declared
+    in this snapshot's ``entities`` list. A dangling reference raises
+    ``ValidationError`` so the builder cannot ship a structurally
+    broken ontology to downstream audit tooling.
+    """
 
     entities: list[Entity] = []
     relationships: list[Relationship] = []
@@ -219,6 +229,43 @@ class Ontology(BaseModel):
     data_models: list[DataModel] = []
     external_dependencies: list[ExternalDependency] = []
     open_questions: list[OpenQuestion] = []
+
+    @model_validator(mode="after")
+    def _check_referential_integrity(self) -> "Ontology":
+        """Verify every cross-reference points to a declared entity.
+
+        Runs after individual-field validation so we're guaranteed
+        each referenced field is already a valid pydantic object;
+        this check is purely about whether the IDs resolve.
+
+        Surfaces a single ``ValueError`` with a complete, sorted
+        list of every dangling reference rather than short-
+        circuiting on the first one — an auditor reading the
+        error sees the whole picture, not just the first fault.
+        Each reference-type is checked by a dedicated
+        ``_check_*_refs`` helper so this top-level function stays
+        under the project's cyclomatic-complexity cap.
+        """
+        known = {entity.id for entity in self.entities}
+        errors: list[str] = []
+        errors.extend(_check_relationship_refs(self.relationships, known))
+        errors.extend(_check_id_list_refs(
+            "DomainConstraint",
+            [(dc.name, dc.entity_ids) for dc in self.domain_constraints],
+            known,
+        ))
+        errors.extend(_check_id_list_refs(
+            "PerformanceConstraint",
+            [(pc.name, pc.entity_ids) for pc in self.performance_constraints],
+            known,
+        ))
+        errors.extend(_check_data_model_refs(self.data_models, known))
+        if errors:
+            raise ValueError(
+                "referential-integrity violations:\n  - "
+                + "\n  - ".join(sorted(errors)),
+            )
+        return self
 
 
 # -- DAG Structure --
@@ -329,6 +376,65 @@ class OntologyDAG(BaseModel):
 
 
 # -- Validation --
+
+
+def _check_relationship_refs(
+    relationships: list[Relationship],
+    known: set[str],
+) -> list[str]:
+    """Return dangling-reference messages for Relationship source
+    and target IDs. Each Relationship may contribute zero, one, or
+    two messages depending on which endpoint(s) are missing."""
+    errors: list[str] = []
+    for rel in relationships:
+        if rel.source_entity_id not in known:
+            errors.append(
+                f"Relationship '{rel.name}' source "
+                f"'{rel.source_entity_id}' not in entities"
+            )
+        if rel.target_entity_id not in known:
+            errors.append(
+                f"Relationship '{rel.name}' target "
+                f"'{rel.target_entity_id}' not in entities"
+            )
+    return errors
+
+
+def _check_id_list_refs(
+    kind: str,
+    items: list[tuple[str, list[str]]],
+    known: set[str],
+) -> list[str]:
+    """Generic reference checker for owner-types that carry a list
+    of entity IDs (``DomainConstraint.entity_ids``,
+    ``PerformanceConstraint.entity_ids``). ``kind`` names the
+    owner type in the error message; ``items`` is a list of
+    ``(owner_name, entity_ids)`` pairs."""
+    errors: list[str] = []
+    for owner_name, entity_ids in items:
+        for eid in entity_ids:
+            if eid not in known:
+                errors.append(
+                    f"{kind} '{owner_name}' references "
+                    f"'{eid}' not in entities"
+                )
+    return errors
+
+
+def _check_data_model_refs(
+    data_models: list[DataModel],
+    known: set[str],
+) -> list[str]:
+    """Return dangling-reference messages for DataModel.entity_id
+    pointers that don't resolve in the ``known`` set."""
+    errors: list[str] = []
+    for dm in data_models:
+        if dm.entity_id not in known:
+            errors.append(
+                f"DataModel for class '{dm.class_name}' references "
+                f"entity '{dm.entity_id}' not in entities"
+            )
+    return errors
 
 
 def validate_ontology_strict(
