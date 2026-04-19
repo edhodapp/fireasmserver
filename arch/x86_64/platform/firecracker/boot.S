@@ -85,13 +85,15 @@ _start:
 
     ; --- Probe virtio-MMIO MagicValue register ---
     ; Virtio 1.2 §4.2.2: "The driver MUST use a memory barrier before
-    ; and after each MMIO register access." On x86 TSO `mfence` is
-    ; largely redundant for cacheable memory, but the spec makes no
-    ; exceptions for strongly-ordered host ISAs. Compliance first,
-    ; performance tuning later once the full driver exists.
-    mfence
+    ; and after each MMIO register access." On x86 TSO `lfence` is
+    ; sufficient around a pure load — stores need `mfence`, loads need
+    ; `lfence`. We only read here, so `lfence` satisfies the spec
+    ; without the store-ordering cost `mfence` carries. When ring-ops
+    ; (descriptor writes) land, the barrier choice becomes `mfence`
+    ; at each store+load boundary; handle case-by-case.
+    lfence
     mov eax, [VIRTIO_MMIO_BASE]
-    mfence
+    lfence
     cmp eax, VIRTIO_MAGIC
     jne .virtio_fail
 
@@ -125,11 +127,21 @@ _start:
 ; Polls the 16550 Line Status Register for THRE (Transmit Holding
 ; Register Empty, bit 5) before each write, with a ~1M-iteration
 ; timeout so a wedged UART doesn't hang the guest. On timeout,
-; abandons the remaining stream; the caller has already received
-; diagnostic output up to the stall. `dx` holds COM1 THR on entry
-; and is restored to COM1 THR before return so subsequent callers
-; can reuse it.
-; Clobbers: eax, ecx, esi, edi. Preserves: dx, ebx, ebp, esp.
+; abandons the remaining stream. `dx` holds COM1 THR on entry and
+; is restored to COM1 THR before return so subsequent callers can
+; reuse it.
+;
+; Return signalling via the carry flag:
+;   CF=0 on full success (all <ecx> bytes written, or ecx==0).
+;   CF=1 on timeout (UART never asserted THRE within the budget).
+; Callers can `jc .error_path` immediately after the ret to branch
+; on UART failure. Current callers don't consume the signal (a
+; wedged UART during boot is unrecoverable anyway and we halt), but
+; the signal is cheap to emit and future callers — a full L2 RX
+; path that recovers from transient UART issues — can consume it
+; without a helper rewrite.
+;
+; Clobbers: eax, ecx, esi, edi, flags. Preserves: dx, ebx, ebp, esp.
 emit_bytes:
     test ecx, ecx
     jz .done
@@ -142,10 +154,9 @@ emit_bytes:
     jnz .have_thre
     dec edi
     jnz .wait_thre
-    ; Timeout. Restore dx and abandon. Returning on timeout is
-    ; best-effort: bytes emitted before the stall survived; the rest
-    ; are lost. The guest still halts cleanly without hanging.
+    ; Timeout. Restore dx, signal failure via CF=1, return.
     sub dx, COM1_LSR_OFFSET
+    stc
     ret
 .have_thre:
     sub dx, COM1_LSR_OFFSET   ; dx = THR port (== COM1_PORT)
@@ -155,6 +166,7 @@ emit_bytes:
     dec ecx
     jnz .next
 .done:
+    clc
     ret
 
 ; --- emit_hex32: write eax as 8 uppercase hex digits to COM1 in dx ---

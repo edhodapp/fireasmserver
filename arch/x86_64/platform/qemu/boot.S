@@ -51,6 +51,12 @@ _start:
 ; factored to a shared include: at 20 instructions it's cheaper to
 ; duplicate than to add build-time include plumbing for two divergent
 ; ELF classes (ELF32 here, ELF64 on firecracker).
+;
+; Return signalling via the carry flag:
+;   CF=0 on full success.
+;   CF=1 on timeout (UART never asserted THRE within the budget).
+;
+; Clobbers: eax, ecx, esi, edi, flags. Preserves: dx, ebx, ebp, esp.
 emit_bytes:
     test ecx, ecx
     jz .done
@@ -63,9 +69,10 @@ emit_bytes:
     jnz .have_thre
     dec edi
     jnz .wait_thre
-    ; Timeout: UART wedged. Abandon the remaining stream and return
-    ; so the guest halts cleanly instead of hanging in the spin.
+    ; Timeout: UART wedged. Restore dx, signal failure via CF=1,
+    ; return so the guest halts cleanly instead of hanging.
     sub dx, COM1_LSR_OFFSET
+    stc
     ret
 .have_thre:
     sub dx, COM1_LSR_OFFSET
@@ -75,6 +82,7 @@ emit_bytes:
     dec ecx
     jnz .next
 .done:
+    clc
     ret
 
 ready_msg: db 'READY', 10
