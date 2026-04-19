@@ -35,13 +35,14 @@ fail=0
 
 run_local_cell() {
     local arch=$1 platform=$2
+    local trace="${3:-0}"
     echo
-    echo "=== pre-push: $arch/$platform (laptop) ==="
+    echo "=== pre-push: $arch/$platform (laptop, TRACE=$trace) ==="
     if ! make -C "arch/$arch" "PLATFORM=$platform" >/dev/null; then
         echo "FAIL: make failed for $arch/$platform"
         return 1
     fi
-    ./tooling/tracer_bullet/run_local.sh "$arch" "$platform"
+    TRACE="$trace" ./tooling/tracer_bullet/run_local.sh "$arch" "$platform"
 }
 
 pi_reachable() {
@@ -67,9 +68,13 @@ run_pi_cell() {
 
 echo "=== fireasmserver pre-push integration tests ==="
 
-run_local_cell x86_64  firecracker || fail=1
-run_local_cell aarch64 qemu        || fail=1
-run_pi_cell                         || fail=1
+run_local_cell x86_64  firecracker   || fail=1
+# TRACE=1 on aarch64/qemu: captures the QEMU instruction stream and
+# runs branch-cov — lets developers see the same coverage numbers
+# locally that CI reports on push. Advisory (no gate) until we have
+# tests that exercise every branch.
+run_local_cell aarch64 qemu        1 || fail=1
+run_pi_cell                          || fail=1
 
 echo
 if [[ $fail -ne 0 ]]; then
