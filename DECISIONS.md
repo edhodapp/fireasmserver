@@ -1232,6 +1232,14 @@ not a quiet feature addition.
 
 ### D044: VLAN (802.1Q and successors) — out of scope for fireasmserver L2 MVP
 
+**~~DEPRECATED 2026-04-19T09:30Z — see D045.~~** Ed pushed back on
+the deferral on assembly-retrofit-cost grounds: VLAN parsing
+reshapes the hot-path EtherType dispatch (offset 12 untagged vs. 16
+tagged), and retrofitting that later costs more than designing it in
+at MVP. D045 reverses this decision to "designed in, runtime-inert
+until configured." The reject-path described below is replaced by
+unconditional parse-and-tolerate.
+
 **Decision:** 802.1Q single-tag VLAN, 802.1ad Q-in-Q, 802.1Qau Congestion
 Notification, and 802.1Qbb Priority Flow Control are **out of scope**
 for the fireasmserver L2 MVP. The L2 layer MUST still gracefully reject
@@ -1280,6 +1288,107 @@ DEPRECATED per the D042 convention.
   explicitly state; D044 records the resolution.
 - `D042` — establishes the "defer vendor-specific scope until
   engagement" pattern this decision follows.
+
+### D045: VLAN + other hot-path-shaping features — designed in, runtime-inert by default (supersedes D044, applies D046)
+
+**Decision:** L2 is architected from MVP to accommodate every feature
+whose later addition would reshape the hot path, even when the MVP
+runtime disables the feature by default. The deferred-until-customer
+model (D044) is reversed for this class. Ships-with-MVP runtime is
+simple; architecture is production-capable.
+
+**Applies to:**
+
+| Feature | Hot-path shaping | MVP runtime default | Design obligation |
+|---------|------------------|---------------------|-------------------|
+| **802.1Q / 802.1ad VLAN RX** | EtherType offset dispatch (12 vs. 16 vs. 20) | Accept tagged frames, strip tag, log VID in per-frame metadata; no filter enforcement | Unconditional tag-peek after SA; tag-strip on RX; VID propagated to L3 handoff metadata |
+| **802.1Q VLAN TX** | Optional 4-byte tag insert | `tx_request_t.vid == 0` → no tag inserted | `tx_request_t` carries `vid` field; TX path branches on non-zero |
+| **virtio-net multi-queue** | Per-queue interrupt dispatch, pools, steering | `NUM_QUEUES = 1` build-time `.equ` | Dispatcher indexes by queue; RX/TX pools are per-queue arrays (size-1 in MVP) |
+| **Checksum offload** | `virtio_net_hdr` flags / `csum_start` / `csum_offset` plumbing to L4 | Feature not negotiated; hdr fields zeroed | L2 always populates hdr; L4 reads + decides |
+| **Jumbo frames** | `RX_BUF_SIZE` + every frame-length compare | `L2_MAX_FRAME = 1518` default | Sizes + compares derive from `L2_MAX_FRAME`; OEM overrides via `.equ` |
+| **GSO / LRO metadata passthrough** | `virtio_net_hdr.gso_type/hdr_len/gso_size` | Reject non-GSO_NONE at L4 for MVP | L2 passes the metadata struct through to L4; L4 is the gate |
+
+**Not in D045's scope (stay deferred per D044-class reasoning,
+because they're additive on an already-designed interface):**
+- VLAN filter management (`VIRTIO_NET_CTRL_VLAN_ADD`/`_DEL`) — control-queue feature; additive when wanted.
+- Runtime MQ negotiation with the device — MVP is build-time pinned.
+- Actual GSO segmentation on TX — L4 decision, not L2 architecture.
+- Pause frames (802.3x), PFC (802.1Qbb), LACP (802.1AX) — each is its own module, orthogonal to L2 frame-parse dispatch. Keep deferred but add an `ETH-018` row in `REQUIREMENTS.md` so pause frames get an explicit reject in the RX parser (analogous to the old VLAN-005 pattern).
+
+**Cost analysis that changed the decision:**
+
+- RX hot-path cost when VLAN is runtime-inert: ~3–5 cycles for the
+  untagged path (one compare, predict-not-taken branch over the
+  skip). At the 10 Gbps / 67 ns target, ~1–2 ns — fits in budget.
+- Retrofit cost of VLAN on 100% assembly: every caller of the RX
+  parser assumes a fixed EtherType offset. Changing that is not a
+  one-file edit; it's a full-pipeline rewrite with rebaseline of
+  the D040 perf ratchet. Assembly amplifies.
+- Same asymmetry applies to multi-queue, jumbo, checksum-offload,
+  GSO metadata. Each would force a reshape-of-callers retrofit.
+
+**Updates cascaded from this decision:**
+
+- `docs/l2/DESIGN.md` §5 rewritten: VLAN parsing described; TX `vid`
+  field described; design hot-path costs table added.
+- `docs/l2/DESIGN.md` new §11 "Designed-in accommodations":
+  describes the multi-queue/checksum/jumbo/GSO architectural shape
+  that MVP runtime defaults away from.
+- `docs/l2/REQUIREMENTS.md` VLAN-001..VLAN-007 flipped from
+  `deviation` back to `spec`. New `ETH-018` row added for pause-
+  frame reject.
+- D044 gets a DEPRECATED marker citing D045 per the D042 convention.
+
+### D046: Assembly-deferral bar — hot-path-shaping features are designed in at MVP
+
+**Principle (meta-rule for future L-layer scoping decisions):**
+
+> A deferral that would force a later reshape of hot-path data layout,
+> dispatch structure, or inter-layer handoff API must be designed in
+> at MVP, even when the MVP runtime defaults the feature off. Only
+> deferrals that are purely additive on an already-designed interface
+> stay deferred.
+
+**Test each deferral proposal against:**
+
+1. Does it change the **frame-parse dispatch** (offsets, EtherType,
+   header layout)?
+2. Does it change **buffer sizing** (max frame, max MTU, pool
+   granularity)?
+3. Does it change **ring / queue structure** (single-queue vs.
+   per-queue arrays, interrupt dispatch)?
+4. Does it change the **L2 ↔ L3 / L3 ↔ L4 handoff API** (metadata
+   struct shape, flags passed through)?
+
+A "yes" to any of the four means design in from the start.
+
+**Rationale:**
+
+- 100% assembly per D003 means every hot-path caller hand-rolls
+  around the data structure it consumes. Retrofitting a structure
+  change touches every caller — no "the compiler will re-emit the
+  accesses" fallback.
+- The D040 perf ratchet baselines are set on the current data
+  layout. Changing layout invalidates the baselines and forces
+  re-measurement across all cells.
+- Review overhead compounds: each retrofit re-touches code that
+  previously passed review. The second review is harder than the
+  first because reviewers compare against the baseline they
+  approved.
+- The MVP runtime stays as simple as the deferred plan (config-
+  time defaults turn the feature off). Customers who need the
+  feature turn it on via build-time `.equ` change; no code churn.
+
+**Application history:**
+
+- D044 (VLAN out-of-scope) superseded by D045 on these grounds.
+- Future L3/L4/HTTP design decisions should invoke D046 when
+  evaluating a "let's do this later" proposal.
+
+**Not a license to scope-creep:** the bar is "would retrofit
+reshape hot-path or interface structure?" — not "might we want this
+eventually?" Features that don't meet the bar (LACP, PFC,
+background-control-queue operations) stay deferred.
 
 ## Future decisions (not yet made)
 - virtio-net driver design

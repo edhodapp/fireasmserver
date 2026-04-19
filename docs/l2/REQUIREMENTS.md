@@ -74,21 +74,26 @@ Scope-defining decisions landed and cross-referenced from here:
 | `ETH-015` | Source MAC MUST have unicast bit clear (LSb of first byte = 0). | 802.3-2018 §4.1.2.1 | spec | |
 | `ETH-016` | MUST NOT emit a frame with source MAC = broadcast or multicast. | 802.3-2018 §4.1.2.1 | spec | Sanity check at TX. |
 | `ETH-017` | MAC address locally-administered bit (2nd LSb of first byte) is informational only; we don't treat L/A MACs differently. | IEEE 802c | spec | |
+| `ETH-018` | MUST silently discard Ethernet PAUSE frames (EtherType `0x8808`, MAC control opcode `0x0001`) and increment a `rx_pause_dropped` counter. | 802.3x-1997 §31B.1 | spec | Acting on received pause is a separate flow-control module, explicitly deferred per D045's "stays deferred" list. |
 
 ## 2. VLAN tagging — IEEE 802.1Q
 
-Scope pending the L2 design doc (D039 §4). Rows seeded so the
-question is tracked.
+Per D045 (superseding D044), VLAN parsing is designed in at MVP and
+runtime-inert by default. The RX parser unconditionally handles
+tagged frames by skipping the tag and extracting VID into per-frame
+metadata; TX insertion is opt-in via `tx_request_t.vid`. See
+`docs/l2/DESIGN.md` §5 for the parser layout.
 
 | ID | Requirement | Source | Status | Notes |
 |----|-------------|--------|--------|-------|
-| `VLAN-001` | 4-byte tag inserted after SA: TPID=`0x8100`, TCI = 3-bit PCP + 1-bit DEI + 12-bit VID. | 802.1Q-2022 §9.6 | deviation | Out of scope for MVP — D044. |
-| `VLAN-002` | Tagged-frame EtherType field is at byte offset 16 (not 12). | 802.1Q-2022 §9.5 | deviation | Out of scope for MVP — D044. |
-| `VLAN-003` | VID `0x000` = priority-tagged (no VLAN membership); `0xFFF` reserved. | 802.1Q-2022 §9.6.1 | deviation | Out of scope for MVP — D044. |
-| `VLAN-004` | PCP field maps to 802.1p priority classes 0–7. | 802.1Q-2022 §6.9 | deviation | Out of scope for MVP — D044. |
-| `VLAN-005` | MUST silently discard tagged frames on a port that is not VLAN-capable, if VLAN is out of scope. | 802.1Q-2022 §8 | spec | This IS the MVP behavior per D044 — single EtherType-compare in RX dispatch + `rx_vlan_dropped` counter. |
-| `VLAN-006` | 802.1ad Q-in-Q (outer TPID `0x88A8`). | 802.1ad-2005 | deviation | Out of scope for MVP — D044. |
-| `VLAN-007` | 802.1Qbb Priority Flow Control (PFC). | 802.1Qbb | deviation | Out of scope for MVP — D044. |
+| `VLAN-001` | 4-byte tag inserted after SA: TPID=`0x8100`, TCI = 3-bit PCP + 1-bit DEI + 12-bit VID. | 802.1Q-2022 §9.6 | spec | RX parses unconditionally; TX inserts when `tx_request_t.vid != 0`. |
+| `VLAN-002` | Tagged-frame EtherType field is at byte offset 16 (not 12). | 802.1Q-2022 §9.5 | spec | RX re-reads EtherType at offset 16 after tag detection. |
+| `VLAN-003` | VID `0x000` = priority-tagged (no VLAN membership); `0xFFF` reserved. | 802.1Q-2022 §9.6.1 | spec | VID extracted into per-frame metadata regardless. |
+| `VLAN-004` | PCP field maps to 802.1p priority classes 0–7. | 802.1Q-2022 §6.9 | spec | Propagated into per-frame metadata; QoS routing is upper-layer. |
+| `VLAN-005` | MUST silently discard tagged frames on a port that is not VLAN-capable. | 802.1Q-2022 §8 | deviation | D045 reverses this behavior — we parse tagged frames rather than discard. Kept for historical reference; obsoleted by the D045 design. |
+| `VLAN-006` | 802.1ad Q-in-Q (outer TPID `0x88A8`). | 802.1ad-2005 | spec | RX recognizes outer + inner tag; extracts both VIDs to metadata. TX can emit Q-in-Q when two `vid` fields are non-zero (MVP default: one-level tagging). |
+| `VLAN-007` | 802.1Qbb Priority Flow Control (PFC). | 802.1Qbb | deviation | D045 keeps PFC deferred — additive feature, doesn't reshape parser. |
+| `VLAN-008` | VLAN filter management via control queue (`VIRTIO_NET_CTRL_VLAN_ADD` / `_DEL`). | Virtio 1.2 §5.1.6.5.3 | deviation | D045 keeps filter management deferred — additive on already-designed control-queue interface. MVP accepts all VIDs. |
 
 ## 3. ARP — IETF RFC 826 / 5227
 

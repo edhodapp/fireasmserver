@@ -187,34 +187,83 @@ the TX on the next loop iteration.
 
 ## 5. D039 §4 — VLAN scope
 
-**MVP decision: 802.1Q and all successors are OUT OF SCOPE.**
+**MVP decision: 802.1Q + 802.1ad are DESIGNED IN, runtime-inert by
+default.** Per D045 (which superseded D044 on assembly-retrofit-cost
+grounds — see D046). Filter management and TX tagging are config-
+driven; pure-cloud deployments that never see tagged frames pay
+only the cost of one predict-not-taken branch per RX frame.
 
-Rationale:
-- All current target deployments (fly.io, AWS EC2, Kata Containers,
-  nested Firecracker) strip VLAN tags at the hypervisor/VPC layer
-  before frames reach the guest virtio-net. The guest sees
-  untagged frames in nearly every realistic cloud configuration.
-- VLAN handling adds real complexity to the parser (variable-offset
-  EtherType, extended max-frame length, tag-insertion on TX, control-
-  queue plumbing for VLAN filter updates). None of that is justified
-  until a customer deployment actually hands us tagged frames.
-- OEM appliance deployments (security, SCADA, instrumentation) may
-  need 802.1Q and/or 802.1ad. When one does, that becomes a
-  customer-engagement-gated feature addition, per the D042 tier
-  model.
+**RX behavior (always on, hot-path):**
 
-**What we do if we receive a tagged frame:** per `VLAN-005`, silently
-discard. Do NOT attempt to parse. Do NOT forward as untagged. Count
-the drop in observability counters so the operator can see "tagged
-frames are being dropped; you need to enable VLAN handling."
+The RX dispatch transition peeks at the two bytes at offset 12
+(position of EtherType in an untagged frame):
 
-**Implementation cost of "reject tagged frames":** one compare
-instruction on the EtherType field (reject if TPID matches `0x8100`
-or `0x88A8`) in the RX path. Cheap and explicit.
+```
+  offset 12-13 == 0x8100  →  802.1Q single-tagged
+                              extract VID (12 bits of bytes 14-15)
+                              re-read EtherType from offset 16
+  offset 12-13 == 0x88A8  →  802.1ad Q-in-Q
+                              extract outer VID, inner VID from bytes 14-19
+                              re-read EtherType from offset 20
+  otherwise               →  untagged; EtherType at offset 12 as expected
+```
 
-**Revisit trigger:** first OEM engagement that requires tagged-frame
-handling, OR evidence that a fly.io/AWS user's traffic arrives tagged.
-Either flips VLAN from OUT OF SCOPE to "in scope per D0XX."
+Extracted VID(s) go into the per-frame metadata slot alongside the
+buffer descriptor. L3 handoff passes the metadata; upper layers
+that don't care about VID read 0 and proceed.
+
+**Hot-path cost (measured against the D040 baseline):**
+
+| Path | Cycles (2.5 GHz reference) |
+|------|----------------------------|
+| Untagged (compare + predict-not-taken branch) | +3 |
+| 802.1Q single-tag (compare taken, skip 4, re-read) | +6 |
+| 802.1ad Q-in-Q (nested compare, skip 8, re-read) | +9 |
+
+At the 10 Gbps / 67 ns (≈170-cycle) budget, the untagged tax is
+~2% of per-frame cycles. Acceptable; sits within the §2 table.
+
+**TX behavior (opt-in per request):**
+
+The TX request structure carries an optional VID:
+
+```c
+/* pseudocode */
+struct tx_request {
+    uint8_t   dst_mac[6];
+    uint16_t  vid;          /* 0 = untagged; non-zero = insert tag */
+    uint16_t  ethertype;
+    ...
+};
+```
+
+When `vid == 0` (the MVP default for every L3/L4 caller), the TX path
+constructs an untagged frame with zero tag-insertion cost. When
+`vid != 0`, a 4-byte `0x8100`-TPID tag is inserted between SA and
+EtherType. TX-path branch is predict-not-taken on the untagged side.
+
+**Filter management (VLAN-accept list):**
+
+Deferred per D045's "stays deferred" list: `VIRTIO_NET_CTRL_VLAN_ADD`
+/ `_DEL` control-queue plumbing is an additive feature on an already-
+designed control-queue interface. Until it lands, L2 accepts any VID
+it sees. OEM deployments that need strict VID filtering will add it
+as a control-queue feature without reshaping the RX hot path.
+
+**What we do NOT do:**
+
+- We don't enforce a filter against the received VID (per above).
+- We don't re-emit rejected tagged frames back to the device.
+- We don't forward a received tagged frame as untagged to L3 without
+  recording the VID — VID is always in the metadata slot.
+
+**Revisit triggers (each would produce a new D-entry):**
+
+- VLAN filter management becomes needed → design doc update + new D
+  entry documenting the control-queue wiring.
+- Production cost analysis shows the untagged hot-path tax (+3
+  cycles) is above tolerance → revisit the design, possibly
+  introduce a runtime-patched fast path.
 
 ---
 
@@ -367,20 +416,92 @@ No silent drops without a named counter. That's the rule.
 
 ---
 
-## 11. Out-of-scope for MVP (explicit list)
+## 11. Designed-in accommodations (D045 / D046)
 
-- Multi-queue (`VIRTIO_NET_F_MQ`). Single RX + single TX + optional
-  control queue for MVP.
-- GSO, LRO, any segmentation offload.
-- Checksum offload (`VIRTIO_NET_F_CSUM` / `F_GUEST_CSUM`). L4 will
-  compute its own checksums.
-- Jumbo frames. Max 1518 for MVP; revisit when a customer needs it.
-- VLAN of any form, per §5 above.
-- Pause frames (802.3x), PFC (802.1Qbb), LACP (802.1AX).
+Features the MVP runtime disables by default but the architecture
+accommodates so future enablement doesn't force a hot-path retrofit.
+Shipping defaults produce the same runtime behavior the original
+"out of scope" plan would have; the **structure** stays production-
+capable.
+
+### 11.1 Multi-queue
+
+- `NUM_QUEUES` is a build-time `.equ` constant. MVP value: `1`.
+- RX and TX pools are arrays indexed by queue: `rx_pool[NUM_QUEUES]`,
+  `tx_pool[NUM_QUEUES]`. MVP instantiates size-1 arrays.
+- The dispatcher indexes by queue when pulling events; pending-event
+  queues are per-queue. No hard-coded "queue 0" special cases.
+- `VIRTIO_NET_F_MQ` feature negotiation is gated on `NUM_QUEUES > 1`;
+  MVP never negotiates it.
+- When an OEM deployment wants MQ, the change is a `.equ` edit, a
+  feature-negotiation branch flip, and a queue-steering rule. No
+  reshape of the dispatcher or pool structure.
+
+### 11.2 Checksum offload
+
+- The L2 RX path always populates `virtio_net_hdr` fields
+  (`flags.NEEDS_CSUM`, `csum_start`, `csum_offset`) into the
+  per-frame metadata struct handed to L3.
+- L4 (TCP) reads the metadata and decides whether to compute the
+  checksum in software or trust the offload result.
+- MVP does not negotiate `VIRTIO_NET_F_CSUM` / `F_GUEST_CSUM`,
+  so the fields are always zeroed at L2. No hot-path cost.
+- Enabling offload later is a feature-negotiation branch flip and an
+  L4 consume-flag update. No L2 interface change.
+
+### 11.3 Jumbo frames
+
+- `L2_MAX_FRAME` is a build-time `.equ`. MVP value: `1518` (or
+  `1522` once VLAN-tag insertion runs).
+- `RX_BUF_SIZE`, frame-length compares (`ETH-003`, `ETH-004`,
+  `ETH-010`, `ETH-011`), and the TX descriptor sizing all derive
+  from `L2_MAX_FRAME`.
+- OEM deployments that need 9000-byte jumbo override `L2_MAX_FRAME`
+  at build time. The RX hot path is structurally identical; only
+  the compare constants change.
+- Buffer-pool memory footprint scales linearly with `L2_MAX_FRAME ×
+  RX_BUF_COUNT`. Customers sizing jumbo need to co-tune
+  `RX_BUF_COUNT` to stay within the RAM budget.
+
+### 11.4 GSO / LRO metadata passthrough
+
+- `virtio_net_hdr.gso_type`, `.hdr_len`, `.gso_size` fields are
+  read by L2 on RX and written into the per-frame metadata struct
+  passed to L3/L4.
+- MVP does not negotiate GSO features, so the hdr fields are always
+  `GSO_NONE` (0) at L2. Passthrough is unconditional; L4 is the gate.
+- Future GSO enablement happens at L4 (TCP's segmentation decision
+  and reassembly discipline). L2's interface is already shaped for it.
+
+### 11.5 Pause-frame reject
+
+Per `ETH-018`, the RX dispatch transition recognizes Ethernet PAUSE
+frames (EtherType `0x8808`, opcode `0x0001` per IEEE 802.3x
+§31B) and silently discards them with a `rx_pause_dropped` counter
+increment. Pause frames are infrastructure-layer flow control the
+MVP doesn't handle. Single compare in the RX parser.
+
+---
+
+## 12. Genuinely out of scope for MVP (explicit list)
+
+These deferrals do NOT reshape the hot path on later addition, so
+they stay deferred per D046:
+
+- VLAN filter management (`VIRTIO_NET_CTRL_VLAN_ADD` / `_DEL`) —
+  additive control-queue feature; implementable without touching
+  RX dispatch.
+- Actual GSO segmentation on TX — L4 decision, not L2 architecture.
+- Runtime MQ negotiation with the device — MVP is `.equ`-pinned.
+- Pause-frame *flow control response* (acting on received pause) —
+  we reject pause frames, don't respond to them. Real flow control
+  integration is its own module.
+- PFC (802.1Qbb) — interacts with QoS queues we don't have.
+- LACP (802.1AX) — bonding is above the L2 driver, orthogonal.
 - Bridging — we are an endpoint (per D022 scope).
 - PHY-layer anything (autonegotiation, WoL, EEE) — virtio abstracts.
 
-Each of these becomes a new decision entry if/when we reverse it.
+Each becomes a new decision entry if/when reversed.
 
 ---
 
