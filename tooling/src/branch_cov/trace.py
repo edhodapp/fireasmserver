@@ -3,6 +3,13 @@
 The canonical input format is plain text with one hex PC per line.
 Blank lines and '#' comments are ignored. A small wrapper can filter
 QEMU `-d exec` output into this format.
+
+Scale note: the in-memory representation is list[int], which at ~28
+bytes per int handles traces up to roughly 1M PCs on a reasonable
+laptop. Beyond that, switching parse_trace's return type to
+array.array('Q') (8 bytes per PC) or a streaming generator is the
+natural evolution. Not done here because current tracer-bullet
+traces are a handful of PCs.
 """
 
 from __future__ import annotations
@@ -43,3 +50,24 @@ def parse_trace(trace_path: Path) -> list[int]:
             if pc is not None:
                 result.append(pc)
     return result
+
+
+def filter_trace(
+    trace: list[int],
+    skip_ranges: list[tuple[int, int]],
+) -> list[int]:
+    """Remove PCs that fall inside any half-open [start, end) range.
+
+    Useful before compute_coverage to strip interrupt-handler PCs so
+    the strict-adjacency classifier doesn't see a branch followed by a
+    handler-entry PC and silently miss the branch's real outcome.
+
+    No-op if skip_ranges is empty — returns a fresh copy regardless
+    so callers can mutate safely.
+    """
+    if not skip_ranges:
+        return list(trace)
+    return [
+        pc for pc in trace
+        if not any(lo <= pc < hi for lo, hi in skip_ranges)
+    ]

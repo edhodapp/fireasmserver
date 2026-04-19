@@ -78,6 +78,60 @@ class TestMain:
         assert "Gaps: 0" in out
 
 
+class TestErrorPaths:
+    """main() returns exit 2 with a clean message on I/O or parse errors."""
+
+    def test_missing_elf_returns_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        trace = tmp_path / "t.log"
+        trace.write_text("", encoding="utf-8")
+        rc = main([
+            "--elf", str(tmp_path / "nonexistent.elf"),
+            "--trace", str(trace),
+        ])
+        assert rc == 2
+        assert "file not found" in capsys.readouterr().err
+
+    def test_missing_trace_returns_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        elf = tmp_path / "g.elf"
+        _write_empty_elf(elf)
+        rc = main([
+            "--elf", str(elf),
+            "--trace", str(tmp_path / "nonexistent.log"),
+        ])
+        assert rc == 2
+        assert "file not found" in capsys.readouterr().err
+
+    def test_malformed_trace_returns_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        elf = tmp_path / "g.elf"
+        trace = tmp_path / "t.log"
+        _write_empty_elf(elf)
+        trace.write_text("not-a-hex-value\n", encoding="utf-8")
+        rc = main(["--elf", str(elf), "--trace", str(trace)])
+        assert rc == 2
+        assert "invalid input" in capsys.readouterr().err
+
+    def test_permission_error_returns_2(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        elf = tmp_path / "g.elf"
+        trace = tmp_path / "t.log"
+        _write_empty_elf(elf)
+        trace.write_text("", encoding="utf-8")
+        elf.chmod(0o000)
+        try:
+            rc = main(["--elf", str(elf), "--trace", str(trace)])
+        finally:
+            elf.chmod(0o644)  # so tmp_path can clean up
+        assert rc == 2
+        assert "permission denied" in capsys.readouterr().err
+
+
 class TestModuleInvocation:
     """`python -m branch_cov` enters through __main__.py."""
 

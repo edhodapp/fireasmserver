@@ -47,11 +47,15 @@ _start:
 
 _entry:
     // Per the Linux arm64 boot protocol, all vCPUs enter here. Park any
-    // secondary CPU (non-zero MPIDR_EL1.Aff0) at the WFE loop — the
+    // secondary CPU (any non-zero affinity) at the WFE loop — the
     // primary does the UART work alone to avoid interleaved writes.
-    // Firecracker assigns Aff0 = vCPU index, so Aff0=0 is the primary.
+    //
+    // Mask covers Aff0 | Aff1 | Aff2 (24 bits). Firecracker v1.15.1
+    // currently indexes vCPUs into Aff0 only, but Aff1/Aff2 are reserved
+    // for cluster/socket hierarchy; a wider mask is cheap insurance
+    // against a future hypervisor using them.
     mrs     x5, mpidr_el1
-    and     x5, x5, #0xff
+    and     x5, x5, #0xffffff
     cbnz    x5, .Ldone
 
     // UART base in x0 = 0x4000_2000 (Firecracker aarch64 SERIAL_MEM_START).

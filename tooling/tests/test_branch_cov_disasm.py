@@ -14,7 +14,9 @@ from branch_cov.disasm import (
     _detect_arch,
     _is_conditional,
     _SHF_EXECINSTR,
+    _symbol_address,
     _to_branch,
+    _trim_to_entry,
     enumerate_branches,
 )
 
@@ -151,6 +153,68 @@ def _fake_insn(
     return insn
 
 
+class TestSymbolAddress:
+    """Resolve a named symbol from the ELF's .symtab."""
+
+    def test_symbol_found(self) -> None:
+        sym = MagicMock()
+        sym.name = "_entry"
+        sym.__getitem__.side_effect = lambda k: {"st_value": 0x40}[k]
+        symtab = MagicMock()
+        symtab.iter_symbols.return_value = [sym]
+        elf = MagicMock()
+        elf.get_section_by_name.return_value = symtab
+        assert _symbol_address(elf, "_entry") == 0x40
+
+    def test_symbol_missing_raises(self) -> None:
+        symtab = MagicMock()
+        symtab.iter_symbols.return_value = []
+        elf = MagicMock()
+        elf.get_section_by_name.return_value = symtab
+        with pytest.raises(ValueError, match="Symbol not found"):
+            _symbol_address(elf, "_entry")
+
+    def test_no_symtab_raises(self) -> None:
+        elf = MagicMock()
+        elf.get_section_by_name.return_value = None
+        with pytest.raises(ValueError, match="no .symtab"):
+            _symbol_address(elf, "_entry")
+
+
+class TestTrimToEntry:
+    """Drop / trim sections so disassembly starts at entry_addr."""
+
+    def test_section_entirely_before_entry_dropped(self) -> None:
+        assert not _trim_to_entry([(b"\x00\x00", 0x0)], 0x100)
+
+    def test_section_entirely_after_entry_kept(self) -> None:
+        assert _trim_to_entry(
+            [(b"\x90\x90", 0x200)], 0x100,
+        ) == [(b"\x90\x90", 0x200)]
+
+    def test_section_straddles_entry_trimmed(self) -> None:
+        # Section spans 0x0..0x10; entry at 0x8 should keep bytes 8..16.
+        data = bytes(range(16))
+        result = _trim_to_entry([(data, 0x0)], 0x8)
+        assert result == [(data[8:], 0x8)]
+
+    def test_section_boundary_at_entry(self) -> None:
+        # Section ends exactly at entry — entirely before; dropped.
+        assert not _trim_to_entry([(b"\xaa\xbb", 0x0)], 0x2)
+
+    def test_mixed_sections(self) -> None:
+        sections = [
+            (b"\x00\x00", 0x0),     # before entry → drop
+            (b"\x11\x22\x33", 0x40),  # straddles → trim
+            (b"\x44\x55", 0x100),    # after entry → keep
+        ]
+        result = _trim_to_entry(sections, 0x41)
+        assert result == [
+            (b"\x22\x33", 0x41),
+            (b"\x44\x55", 0x100),
+        ]
+
+
 class TestToBranch:
     """Mapping capstone insn → ConditionalBranch."""
 
@@ -194,3 +258,24 @@ def test_enumerate_branches_on_aarch64_tracer_stub() -> None:
     branches = enumerate_branches(_AARCH64_ELF)
     mnemonics = sorted(b.mnemonic for b in branches)
     assert mnemonics == ["cbnz", "cbz", "tbz"]
+
+
+@pytest.mark.skipif(
+    not _AARCH64_ELF.exists(),
+    reason="aarch64 firecracker build artifact not present",
+)
+def test_enumerate_branches_with_entry_symbol_narrows_scope() -> None:
+    """_entry restriction yields the same three branches (header excluded)."""
+    branches = enumerate_branches(_AARCH64_ELF, entry_symbol="_entry")
+    mnemonics = sorted(b.mnemonic for b in branches)
+    assert mnemonics == ["cbnz", "cbz", "tbz"]
+
+
+@pytest.mark.skipif(
+    not _AARCH64_ELF.exists(),
+    reason="aarch64 firecracker build artifact not present",
+)
+def test_enumerate_branches_unknown_entry_symbol_raises() -> None:
+    """A missing entry symbol surfaces as ValueError."""
+    with pytest.raises(ValueError, match="Symbol not found"):
+        enumerate_branches(_AARCH64_ELF, entry_symbol="__nope__")

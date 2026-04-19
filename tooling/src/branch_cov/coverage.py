@@ -1,4 +1,16 @@
-"""Diff observed execution against required branch outcomes."""
+"""Diff observed execution against required branch outcomes.
+
+Classification assumes the trace is a **contiguous, interrupt-free**
+sequence of executed PCs: for each branch instruction at addr A, the
+immediately-following PC in the trace is classified as TAKEN if it
+equals A's taken-target or NOT_TAKEN if it equals A + insn_size.
+
+Traces that include interrupt-handler entry PCs, exception dispatch,
+or other discontinuities between a branch and its successor will
+silently miss those outcomes. Callers with interrupt-heavy traces
+should strip handler ranges with branch_cov.trace.filter_trace
+before calling compute_coverage.
+"""
 
 from __future__ import annotations
 

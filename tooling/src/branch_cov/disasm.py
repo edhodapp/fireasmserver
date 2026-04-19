@@ -78,6 +78,38 @@ def _code_sections(elf: ELFFile) -> list[tuple[bytes, int]]:
     return out
 
 
+def _symbol_address(elf: ELFFile, name: str) -> int:
+    """Return the address (st_value) of the named symbol, or raise."""
+    symtab = elf.get_section_by_name(  # type: ignore[no-untyped-call]
+        ".symtab",
+    )
+    if symtab is None:
+        msg = "ELF has no .symtab; cannot resolve symbols"
+        raise ValueError(msg)
+    for symbol in symtab.iter_symbols():
+        if symbol.name == name:
+            return int(symbol["st_value"])
+    msg = f"Symbol not found: {name}"
+    raise ValueError(msg)
+
+
+def _trim_to_entry(
+    sections: list[tuple[bytes, int]], entry_addr: int,
+) -> list[tuple[bytes, int]]:
+    """Drop/trim sections so disassembly starts at entry_addr."""
+    out: list[tuple[bytes, int]] = []
+    for data, base in sections:
+        end = base + len(data)
+        if end <= entry_addr:
+            continue  # section entirely before entry
+        if base >= entry_addr:
+            out.append((data, base))  # section entirely at/after entry
+            continue
+        offset = entry_addr - base  # section straddles; trim prefix
+        out.append((data[offset:], entry_addr))
+    return out
+
+
 def _to_branch(insn: Any) -> ConditionalBranch:
     """Build a ConditionalBranch from a capstone instruction.
 
@@ -108,8 +140,20 @@ def _filter_branches(
     ]
 
 
-def enumerate_branches(elf_path: Path) -> list[ConditionalBranch]:
-    """Enumerate every conditional branch in the ELF's code sections."""
+def enumerate_branches(
+    elf_path: Path,
+    entry_symbol: str | None = None,
+) -> list[ConditionalBranch]:
+    """Enumerate every conditional branch in the ELF's code sections.
+
+    If entry_symbol is provided, disassembly is restricted to bytes at
+    or after that symbol's address. This closes the phantom-branch
+    window for ELFs where a binary header (e.g., the 64-byte Linux
+    arm64 Image header in our firecracker aarch64 stubs) precedes the
+    real code but shares the same SHF_EXECINSTR section — a random
+    4-byte word in the header could otherwise decode as a valid
+    conditional branch and be reported as a permanent gap.
+    """
     result: list[ConditionalBranch] = []
     with open(elf_path, "rb") as f:
         # pyelftools is untyped; the ELFFile constructor is untyped too.
@@ -135,6 +179,11 @@ def enumerate_branches(elf_path: Path) -> list[ConditionalBranch]:
         # actual code entry (e.g., _entry onwards) rather than the whole
         # SHF_EXECINSTR section.
         cs.skipdata = True
-        for data, base in _code_sections(elf):
+        sections = _code_sections(elf)
+        if entry_symbol is not None:
+            sections = _trim_to_entry(
+                sections, _symbol_address(elf, entry_symbol),
+            )
+        for data, base in sections:
             result.extend(_filter_branches(arch, cs.disasm(data, base)))
     return result
