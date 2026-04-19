@@ -1096,6 +1096,140 @@ the superseded paragraph in the old entry, add a `**DEPRECATED
 write the replacement as a new numbered entry that cites the
 section being superseded. Bidirectional references beat unidirectional.
 
+### D043: FSA runtime model — statically-allocated per-type pools, cooperative dispatch
+
+**Decision:** fireasmserver's FSA runtime (the concrete realization of
+the VMIO automaton engine per D012) uses **per-FSA-type static slot
+pools sized at build time**. No heap. Dispatch is cooperative, not
+preemptive. Allocator failure is a per-layer-defined backpressure
+response, not a panic.
+
+Applies cross-layer: L2 connection state, L3 ARP/reassembly, L4 TCB,
+HTTP request state, TLS context, future timers. Each gets its own
+pool; each pool's capacity is independent.
+
+### Memory model
+
+- **Per-FSA-type static pools.** Each FSA species has its own
+  contiguous array of slots, sized by a build-time `.equ`:
+  ```
+  # arch/<arch>/config.S (pseudocode)
+  .equ TCP_MAX_CONN,         8192
+  .equ HTTP_MAX_REQ,         16384   # supports pipelining up to 2x
+  .equ TLS_MAX_CTX,          8192
+  .equ ARP_MAX_ENTRIES,      2048
+  .equ REASSEMBLY_BUFS,      512
+  ```
+  The full RAM footprint is
+  `sum_over_types(slots × slot_size_bytes)` — known exactly at link
+  time. Builds fail loudly if the sum exceeds the configured RAM
+  budget; no surprise OOMs.
+- **No heap.** Zero `malloc`/`free` paths. Consistent with D003 and
+  removes an entire attack surface and class of bugs (fragmentation,
+  use-after-free, double-free, heap corruption).
+- **Slot recycling zeroes.** On release, the slot's state block is
+  `memset`-cleared before the allocator returns it. Cheap, predictable,
+  closes the info-leak class of bugs that plague reused heap allocators.
+- **Sizing relationships documented** alongside the `.equ` block, e.g.
+  `HTTP_MAX_REQ >= TCP_MAX_CONN × pipeline_depth`,
+  `TLS_MAX_CTX <= TCP_MAX_CONN` (one TLS context attaches to one TCP
+  connection), `ARP_MAX_ENTRIES` sized for subnet breadth not
+  connection count. OEM deployments can re-tune without inventing
+  the relationships from scratch.
+
+### Dispatch model
+
+- **Cooperative.** A single dispatcher loop pulls the next pending
+  event from the priority wait queues (per Astier FSA, D012) and
+  invokes the matching transition handler. No preemption, no kernel
+  scheduler, no context-switch cost.
+- **Bounded-work transitions.** A transition has a wall-clock
+  budget (nanoseconds, not microseconds) because it directly blocks
+  every other FSA in the dispatcher. Anything that might exceed the
+  budget must be split across multiple transitions with interleaved
+  dispatches. This is the "transactional handler" discipline made
+  concrete and enforceable (see Properties to Enforce).
+- **Transition atomicity.** A transition either fully completes or
+  didn't start. On fault, the slot rolls back to the pre-transition
+  state. Basis for durability claims and for formal verification
+  later.
+- **Priority and QoS** live in the wait queues, not in slot
+  allocation. Slots are fungible within a type; priority is per
+  pending event (e.g., TLS handshake completion > keepalive refresh).
+
+### Backpressure — allocator failure is per-layer behavior
+
+Each layer defines its response to "pool full" at design time.
+Silent drops are the enemy; every layer has a defined answer:
+
+| Allocator | Response on full | Rationale |
+|-----------|------------------|-----------|
+| TCP (new TCB) | RST or silent drop of SYN (config-pinned per deployment) | TCP retransmit handles temporary unavailability cleanly; RST is more honest to well-behaved clients |
+| TCP (established) | still has its slot; no alloc needed | — |
+| HTTP request | 503 Service Unavailable + `Retry-After` | Gives the client a defined comeback window |
+| TLS context | TCP RST at connection time (don't accept if we can't handshake) | Fail early; don't burn a TCB slot on an unservable connection |
+| ARP | drop (ARP is already best-effort) | Next client request re-triggers |
+| Reassembly | drop the fragment | Sender will retransmit |
+
+Each per-layer decision recorded in that layer's design doc (the
+`docs/<layer>/DESIGN.md` mandated by D038 stage 2 / D039).
+
+### Why this wins over a thread pool
+
+- **Bounded memory by construction.** Thread stacks are typically
+  8 KB minimum (often 64 KB+); 10K threads is 80 MB of stack alone
+  before any application state. FSA slots carry only the state the
+  layer needs (TCB ~200 B, HTTP req state ~1 KB, TLS ctx ~16 KB) —
+  a full 10K-connection server fits in ~200 MB.
+- **No OS overhead.** No kernel thread table entries, no signal
+  masks, no FPU state save areas, no scheduler queues.
+- **Deterministic scheduling.** No preemption, no priority-inversion
+  pathologies, no scheduler jitter. Latency bounds are a function of
+  transition work, not kernel fairness heuristics.
+- **Cache-friendly.** Contiguous per-type arrays accessed via base +
+  index, bounded TLB pressure, no pointer-chasing through allocator
+  metadata.
+- **Predictable DoS envelope.** Attacker exhausts *slots*; cannot
+  cause OOM kill, heap corruption, or fragmented-allocator stall.
+  The security envelope equals the `.equ` sum.
+
+### Properties the FSA runtime MUST enforce (invariants)
+
+Each bullet is a testable invariant, not aspirational:
+
+1. Every transition completes in ≤ `FSA_TRANSITION_BUDGET_NS`
+   (initial budget to be set in D040's perf-regression baseline;
+   design-doc states the number before implementation).
+2. No transition allocates or frees heap memory (static-check
+   in CI: grep for malloc/free symbol references in linked output).
+3. A freed slot's state block is fully zeroed before the allocator
+   returns it to another caller (unit-testable per allocator).
+4. Pool capacity per type is a build-time constant visible in a
+   single header; rebuild with different values produces a different
+   binary, not a different runtime state.
+5. Every per-layer "pool full" path is handled — no silent drops
+   except where explicitly named above (ARP, reassembly).
+
+### Runtime reconfiguration — deliberately out of scope
+
+Hot-resizing a pool while connections are live is a future
+decision, not MVP. Build-time `.equ` tuning per OEM deployment
+covers today's needs without adding a config parser, string
+handling, and early-boot complexity that 100%-assembly doesn't
+want. If we ever need it, that's a deliberate new decision,
+not a quiet feature addition.
+
+### Cross-references
+
+- `D003` — 100% assembly, no C stdlib
+- `D012` — Astier VMIO automaton engine
+- `D034` — per-arch profiles (including cache-line size, which
+  informs slot-size alignment)
+- `D038` stage 2 / `D039` — each L-layer design doc must state
+  its pool-type, its pool size, and its allocator-full behavior
+- `D040` — perf regression ratchet includes `FSA_TRANSITION_BUDGET_NS`
+  as a measurable metric
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
