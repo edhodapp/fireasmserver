@@ -1,24 +1,23 @@
 name: CD matrix (arch × platform)
 
-# Build-only MVP per D005. Every commit to main (and every PR against
-# main) builds the four (arch, platform) cells from a clean checkout.
-# Validates the cross-toolchain + Makefile + linker-script triad on
-# fresh GitHub-hosted runners. VM-launch-level coverage in CI is
-# follow-up work; today the per-cell guest-boot is exercised by the
-# local pytest harness + the Pi-side tracer-bullet orchestration.
+# Every commit to main (and every PR against main) builds AND boots
+# the four (arch, platform) cells from a clean checkout. Each cell:
+#   1. installs the cross-toolchain
+#   2. builds guest.{elf,bin} via make
+#   3. installs the cell's VMM (qemu or firecracker)
+#   4. invokes tooling/tracer_bullet/run_local.sh which launches the
+#      guest under that VMM, captures serial to a temp file, and
+#      checks for the READY marker — exit 0 = PASS, 1 = FAIL.
 #
-# Coverage scope: all cells are build-only today.
-#
-# x86_64 VM-launch coverage comes from the pytest harness in
-# python-gates.yml (which runs on the same ubuntu-latest image that
-# has /dev/kvm). AArch64/firecracker VM-launch coverage comes from
-# the local Pi-side tracer bullet
-# (tooling/tracer_bullet/pi_aarch64_firecracker.sh) — not from CI.
-#
-# Empirical finding (2026-04-18, eaf50d3): the free ubuntu-24.04-arm
-# hosted runner does NOT expose /dev/kvm. The probe step at the bottom
-# of each firecracker cell continues to surface this; promote the
-# cell to VM-launch when/if a future hosted image makes KVM available.
+# aarch64/firecracker is build-only in CI: Firecracker requires KVM,
+# and the free ubuntu-24.04-arm hosted runner does NOT expose
+# /dev/kvm (empirical finding 2026-04-18, eaf50d3). run_local.sh
+# detects this cell and exits 0 with an explicit SKIP message, so
+# the uniform "call run_local.sh" step still works. VM-launch
+# coverage for that cell lives in the local Pi-side tracer bullet
+# (tooling/tracer_bullet/pi_aarch64_firecracker.sh). Promote the
+# cell to full VM-launch when/if a future hosted arm64 image exposes
+# KVM.
 
 on:
   push:
@@ -29,6 +28,9 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  FIRECRACKER_VERSION: v1.15.1
 
 jobs:
   build:
@@ -83,6 +85,37 @@ jobs:
           ls -la "$ARTIFACT"
           file "$ARTIFACT"
 
+      # Install whichever VMM this cell's platform uses, so run_local.sh
+      # can drive it in the step after.
+      - name: Install QEMU
+        if: matrix.platform == 'qemu'
+        run: |
+          sudo apt-get install -y \
+            qemu-system-x86 qemu-system-arm
+
+      - name: Install Firecracker (prebuilt, SHA-verified)
+        if: matrix.platform == 'firecracker'
+        run: |
+          VERSION="$FIRECRACKER_VERSION"
+          FC_ARCH="${{ matrix.arch }}"
+          BASE="https://github.com/firecracker-microvm/firecracker/releases/download/${VERSION}"
+          TARBALL="firecracker-${VERSION}-${FC_ARCH}.tgz"
+          CHECKSUM="${TARBALL}.sha256.txt"
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+          curl -fLsS -o "$WORK/$TARBALL"  "$BASE/$TARBALL"
+          curl -fLsS -o "$WORK/$CHECKSUM" "$BASE/$CHECKSUM"
+          (cd "$WORK" && sha256sum -c "$CHECKSUM")
+          # Tar-slip defense — refuse unsafe paths before extract.
+          if tar -tzf "$WORK/$TARBALL" | grep -qE '^(/|.*\.\./)'; then
+            echo "ERROR: tarball contains unsafe paths" >&2; exit 1
+          fi
+          tar --no-same-owner -xzf "$WORK/$TARBALL" -C "$WORK"
+          FC_BIN="$WORK/release-${VERSION}-${FC_ARCH}/firecracker-${VERSION}-${FC_ARCH}"
+          [ -x "$FC_BIN" ] || { echo "ERROR: firecracker binary missing"; exit 1; }
+          sudo install -m 0755 "$FC_BIN" /usr/local/bin/firecracker
+          firecracker --version
+
       - name: Probe /dev/kvm (informational, firecracker cells only)
         if: matrix.platform == 'firecracker'
         run: |
@@ -92,3 +125,9 @@ jobs:
           else
             echo "::warning::KVM NOT available on ${{ matrix.runner }} — firecracker boot would fail here"
           fi
+
+      # Launch the built guest and check for the READY marker. For
+      # aarch64/firecracker on a KVM-less host this step exits 0 with
+      # a SKIP message (see run_local.sh's comment on that cell).
+      - name: Tracer bullet (launch + READY check)
+        run: ./tooling/tracer_bullet/run_local.sh ${{ matrix.arch }} ${{ matrix.platform }}
