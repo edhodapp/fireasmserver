@@ -114,6 +114,18 @@ class TestRequiredOutcomes:
         bs = [_make_branch(addr=a) for a in (0x100, 0x200, 0x300)]
         assert len(_required_outcomes(bs)) == 6
 
+    def test_degenerate_branch_yields_single_outcome(self) -> None:
+        """target_taken == target_not_taken → only TAKEN is required.
+
+        Synthesises a `cbz x0, .+4` analogue: TAKEN target equals the
+        fallthrough, so there's no semantically-distinct NOT_TAKEN
+        path. Requiring both outcomes would create a permanent gap.
+        """
+        b = _make_branch(
+            addr=0x100, insn_size=4, target=0x104,  # target == fallthrough
+        )
+        assert _required_outcomes([b]) == [(b, BranchOutcome.TAKEN)]
+
 
 class TestComputeCoverage:
     """End-to-end: branches + trace → report with gaps."""

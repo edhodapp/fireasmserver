@@ -94,11 +94,20 @@ def _observed_outcomes(
 def _required_outcomes(
     branches: list[ConditionalBranch],
 ) -> list[tuple[ConditionalBranch, BranchOutcome]]:
-    """Return (branch, TAKEN) and (branch, NOT_TAKEN) for every branch."""
+    """Return (branch, TAKEN) and (branch, NOT_TAKEN) for every branch.
+
+    Degenerate branches where target_taken == target_not_taken (e.g.,
+    `cbz x0, .+4` — the TAKEN target is also the fallthrough) have
+    only one semantically-distinct outcome. Requiring both would
+    create a permanent gap that no trace can ever close because
+    _classify always resolves the collision as TAKEN. We require
+    only TAKEN in that case.
+    """
     out: list[tuple[ConditionalBranch, BranchOutcome]] = []
     for b in branches:
         out.append((b, BranchOutcome.TAKEN))
-        out.append((b, BranchOutcome.NOT_TAKEN))
+        if b.target_taken != b.target_not_taken:
+            out.append((b, BranchOutcome.NOT_TAKEN))
     return out
 
 

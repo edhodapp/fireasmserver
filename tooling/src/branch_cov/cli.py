@@ -103,6 +103,12 @@ def _print_baseline_delta(cmp_: BaselineComparison) -> None:
 
 def _run(args: argparse.Namespace) -> int:
     """Execute the coverage pipeline; raises on I/O or parse errors."""
+    # Load + validate the baseline BEFORE the expensive disassembly and
+    # trace parsing phases, so a malformed baseline file fails fast
+    # (~milliseconds) rather than after minutes of analysis.
+    baseline = (
+        load_baseline(args.baseline) if args.baseline else None
+    )
     branches = enumerate_branches(args.elf, entry_symbol=args.entry)
     trace = parse_trace(args.trace)
     if args.load_offset:
@@ -113,10 +119,10 @@ def _run(args: argparse.Namespace) -> int:
         trace = [pc - args.load_offset for pc in trace]
     report = compute_coverage(branches, trace)
     _print_report(report)
-    if args.baseline is None:
+    if baseline is None:
         # Advisory mode — gaps do not fail the run.
         return 0
-    cmp_ = compare_to_baseline(report, load_baseline(args.baseline))
+    cmp_ = compare_to_baseline(report, baseline)
     _print_baseline_delta(cmp_)
     return 0 if cmp_.matches else 1
 
