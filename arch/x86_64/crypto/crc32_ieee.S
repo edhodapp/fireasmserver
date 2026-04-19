@@ -348,8 +348,8 @@ global crc32_ieee_802_3_has_pclmulqdq
 ;   returns eax = updated crc_acc (no final XOR)
 ; Leaf; clobbers rax, rcx, rdx, rdi, rsi, r8-r11. Internal-only —
 ; callers must stage rdi/rsi themselves if they need them after the
-; call. The 16-byte main loop advances rdi by +len and ends with
-; rsi = 0; the byte tail leaves rdi at end-of-input and rsi = 0.
+; call. The 8-byte slicing main loop advances rdi by +len and ends
+; with rsi = 0; the byte tail leaves rdi at end-of-input and rsi = 0.
 ;
 ; eax is used (not edx) for the incoming accumulator so the caller
 ; can avoid a reg→reg MOV when handing one update's output to the
@@ -516,26 +516,62 @@ crc32_ieee_802_3_has_pclmulqdq:
     pop     rbx
     ret
 
-; Dispatcher. Runtime CPUID check on PCLMULQDQ and tail-call the
-; appropriate path. CPUID is serializing and costs ~100 cycles, so
-; for small-frame hot paths it dominates; D034's `HAS_PCLMULQDQ`
-; build-time profile flag is the intended replacement for this
-; runtime probe.
+; Dispatcher. One-time CPUID probe via a cached function pointer —
+; CPUID is serializing and costs 100–300 cycles, so running it on
+; every invocation dominates the hot path for small-frame callers.
+; Instead, the first call goes through a resolver that picks the
+; right impl, writes its address into `crc32_ieee_802_3_ptr`, and
+; tail-calls it; subsequent calls just jmp through the pointer.
 ;
-; cpuid leaves rdi/rsi/r11 alone (only eax/ebx/ecx/edx), so we only
-; need to save rbx. The push+pop of rbx also keeps rsp 16-aligned
-; across the cpuid so any future insertion here doesn't trip over
-; the implicit alignment.
+; D034's `HAS_PCLMULQDQ` build-time profile flag remains the
+; intended long-term replacement (eliminates even the one-time
+; probe and the pointer load); this dispatcher is the runtime
+; fallback when we ship a profile-agnostic binary.
+;
+; Concurrency: the pointer write is a single aligned 8-byte store,
+; so torn reads can't happen even under concurrent callers. If two
+; callers race on the first invocation, both run the resolver, both
+; compute the same target, and whichever writes last is idempotent.
+; We are single-threaded today (D003) so this is free robustness.
+;
+; ABI: a standard SysV call into `crc32_ieee_802_3` becomes a
+; single indirect jump. The resolver preserves rdi/rsi/rbx across
+; its CPUID so the real impl sees the caller's arguments intact.
 align 16
+global crc32_ieee_802_3
 crc32_ieee_802_3:
+    jmp     [crc32_ieee_802_3_ptr]
+
+; One-time resolver. Runs on the first dispatcher call, then
+; replaces itself in the pointer cache. CPUID clobbers rbx
+; (callee-saved) and eax/ebx/ecx/edx; rdi/rsi are caller's args
+; that must survive the tail-call.
+align 16
+crc32_ieee_802_3_resolve:
     push    rbx
+    push    rdi
+    push    rsi
     mov     eax, 1
     cpuid
-    mov     r11d, ecx                 ; r11 ← ecx
+    test    ecx, 2                    ; PCLMULQDQ = ECX bit 1
+    lea     rax, [crc32_ieee_802_3_pclmulqdq]
+    jnz     .install
+    lea     rax, [crc32_ieee_802_3_slice8]
+.install:
+    mov     [crc32_ieee_802_3_ptr], rax
+    pop     rsi
+    pop     rdi
     pop     rbx
-    test    r11d, 2                   ; PCLMULQDQ = ECX bit 1
-    jnz     crc32_ieee_802_3_pclmulqdq
-    jmp     crc32_ieee_802_3_slice8
+    jmp     rax                       ; tail-call resolved impl
+
+; Function-pointer cache. Initialized to the resolver; the resolver
+; overwrites this with the PCLMULQDQ or slice8 address on first
+; call. 8-byte aligned so the pointer read/write is a single
+; atomic transaction on x86-64.
+section .data
+align 8
+crc32_ieee_802_3_ptr:
+    dq crc32_ieee_802_3_resolve
 
 ; Non-executable stack marker.
 section .note.GNU-stack noalloc noexec nowrite progbits
