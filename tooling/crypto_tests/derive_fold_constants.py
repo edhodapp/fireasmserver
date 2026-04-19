@@ -162,13 +162,18 @@ def derive_pair(fold_n: int) -> FoldPair:
 
 
 def fold_step(state: int, const128: int, chunk: int) -> int:
-    """One fold step, matching the asm `pclmul + pslldq 4 + xor` body."""
+    """One fold step, matching the asm `pclmul + pslldq 4 + xor` body.
+
+    Names match FoldPair field roles (hi/lo = exponent tier, NOT xmm
+    bit position): k_hi = x^(N*128+64) multiplier, held in the LOW 64
+    bits of const128 by convention, multiplies state_lo.
+    """
     state_lo = state & MASK64
     state_hi = (state >> 64) & MASK64
-    c_hi = const128 & MASK64
-    c_lo = (const128 >> 64) & MASK64
-    p_lo = (gf2_mul(state_lo, c_hi) << 32) & MASK128
-    p_hi = (gf2_mul(state_hi, c_lo) << 32) & MASK128
+    k_hi = const128 & MASK64
+    k_lo = (const128 >> 64) & MASK64
+    p_lo = (gf2_mul(state_lo, k_hi) << 32) & MASK128
+    p_hi = (gf2_mul(state_hi, k_lo) << 32) & MASK128
     return (p_lo ^ p_hi ^ chunk) & MASK128
 
 
