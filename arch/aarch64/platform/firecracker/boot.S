@@ -105,5 +105,5 @@ ready_msg:
     .ascii  "READY\n"
 ready_msg_end:
 
-.section .text, "ax"
-_image_end:
+// _image_end is defined in the linker script (placed after both .text
+// and .rodata) so the Image header's image_size covers the entire file.

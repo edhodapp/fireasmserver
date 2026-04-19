@@ -35,6 +35,18 @@ SECTIONS
         *(.rodata*)
     }
 
+    /*
+     * _image_end is defined here, *after* both .text and .rodata output
+     * sections, so the Linux arm64 Image header's image_size field
+     * (computed as `_image_end - _start` in boot.S) covers the full
+     * image the loader needs to place in memory. Previously this symbol
+     * lived in the assembly and got pulled into .text output, causing
+     * image_size to exclude .rodata (e.g., the READY string) — Firecracker
+     * loads the whole file regardless, but a stricter arm64 boot loader
+     * would truncate per the spec.
+     */
+    _image_end = .;
+
     /DISCARD/ : {
         *(.comment)
         *(.note*)

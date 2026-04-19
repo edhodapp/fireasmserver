@@ -85,6 +85,19 @@ class TestParseTrace:
         path.write_text("# a\n# b\n", encoding="utf-8")
         assert not parse_trace(path)
 
+    def test_malformed_line_error_includes_lineno_and_path(
+        self, tmp_path: Path,
+    ) -> None:
+        """ValueError message should cite filename + line for quick debug."""
+        path = tmp_path / "trace.log"
+        path.write_text("0x40\nnot-a-hex\n0x50\n", encoding="utf-8")
+        with pytest.raises(ValueError) as exc:
+            parse_trace(path)
+        msg = str(exc.value)
+        assert str(path) in msg
+        assert ":2:" in msg  # line 2 is the malformed one
+        assert "not-a-hex" in msg
+
 
 class TestFilterTrace:
     """Skip PCs that fall inside any half-open [start, end) range."""

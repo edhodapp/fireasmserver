@@ -14,6 +14,7 @@ traces are a handful of PCs.
 
 from __future__ import annotations
 
+import bisect
 from pathlib import Path
 
 
@@ -42,14 +43,34 @@ def _parse_pc_line(line: str) -> int | None:
 
 
 def parse_trace(trace_path: Path) -> list[int]:
-    """Return PCs from the trace file in execution order."""
+    """Return PCs from the trace file in execution order.
+
+    Raises ValueError with a filename:lineno context on malformed hex,
+    so the CLI can surface a useful error rather than a bare
+    "invalid literal for int()".
+    """
     result: list[int] = []
     with open(trace_path, encoding="utf-8") as f:
-        for raw in f:
-            pc = _parse_pc_line(raw)
+        for lineno, raw in enumerate(f, start=1):
+            try:
+                pc = _parse_pc_line(raw)
+            except ValueError as exc:
+                msg = (
+                    f"{trace_path}:{lineno}: malformed PC line "
+                    f"{raw.rstrip()!r}: {exc}"
+                )
+                raise ValueError(msg) from exc
             if pc is not None:
                 result.append(pc)
     return result
+
+
+def _in_skip(pc: int, sorted_los: list[int], sorted_his: list[int]) -> bool:
+    """True iff pc falls in the half-open range at the bisected index."""
+    idx = bisect.bisect_right(sorted_los, pc) - 1
+    if idx < 0:
+        return False
+    return sorted_los[idx] <= pc < sorted_his[idx]
 
 
 def filter_trace(
@@ -62,12 +83,20 @@ def filter_trace(
     the strict-adjacency classifier doesn't see a branch followed by a
     handler-entry PC and silently miss the branch's real outcome.
 
+    O(N log M) for N trace PCs and M skip ranges — ranges are sorted
+    once and bisected per PC. Assumes ranges are non-overlapping; an
+    overlap would merely mean some PCs get multi-counted as "skipped,"
+    which is benign but not asserted.
+
     No-op if skip_ranges is empty — returns a fresh copy regardless
     so callers can mutate safely.
     """
     if not skip_ranges:
         return list(trace)
+    sorted_ranges = sorted(skip_ranges)
+    sorted_los = [lo for lo, _ in sorted_ranges]
+    sorted_his = [hi for _, hi in sorted_ranges]
     return [
         pc for pc in trace
-        if not any(lo <= pc < hi for lo, hi in skip_ranges)
+        if not _in_skip(pc, sorted_los, sorted_his)
     ]
