@@ -82,13 +82,13 @@ question is tracked.
 
 | ID | Requirement | Source | Status | Notes |
 |----|-------------|--------|--------|-------|
-| `VLAN-001` | 4-byte tag inserted after SA: TPID=`0x8100`, TCI = 3-bit PCP + 1-bit DEI + 12-bit VID. | 802.1Q-2022 §9.6 | spec | Scope decision pending. |
-| `VLAN-002` | Tagged-frame EtherType field is at byte offset 16 (not 12). | 802.1Q-2022 §9.5 | spec | Affects parser dispatch. |
-| `VLAN-003` | VID `0x000` = priority-tagged (no VLAN membership); `0xFFF` reserved. | 802.1Q-2022 §9.6.1 | spec | |
-| `VLAN-004` | PCP field maps to 802.1p priority classes 0–7. | 802.1Q-2022 §6.9 | spec | |
-| `VLAN-005` | MUST silently discard tagged frames on a port that is not VLAN-capable, if VLAN is out of scope. | 802.1Q-2022 §8 | spec | Alternative to `VLAN-*`-implemented. |
-| `VLAN-006` | 802.1ad Q-in-Q (outer TPID `0x88A8`). | 802.1ad-2005 | spec | Enterprise/SP deployments. |
-| `VLAN-007` | 802.1Qbb Priority Flow Control (PFC). | 802.1Qbb | deviation-candidate | Data-center specific; defer. |
+| `VLAN-001` | 4-byte tag inserted after SA: TPID=`0x8100`, TCI = 3-bit PCP + 1-bit DEI + 12-bit VID. | 802.1Q-2022 §9.6 | deviation | Out of scope for MVP — D044. |
+| `VLAN-002` | Tagged-frame EtherType field is at byte offset 16 (not 12). | 802.1Q-2022 §9.5 | deviation | Out of scope for MVP — D044. |
+| `VLAN-003` | VID `0x000` = priority-tagged (no VLAN membership); `0xFFF` reserved. | 802.1Q-2022 §9.6.1 | deviation | Out of scope for MVP — D044. |
+| `VLAN-004` | PCP field maps to 802.1p priority classes 0–7. | 802.1Q-2022 §6.9 | deviation | Out of scope for MVP — D044. |
+| `VLAN-005` | MUST silently discard tagged frames on a port that is not VLAN-capable, if VLAN is out of scope. | 802.1Q-2022 §8 | spec | This IS the MVP behavior per D044 — single EtherType-compare in RX dispatch + `rx_vlan_dropped` counter. |
+| `VLAN-006` | 802.1ad Q-in-Q (outer TPID `0x88A8`). | 802.1ad-2005 | deviation | Out of scope for MVP — D044. |
+| `VLAN-007` | 802.1Qbb Priority Flow Control (PFC). | 802.1Qbb | deviation | Out of scope for MVP — D044. |
 
 ## 3. ARP — IETF RFC 826 / 5227
 

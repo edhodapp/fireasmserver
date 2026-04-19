@@ -1230,6 +1230,57 @@ not a quiet feature addition.
 - `D040` — perf regression ratchet includes `FSA_TRANSITION_BUDGET_NS`
   as a measurable metric
 
+### D044: VLAN (802.1Q and successors) — out of scope for fireasmserver L2 MVP
+
+**Decision:** 802.1Q single-tag VLAN, 802.1ad Q-in-Q, 802.1Qau Congestion
+Notification, and 802.1Qbb Priority Flow Control are **out of scope**
+for the fireasmserver L2 MVP. The L2 layer MUST still gracefully reject
+tagged frames (per `VLAN-005` in `docs/l2/REQUIREMENTS.md`): silent
+discard with a dedicated counter increment, no attempt to parse.
+
+**Rationale:**
+- All current MVP deployment targets (fly.io, AWS EC2 with Firecracker,
+  Kata Containers, nested Firecracker on Pi 5) present **untagged
+  frames to the guest.** The hypervisor/VPC layer strips VLAN before
+  hand-off. Implementing VLAN in the guest doesn't improve any
+  current deployment path.
+- VLAN handling has real complexity cost: variable-offset EtherType
+  dispatch in the RX hot path, extended max-frame length (1522
+  instead of 1518), tag-insertion logic on TX, control-queue
+  plumbing for VLAN-filter updates. Every one of these adds budget
+  against the D039 latency target without earning signal.
+- OEM appliance deployments (security, SCADA, defense,
+  instrumentation — per `~/fireasmserver_oem_market_notes.md`) may
+  require VLAN. When a specific engagement surfaces the need, VLAN
+  becomes a scope addition gated on that engagement (same pattern
+  D042 uses for enterprise-switch interop).
+
+**Implementation cost of the reject-path:** one comparison of the
+EtherType field against `0x8100` (802.1Q) and `0x88A8` (802.1ad) in
+the RX dispatch transition. Cheap and explicit.
+
+**Affected requirement rows** (`docs/l2/REQUIREMENTS.md` section 2):
+- `VLAN-001`..`VLAN-004`: flipped from `spec` to `deviation`, citing
+  this D044.
+- `VLAN-005`: stays `spec` — this IS the behavior we implement
+  (silent reject with counter).
+- `VLAN-006` (802.1ad Q-in-Q): `deviation`, D044.
+- `VLAN-007` (802.1Qbb PFC): was already `deviation-candidate`;
+  promoted to `deviation` citing D044.
+
+**Revisit trigger (supersedes condition):** first OEM engagement
+that requires tagged-frame handling, OR evidence of a production
+cloud deployment arriving with tagged frames. Either would result
+in a new D-entry marking D044's VLAN-out-of-scope decision
+DEPRECATED per the D042 convention.
+
+**Cross-references:**
+- `docs/l2/DESIGN.md` §5 — the design-doc statement of this scope.
+- `D039` §4 — the "VLAN scope" property the design doc must
+  explicitly state; D044 records the resolution.
+- `D042` — establishes the "defer vendor-specific scope until
+  engagement" pattern this decision follows.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
