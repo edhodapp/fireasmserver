@@ -4,21 +4,23 @@
 # Usage:
 #   make PLATFORM=qemu        (default)
 #   make PLATFORM=firecracker
+#
+# Assembler: NASM per D048. Linker stays at binutils' ld.
 
 PLATFORM ?= qemu
 
-AS := x86_64-linux-gnu-as
+AS := nasm
 LD := x86_64-linux-gnu-ld
 
-# qemu boots via Multiboot1 on -machine pc, which requires a
-# 32-bit ELF (--32 / -m elf_i386). firecracker boots via PVH,
-# which requires a 64-bit ELF wrapping the same .code32 entry
-# stub. ELF class is a function of (arch, platform).
+# qemu boots via Multiboot1 on -machine pc, which requires a 32-bit
+# ELF. firecracker boots via PVH, which requires a 64-bit ELF wrapping
+# the same `[bits 32]` entry stub. ELF class is a function of (arch,
+# platform).
 ifeq ($(PLATFORM),firecracker)
-ASFLAGS :=
+ASFLAGS := -f elf64
 LDFLAGS :=
 else
-ASFLAGS := --32
+ASFLAGS := -f elf32
 LDFLAGS := -m elf_i386
 endif
 

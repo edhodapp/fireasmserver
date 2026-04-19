@@ -77,8 +77,10 @@ jobs:
       - name: Install cross-toolchain
         run: |
           sudo apt-get update
+          # x86_64 uses NASM per D048 (for the assembler) plus binutils
+          # (for ld). aarch64 stays on binutils' GAS + ld per D006.
           case "${{ matrix.arch }}" in
-            x86_64)  sudo apt-get install -y binutils-x86-64-linux-gnu ;;
+            x86_64)  sudo apt-get install -y nasm binutils-x86-64-linux-gnu ;;
             aarch64) sudo apt-get install -y binutils-aarch64-linux-gnu ;;
           esac
 

@@ -1392,6 +1392,13 @@ background-control-queue operations) stay deferred.
 
 ### D047: GAS intel-syntax `OFFSET` convention for MOV sources (x86_64)
 
+**~~DEPRECATED 2026-04-19T14:00Z — see D048.~~** The convention held
+for a few hours and one commit (`f44e294`) before Ed and I concluded
+that living with GAS's intel-syntax ambiguities is worse than a
+one-time toolchain switch. D048 moves x86_64 to NASM, which has clean
+intel-syntax semantics and needs no OFFSET convention. The asm-syntax
+lint from this decision is removed under D048.
+
 **Rule:**
 
 > In `arch/x86_64/**/*.S`, any `mov <reg>, <bare-identifier>` source
@@ -1457,6 +1464,86 @@ CI or interactive use.
   pins the convention needed to use GAS's intel-syntax safely.
 - `D003` — 100% assembly; no C compiler is available to paper over
   GAS's operand-interpretation quirks.
+
+### D048: Switch x86_64 to NASM (supersedes D006 for x86_64; AArch64 stays on GNU as)
+
+**Decision (2026-04-19):** x86_64 assembly sources move from
+`x86_64-linux-gnu-as` (GAS `.intel_syntax noprefix`) to NASM. AArch64
+continues to use `aarch64-linux-gnu-as` — no change there.
+
+**Supersedes D006 for x86_64 only.** D006 ("GNU as, both arches") was
+load-bearing for toolchain unity; we keep the principle on AArch64
+(where the `mov` grammar is unambiguous and GAS is idiomatic) but
+sacrifice unity on x86_64 in exchange for assembler semantics that
+match the Intel SDM the code is written against.
+
+**What broke the camel's back:**
+
+- D047's OFFSET convention arose after a multi-hour debug session in
+  which `mov ecx, ready_len` silently assembled to `mov ecx, [6]`
+  (load from physical address 6). We wrote a lint to catch future
+  recurrences of that specific shape.
+- Gemini's independent review of the follow-up commit (`f44e294`)
+  then flagged `cmp eax, VIRTIO_MAGIC` with the same rationale. The
+  flag was empirically wrong — the CMP encoding picked the immediate
+  form — but "empirically wrong in this codebase, right in principle"
+  is not the kind of rule that scales. Every future x86_64 contributor
+  (human or AI) would have to re-derive the MOV-vs-CMP asymmetry from
+  disassembly, and the lint would have to grow in step.
+- The cleaner invariant is: **don't use an assembler whose operand
+  interpretation is ambiguous.** NASM is that assembler.
+
+**What NASM gives us:**
+
+- **Unambiguous bare-symbol semantics.** `mov ecx, ready_len` is
+  always immediate; `mov ecx, [ready_len]` is always memory; the
+  assembler never guesses.
+- **Native intel syntax.** No `.intel_syntax noprefix` directive, no
+  partial-MASM emulation layer. What the Intel SDM reads, NASM
+  assembles.
+- **ELF section types explicit.** `section .note.Xen note alloc
+  align=4` produces SHT_NOTE directly, matching the PVH requirement
+  without relying on name-based heuristics.
+- **Documented macros.** `%define`, `%macro` are first-class; GAS's
+  `.macro` is fine but NASM's is more commonly cited in x86 reference
+  material.
+
+**What NASM costs:**
+
+- **Second assembler in CI.** Install `nasm` for x86_64 cells;
+  `binutils-*-linux-gnu` still needed for `ld` and the AArch64
+  assembler. One extra apt package per cell.
+- **Syntax deltas to absorb.** `.equ X, v` → `X equ v`, `.section`
+  → `section`, `.code32` → `[bits 32]`, `.ascii` / `.asciz` → `db`
+  forms, `.byte`/`.word`/`.long`/`.quad` → `db`/`dw`/`dd`/`dq`,
+  `.globl` → `global`, and — the main thing — no `OFFSET` keyword
+  (bare symbol = immediate always; brackets = memory always).
+- **Re-learning for anyone reaching for GAS reflexively.** Tolerable
+  because the reason (semantic unambiguity) stays front-of-mind.
+
+**Files converted in this switch** (see commits C1 and C2 in this
+series):
+
+- `arch/x86_64/platform/firecracker/boot.S`
+- `arch/x86_64/platform/qemu/boot.S`
+- `arch/x86_64/crypto/crc32_ieee.S`
+
+**Hook/lint cleanup under this decision:**
+
+- `tooling/hooks/asm_syntax_lint.sh` — removed; not applicable to NASM.
+- `tooling/hooks/pre_commit.sh` — simplified to just exec the shared
+  cross-project hook (Python gates + Gemini review). Kept as a wrapper
+  in case a future project-local pre-commit check lands.
+- `tooling/hooks/install.sh` — still installs both `pre-commit` and
+  `pre-push` symlinks; target-existence check retained.
+
+**Cross-refs:**
+
+- `D006` — load-bearing for AArch64; superseded for x86_64 only.
+- `D047` — deprecated by this decision; the OFFSET convention and the
+  lint that enforced it are obsolete under NASM.
+- `D003` (100% assembly) — unaffected; we're changing assemblers, not
+  languages.
 
 ## Future decisions (not yet made)
 - virtio-net driver design
