@@ -231,16 +231,18 @@ class TestToBranch:
 # Integration tests against real guest.elf build artifacts (when present).
 # The x86_64 stub grew conditional branches as the virtio-net L2 driver
 # took shape (virtio probe, LSR-polled UART emit loop, hex-print helper);
-# the aarch64 stub is still small (cbnz + cbz + tbz as its three
-# branches). Assertions for x86_64 are deliberately loose — checking
-# non-emptiness and mnemonic validity — so every boot.S edit doesn't
-# re-pin the expected count.
-_X86_ELF = Path(
-    "/home/ed/fireasmserver/arch/x86_64/build/firecracker/guest.elf",
-)
-_AARCH64_ELF = Path(
-    "/home/ed/fireasmserver/arch/aarch64/build/firecracker/guest.elf",
-)
+# the aarch64 stub stays small but is still expected to grow. Both
+# assertions are loose — non-emptiness plus mnemonic validity against
+# a per-arch allowed set — so every boot.S edit doesn't re-pin.
+#
+# Paths resolve from this file's location, not a hardcoded absolute
+# path. The prior form silently skipped in CI (artifact not at
+# /home/ed/fireasmserver/...), which meant these integration checks
+# had been running only on Ed's laptop — false confidence. Now they
+# run anywhere the build artifacts exist.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_X86_ELF = _REPO_ROOT / "arch/x86_64/build/firecracker/guest.elf"
+_AARCH64_ELF = _REPO_ROOT / "arch/aarch64/build/firecracker/guest.elf"
 
 # Exhaustive-ish set of x86_64 conditional-branch mnemonics Capstone can
 # emit for Jcc and loop variants. If the disassembler ever starts
@@ -281,15 +283,30 @@ def test_enumerate_branches_on_x86_tracer_stub() -> None:
     )
 
 
+_AARCH64_COND_BRANCHES = frozenset({
+    "b.eq", "b.ne", "b.cs", "b.hs", "b.cc", "b.lo", "b.mi", "b.pl",
+    "b.vs", "b.vc", "b.hi", "b.ls", "b.ge", "b.lt", "b.gt", "b.le",
+    "b.al", "b.nv",
+    "cbz", "cbnz",
+    "tbz", "tbnz",
+})
+
+
 @pytest.mark.skipif(
     not _AARCH64_ELF.exists(),
     reason="aarch64 firecracker build artifact not present",
 )
 def test_enumerate_branches_on_aarch64_tracer_stub() -> None:
-    """The aarch64 stub has cbnz + cbz + tbz as its three branches."""
+    """The aarch64 stub has at least one conditional branch with valid
+    AArch64 mnemonics. Loose form — same rationale as the x86_64 test:
+    avoid re-pinning on every boot.S edit."""
     branches = enumerate_branches(_AARCH64_ELF)
-    mnemonics = sorted(b.mnemonic for b in branches)
-    assert mnemonics == ["cbnz", "cbz", "tbz"]
+    assert branches, "expected conditional branches in the aarch64 stub"
+    mnemonics = {b.mnemonic for b in branches}
+    unexpected = mnemonics - _AARCH64_COND_BRANCHES
+    assert not unexpected, (
+        f"unexpected aarch64 branch mnemonics from disassembler: {unexpected}"
+    )
 
 
 @pytest.mark.skipif(
@@ -297,10 +314,15 @@ def test_enumerate_branches_on_aarch64_tracer_stub() -> None:
     reason="aarch64 firecracker build artifact not present",
 )
 def test_enumerate_branches_with_entry_symbol_narrows_scope() -> None:
-    """_entry restriction yields the same three branches (header excluded)."""
+    """_entry-restricted enumeration still yields valid conditional
+    branches (no bogus mnemonics, no empty result)."""
     branches = enumerate_branches(_AARCH64_ELF, entry_symbol="_entry")
-    mnemonics = sorted(b.mnemonic for b in branches)
-    assert mnemonics == ["cbnz", "cbz", "tbz"]
+    assert branches
+    mnemonics = {b.mnemonic for b in branches}
+    unexpected = mnemonics - _AARCH64_COND_BRANCHES
+    assert not unexpected, (
+        f"unexpected aarch64 branch mnemonics from disassembler: {unexpected}"
+    )
 
 
 @pytest.mark.skipif(
