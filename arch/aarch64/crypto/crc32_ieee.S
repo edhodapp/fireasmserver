@@ -42,6 +42,9 @@ crc32_ieee_802_3:
     mov     w2, #0xFFFFFFFF         // init state
 
     // 8-byte main loop: the widest update in one instruction.
+    // The loop condition is "at least 8 bytes remaining," not
+    // "exactly zero," so folding to `subs` doesn't eliminate the
+    // subsequent `cmp`. Kept as plain `sub` + `cmp`.
     cmp     x1, #8
     b.lo    .Ltail_4
 .Lloop_8:
