@@ -22,8 +22,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 CRYPTO_TESTS_DIR = REPO_ROOT / "tooling" / "crypto_tests"
 
 # Tools required per arch. If any are missing we skip rather than fail.
+# x86_64 uses nasm per D048; aarch64 stays on binutils' GAS per D006.
+# The gcc and qemu-aarch64-static entries are defaults that can be
+# overridden at the Makefile level (CC_X86, CC_AARCH, QEMU_AARCH64)
+# for runners where native tools already suffice — the skip check is
+# conservative and may skip on environments that actually work via
+# overrides; CI exercises the override path explicitly.
 REQUIRED_TOOLS = {
-    "x86_64": ("x86_64-linux-gnu-as", "x86_64-linux-gnu-gcc"),
+    "x86_64": ("nasm", "x86_64-linux-gnu-gcc"),
     "aarch64": (
         "aarch64-linux-gnu-as",
         "aarch64-linux-gnu-gcc",

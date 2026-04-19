@@ -22,14 +22,18 @@ BUILD_DIR := build
 X86_BIN   := $(BUILD_DIR)/x86_64/crc32_test
 AARCH_BIN := $(BUILD_DIR)/aarch64/crc32_test
 
-CC_X86    := x86_64-linux-gnu-gcc
-CC_AARCH  := aarch64-linux-gnu-gcc
+# Compilers and qemu wrapper are `?=` so CI can override per runner:
+# a native x86_64 runner uses CC_X86=gcc; a native arm64 runner uses
+# CC_AARCH=gcc and QEMU_AARCH64='' (empty — run the binary directly).
+# The defaults below are the cross-compile / emulated-execution path
+# used from Ed's x86_64 laptop.
+CC_X86        ?= x86_64-linux-gnu-gcc
+CC_AARCH      ?= aarch64-linux-gnu-gcc
+QEMU_AARCH64  ?= qemu-aarch64-static
 # -static simplifies running the aarch64 binary under qemu-aarch64
 # without juggling a sysroot for the dynamic loader.
-CFLAGS    := -O2 -Wall -Wextra -Wpedantic -std=c11
+CFLAGS        := -O2 -Wall -Wextra -Wpedantic -std=c11
 LDFLAGS_AARCH := -static
-
-QEMU_AARCH64 := qemu-aarch64-static
 
 SRCS := crc32_test.c
 HDRS := vectors.h

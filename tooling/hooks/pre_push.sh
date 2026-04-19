@@ -66,6 +66,16 @@ run_pi_cell() {
     ./tooling/tracer_bullet/pi_aarch64_firecracker.sh
 }
 
+run_crc_tests() {
+    echo
+    echo "=== pre-push: CRC-32 IEEE vectors (both arches) ==="
+    # Exercises the per-arch crc32_ieee.o against IEEE 802.3 / zlib
+    # test vectors via the host C driver. Fast (~0.3s total); catches
+    # regressions in the crypto primitive independent of the boot
+    # stubs that the tracer-bullet cells cover.
+    make -C tooling/crypto_tests -s test
+}
+
 echo "=== fireasmserver pre-push integration tests ==="
 
 run_local_cell x86_64  firecracker   || fail=1
@@ -75,6 +85,7 @@ run_local_cell x86_64  firecracker   || fail=1
 # tests that exercise every branch.
 run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
+run_crc_tests                        || fail=1
 
 echo
 if [[ $fail -ne 0 ]]; then

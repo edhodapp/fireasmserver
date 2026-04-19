@@ -77,12 +77,20 @@ jobs:
       - name: Install cross-toolchain
         run: |
           sudo apt-get update
-          # x86_64 uses NASM per D048 (for the assembler) plus binutils
-          # (for ld). aarch64 stays on binutils' GAS + ld per D006.
+          # Assembler + linker per arch. x86_64 uses NASM per D048;
+          # aarch64 stays on binutils' GAS + ld per D006.
           case "${{ matrix.arch }}" in
             x86_64)  sudo apt-get install -y nasm binutils-x86-64-linux-gnu ;;
             aarch64) sudo apt-get install -y binutils-aarch64-linux-gnu ;;
           esac
+          # CRC-32 host C driver needs per-arch gcc + (when the test
+          # arch differs from the runner arch) qemu-user-static.
+          # aarch64/qemu runs on ubuntu-latest (x86_64 host), so its
+          # crypto test needs the cross-gcc and qemu-user.
+          if [ "${{ matrix.arch }}" = "aarch64" ] && \
+             [ "${{ matrix.runner }}" = "ubuntu-latest" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
+          fi
 
       - name: Build guest
         run: make -C arch/${{ matrix.arch }} PLATFORM=${{ matrix.platform }}
@@ -182,6 +190,23 @@ jobs:
         env:
           TRACE: ${{ matrix.trace }}
         run: ./tooling/tracer_bullet/run_local.sh ${{ matrix.arch }} ${{ matrix.platform }}
+
+      # CRC-32 IEEE 802.3 vector tests. Runs the per-arch test driver
+      # against IEEE 802.3 / zlib vectors; zero exit = all vectors
+      # match the reference implementation. The matrix cell's arch
+      # picks which Makefile target runs; the build tools are routed
+      # per-runner so a native x86_64 runner uses its native gcc and
+      # a native arm64 runner skips qemu-user entirely.
+      - name: CRC-32 IEEE vector test
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            make -C tooling/crypto_tests test-x86 CC_X86=gcc
+          elif [ "${{ matrix.runner }}" = "ubuntu-24.04-arm" ]; then
+            make -C tooling/crypto_tests test-aarch64 \
+                 CC_AARCH=gcc QEMU_AARCH64=
+          else
+            make -C tooling/crypto_tests test-aarch64
+          fi
 
       # OSACA static pipeline analysis (D007). Advisory — the wrapper
       # always exits 0 whether OSACA succeeds, emits port-pressure
