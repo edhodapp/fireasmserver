@@ -1,5 +1,8 @@
 # fireasmserver
 
+[![CD matrix](https://github.com/edhodapp/fireasmserver/actions/workflows/cd-matrix.yml/badge.svg)](https://github.com/edhodapp/fireasmserver/actions/workflows/cd-matrix.yml)
+[![Python Quality Gates](https://github.com/edhodapp/fireasmserver/actions/workflows/python-gates.yml/badge.svg)](https://github.com/edhodapp/fireasmserver/actions/workflows/python-gates.yml)
+
 A bare-metal x86_64/AArch64 HTTP server written in 100% assembly language, booting directly as a [Firecracker](https://firecracker-microvm.github.io/) microVM guest. No Linux kernel, no userspace, no runtime — the kernel image *is* the HTTP server.
 
 `fireasmserver` is the first product in the **fireasm** family of bare-metal Firecracker-hosted services. Downstream of [ws_pi5](https://github.com/edhodapp/ws_pi5)'s protocol stack, retargeted from AArch64 + GENET to x86_64 + virtio-net.
