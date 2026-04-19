@@ -144,6 +144,22 @@ jobs:
             echo "::warning::KVM NOT available on ${{ matrix.runner }} — firecracker boot would fail here"
           fi
 
+      # tap0 backs the virtio-net device boot.S probes on x86_64/firecracker.
+      # /dev/net/tun is built into the GHA ubuntu-latest kernel; modprobe is
+      # a no-op there but keeps the step meaningful on self-hosted images
+      # that ship tun as a loadable module. run_local.sh does the actual
+      # `ip tuntap add` + teardown inside its trap — this step only ensures
+      # the kernel capability is present before we try.
+      - name: Ensure tun module available (x86_64/firecracker only)
+        if: matrix.arch == 'x86_64' && matrix.platform == 'firecracker'
+        run: |
+          sudo modprobe tun || true
+          if [ ! -c /dev/net/tun ]; then
+            echo "::error::/dev/net/tun missing — virtio-net probe will fail"
+            exit 1
+          fi
+          ls -la /dev/net/tun
+
       - name: Install tooling (for branch-cov when TRACE=1)
         if: matrix.trace == '1'
         uses: actions/setup-python@v5

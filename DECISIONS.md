@@ -1390,6 +1390,74 @@ reshape hot-path or interface structure?" — not "might we want this
 eventually?" Features that don't meet the bar (LACP, PFC,
 background-control-queue operations) stay deferred.
 
+### D047: GAS intel-syntax `OFFSET` convention for MOV sources (x86_64)
+
+**Rule:**
+
+> In `arch/x86_64/**/*.S`, any `mov <reg>, <bare-identifier>` source
+> must be written as `mov <reg>, OFFSET <identifier>` for immediate
+> loads or `mov <reg>, [<identifier>]` for explicit memory loads.
+> Bare-symbol MOV sources are rejected at commit time.
+
+**Why:** GAS under `.intel_syntax noprefix` is a partial MASM emulator,
+not a spec-compliant one. A bare symbol as a MOV source defaults to a
+memory reference, so `mov ecx, ready_len` — where `ready_len` is a
+`.equ`-defined constant — silently assembles to `mov ecx, [<value>]`,
+a load from the value-treated-as-address. The behavior also varies by
+the symbol's defining expression: pure literal `.equ` symbols
+sometimes pick the immediate encoding, `. - label` expression symbols
+pick memory. That fragility is the problem — our rule makes the
+intent explicit so GAS cannot guess.
+
+**Discovery:** first-byte emission of the x86_64 virtio-MMIO probe
+failed because `mov ecx, ready_len` assembled as `mov ecx, [6]` (load
+from physical address 6). The emit loop ran with a garbage `ecx`,
+`READY\n` never reached COM1, and control later fell through to
+invalid instructions. Separately, an uninitialized ESP caused the
+first `CALL` to push the return address into MMIO space at
+`0xfffffffc`, so even the corrected MOV could not have produced a
+stable probe — both issues fixed together in the D047-guarded commit.
+
+**Scope — x86_64 only:**
+
+- AArch64 uses a different mnemonic grammar (`mov` takes an
+  immediate-encoded `#imm` or a register; no bracketed memory form),
+  so the ambiguity does not arise. The lint filters to `arch/x86_64/`.
+- Other x86_64 mnemonics (`cmp`, `add`, `sub`, `test`, ...) were not
+  observed to hit this ambiguity for bare .equ sources — they pick the
+  immediate encoding in every case we have disassembled. The rule
+  stays narrowly focused on MOV. Expand only if a future disassembly
+  shows the same symptom on another mnemonic.
+
+**Alternatives considered:**
+
+- **Switch x86_64 to NASM.** Clean intel-syntax semantics, no MOV
+  ambiguity. Rejected because D006 (GNU as for both arches) is
+  load-bearing for toolchain unity: one assembler, one directive set,
+  one set of linker scripts, one apt package in CI. The MOV-source
+  issue is a one-time tax payable with a four-line regex; a second
+  assembler is an ongoing one.
+- **Switch x86_64 to GAS AT&T syntax.** Native GAS, no ambiguity
+  (immediates marked `$`). Rejected on readability — x86_64 assembly
+  in fireasmserver is written by humans who reach for Intel's
+  manuals as primary reference; AT&T's operand order and sigils add
+  cognitive load without correctness benefit beyond what this rule
+  already provides.
+
+**Enforcement:** `tooling/hooks/asm_syntax_lint.sh` runs under
+`.git/hooks/pre-commit` (via `tooling/hooks/pre_commit.sh`) and
+matches the offending pattern on staged `arch/x86_64/**/*.S`. Failing
+the lint blocks the commit with a remediation message pointing at
+this decision. The check is also runnable ad-hoc on any file set for
+CI or interactive use.
+
+**Cross-refs:**
+
+- `D006` — GAS chosen as the assembler for both arches; this rule
+  pins the convention needed to use GAS's intel-syntax safely.
+- `D003` — 100% assembly; no C compiler is available to paper over
+  GAS's operand-interpretation quirks.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation

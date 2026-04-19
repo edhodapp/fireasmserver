@@ -35,6 +35,10 @@ REPO_ROOT="$(realpath -m "$(cd "$(dirname "$0")/../.." && pwd)")"
 cd "$REPO_ROOT"
 
 TMPDIR="$(mktemp -d)"
+# TAP_CREATED flips to 1 only when launch_firecracker_x86_64 successfully
+# creates tap0 for the virtio-net probe. Scoped here so the trap can
+# tear it down on any exit path before tap-creation has even run.
+TAP_CREATED=0
 # Named cleanup so the output makes the "we did leave nothing behind"
 # contract visible to anyone reading the log. trap covers abnormal
 # exits (Ctrl-C, SIGTERM, errexit); the main flow also calls it
@@ -43,6 +47,10 @@ cleanup() {
     if [[ -d "$TMPDIR" ]]; then
         rm -rf "$TMPDIR"
         echo "--- cleanup: removed $TMPDIR ---"
+    fi
+    if [[ "$TAP_CREATED" == "1" ]]; then
+        sudo ip link del tap0 2>/dev/null || true
+        echo "--- cleanup: removed tap0 ---"
     fi
 }
 trap cleanup EXIT INT TERM
@@ -87,11 +95,31 @@ launch_qemu_x86_64() {
 launch_firecracker_x86_64() {
     local guest="$REPO_ROOT/arch/x86_64/build/firecracker/guest.elf"
     [[ -f "$guest" ]] || { echo "missing $guest — run make first" >&2; exit 1; }
+    # virtio-net backing device. Two provisioning modes:
+    #   (a) Pre-persistent tap0 (local dev ergonomic path): created once
+    #       by a human via `sudo ip tuntap add dev tap0 mode tap user $USER
+    #       && sudo ip link set tap0 up`. The script detects /sys/class/net/tap0
+    #       and reuses it without touching sudo. TAP_CREATED stays 0 so
+    #       the cleanup trap also leaves it alone.
+    #   (b) Ephemeral tap0 (CI path / first-time local run): we create
+    #       fresh here and tear down in cleanup(). Requires passwordless
+    #       sudo — the contract on GHA runners.
+    if [[ -d /sys/class/net/tap0 ]]; then
+        echo "tap0 exists — reusing (pre-persistent mode)"
+    else
+        echo "tap0 missing — creating ephemeral (needs sudo)"
+        sudo ip tuntap add dev tap0 mode tap user "$USER"
+        sudo ip link set tap0 up
+        TAP_CREATED=1
+    fi
     cat > "$TMPDIR/fc.json" <<EOF
 {
   "boot-source": { "kernel_image_path": "$guest" },
   "machine-config": { "vcpu_count": 1, "mem_size_mib": 128 },
-  "drives": []
+  "drives": [],
+  "network-interfaces": [
+    { "iface_id": "eth0", "host_dev_name": "tap0" }
+  ]
 }
 EOF
     (cd "$TMPDIR" && \
@@ -129,13 +157,32 @@ case "$ARCH/$PLATFORM" in
         ;;
 esac
 
-if ! grep -q 'READY' "$SERIAL"; then
+# Anchor markers to line start so a Firecracker log line containing the
+# substring "READY" (or "VIRTIO:OK") can't masquerade as guest output.
+# Our stubs emit each marker on its own line, so line-anchored grep is
+# both sufficient and tighter than a loose substring match.
+if ! grep -qE '^READY$' "$SERIAL"; then
     echo "FAIL: READY not observed in ${TIMEOUT}s"
     echo "=== serial.log ==="
     sed 's/^/    /' "$SERIAL"
     exit 1
 fi
 echo "READY observed — PASS"
+
+# x86_64/firecracker additionally probes the virtio-MMIO MagicValue
+# register at the first device slot (VIO-Q-001 per docs/l2/REQUIREMENTS.md,
+# Virtio 1.2 §4.2.2). boot.S emits VIRTIO:OK on match, VIRTIO:FAIL on
+# mismatch. Other cells don't have virtio-net wired yet — aarch64's
+# tracer-bullet boot.S still stops at READY.
+if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
+    if ! grep -qE '^VIRTIO:OK$' "$SERIAL"; then
+        echo "FAIL: VIRTIO:OK not observed (virtio-mmio magic mismatch?)"
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "VIRTIO:OK observed — virtio-mmio magic verified"
+fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —
 # current tracer stubs don't exercise every conditional path (e.g.,
