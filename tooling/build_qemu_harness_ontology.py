@@ -17,15 +17,13 @@ from ontology import (
     FunctionSpec,
     ModuleSpec,
     Ontology,
-    OntologyDAG,
     Property,
     PropertyType,
     Relationship,
 )
 from ontology.dag import (
+    dag_transaction,
     git_snapshot_label,
-    load_dag,
-    save_dag,
     snapshot_if_changed,
 )
 
@@ -836,15 +834,15 @@ ontology = Ontology(
     external_dependencies=ext_deps,
 )
 
-# D049: load-then-snapshot-if-changed, so running the builder on
-# unchanged content is a true no-op and consecutive runs don't
-# bloat the DAG with duplicate nodes. Snapshot label embeds the
-# current git SHA so each DAG generation traces back to a source
-# commit with `git show`.
-dag = load_dag(DAG_PATH, project_name=PROJECT_NAME)
+# D049: dag_transaction wraps the load-modify-save cycle under
+# an fcntl.flock, so a concurrently-running builder (a side
+# session, a parallel CI job) can't overwrite this one's update.
+# Inside the transaction, snapshot_if_changed makes re-runs on
+# unchanged content a true no-op. Label embeds the git HEAD SHA
+# for source-level cross-reference with the DAG generation.
 label = git_snapshot_label()
-_node_id, created = snapshot_if_changed(dag, ontology, label)
-save_dag(dag, DAG_PATH)
+with dag_transaction(DAG_PATH, project_name=PROJECT_NAME) as dag:
+    _node_id, created = snapshot_if_changed(dag, ontology, label)
 
 print(f"Saved ontology DAG to {DAG_PATH}")
 print(f"  Entities: {len(ontology.entities)}")

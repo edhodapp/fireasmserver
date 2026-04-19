@@ -6,6 +6,7 @@ land in this project without coordination through the python_agent
 session. Lessons flow back to python_agent after first release.
 """
 
+from ontology.dag import dag_transaction
 from ontology.models import (
     ClassSpec,
     DAGEdge,
@@ -45,5 +46,6 @@ __all__ = [
     "Property",
     "PropertyType",
     "Relationship",
+    "dag_transaction",
     "validate_ontology_strict",
 ]

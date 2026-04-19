@@ -1630,6 +1630,31 @@ Two related sub-decisions:
    (git), graph-shape changes (DAG), and alternative-design
    multiplicity (DAG branching).
 
+   **Concurrent-process safety.** Parallel work across Claude
+   sessions is already part of the workflow (a main session plus
+   side sessions taking briefed modules — see
+   `project_parallelization_strategy.md`), and any of them may
+   trigger a builder run. The DAG file is a shared artifact; a
+   naive load-modify-save across two concurrent builders would
+   race and lose updates. O2b addresses this with a
+   `dag_transaction` context manager in
+   `tooling/src/ontology/dag.py` that acquires an exclusive
+   `fcntl.flock` on a sidecar lock file (`<dag_path>.lock`)
+   before loading, holds the lock across the modification, and
+   releases it on exit after saving. Contenders serialize
+   automatically — the second process's `flock` call blocks
+   until the first's with-block exits, so loads always see the
+   fully-saved state of the prior writer. No lost updates, no
+   torn reads. On an exception inside the yielded block the DAG
+   is NOT saved but the lock IS released; callers wanting to
+   persist partial state must save explicitly before the
+   exception propagates. The concurrent-safety invariants are
+   tested under real OS processes in
+   `tooling/tests/test_ontology_dag_concurrent.py` (two
+   workers + three workers + five workers in parallel, all must
+   land; exception path must roll back; crashed-worker lock
+   release must not wedge the next worker).
+
 **Why:**
 
 - **External SysE expert review** is planned post-first-release
