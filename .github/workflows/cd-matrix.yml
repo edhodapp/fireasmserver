@@ -165,6 +165,23 @@ jobs:
           TRACE: ${{ matrix.trace }}
         run: ./tooling/tracer_bullet/run_local.sh ${{ matrix.arch }} ${{ matrix.platform }}
 
+      # OSACA static pipeline analysis (D007). Advisory — the wrapper
+      # always exits 0 whether OSACA succeeds, emits port-pressure
+      # numbers with "X" for instructions missing from the uarch DB,
+      # or crashes on an unmodelled opcode (current x86 I/O stubs).
+      # Per D005, perf gates advise; functional gates block.
+      - name: OSACA (advisory)
+        if: always() && hashFiles('tooling/osaca/run.sh') != ''
+        run: |
+          # OSACA + its deps land in the same venv-equivalent that
+          # run_local.sh expects. On GH-hosted runners where no venv
+          # exists, pip-install directly into the runner's python.
+          if [[ ! -x .venv/bin/osaca ]]; then
+              python3 -m venv .venv
+              .venv/bin/pip install -e "."
+          fi
+          ./tooling/osaca/run.sh ${{ matrix.arch }} ${{ matrix.platform }}
+
       # Explicit cleanup: remove build trees and any temp state that
       # might outlive the step. if:always() so this still fires when a
       # previous step failed. GitHub-hosted runners are ephemeral, but
