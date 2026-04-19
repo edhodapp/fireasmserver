@@ -76,6 +76,31 @@ update at completion.
 
 ---
 
+## Two firm rules from Ed — violate neither
+
+These are not suggestions. They are the two rules that caused the
+prior side session's output to fall short of bar and that Ed has
+explicitly called out as non-negotiable for this session:
+
+1. **Use Gemini for independent code review on every functional
+   commit.** The pre-commit hook does this automatically
+   (`~/tools/code-review/gemini-review.sh` runs on staged `.py` and
+   `.S` files via `~/tools/code-review/pre-commit-hook.sh`). Do
+   not bypass, suppress, or rush past Gemini output. Read it, act
+   on it, and decide what to change before committing. If Gemini
+   raises concerns you don't act on, surface them to Ed per rule 2
+   — do not silently commit past them.
+2. **No deferments without asking Ed first.** This is explicit. If
+   Gemini (or a subagent, or your own analysis) flags a concern you
+   would reflexively call "low priority / defer," STOP. Do not
+   dispose it yourself. Write your recommendation + the tradeoff in
+   a message to Ed and wait for his decision. Apply this even to
+   concerns Gemini labels LOW — the judgment of what to defer is
+   Ed's, not yours. See `~/.claude/projects/-home-ed-fireasmserver/
+   memory/feedback_no_silent_deferments.md`.
+
+Everything below flows from these two rules.
+
 ## Quality expectations — read this before starting
 
 Ed was not completely happy with the quality of the prior CRC side
