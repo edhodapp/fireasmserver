@@ -887,7 +887,7 @@ sanity check on the Pi post-install.
 - virtio-net driver design
 - TCP state machine implementation
 - HTTP parser design
-- Assembly branch coverage tooling
+- ~~Assembly branch coverage tooling~~ **DEPRECATED 2026-04-19T07:15Z** — implemented as `tooling/src/branch_cov/` (MVP in commit `e3aa166`, 2026-04-18) with capstone + pyelftools disassembly, QEMU-trace ingestion, per-cell baselines, and a ratchet-mode `--baseline` flag wired into `cd-matrix.yml` via `run_local.sh`.
 - PICT combinatorial testing integration
 - OSACA CI integration
-- Pi 5 self-hosted runner setup
+- ~~Pi 5 self-hosted runner setup~~ **DEPRECATED 2026-04-17T00:00Z** — superseded by D022 (Pi 5 is a local-only AArch64 test host; CI lives in GitHub Actions, not on the Pi).
