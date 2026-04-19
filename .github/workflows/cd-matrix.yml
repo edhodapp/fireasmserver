@@ -7,12 +7,18 @@ name: CD matrix (arch × platform)
 # follow-up work; today the per-cell guest-boot is exercised by the
 # local pytest harness + the Pi-side tracer-bullet orchestration.
 #
-# `aarch64/firecracker` is marked experimental: Firecracker requires
-# /dev/kvm, and /dev/kvm availability on the free ubuntu-24.04-arm
-# hosted runner is not yet confirmed. The cell builds regardless
-# (binutils cross-toolchain is independent of KVM); the probe step
-# surfaces whether a subsequent boot step would be viable. Drop the
-# experimental flag once the probe is consistently green.
+# Coverage scope: all cells are build-only today.
+#
+# x86_64 VM-launch coverage comes from the pytest harness in
+# python-gates.yml (which runs on the same ubuntu-latest image that
+# has /dev/kvm). AArch64/firecracker VM-launch coverage comes from
+# the local Pi-side tracer bullet
+# (tooling/tracer_bullet/pi_aarch64_firecracker.sh) — not from CI.
+#
+# Empirical finding (2026-04-18, eaf50d3): the free ubuntu-24.04-arm
+# hosted runner does NOT expose /dev/kvm. The probe step at the bottom
+# of each firecracker cell continues to surface this; promote the
+# cell to VM-launch when/if a future hosted image makes KVM available.
 
 on:
   push:
@@ -45,7 +51,7 @@ jobs:
           - arch: aarch64
             platform: firecracker
             runner: ubuntu-24.04-arm
-            experimental: true
+            experimental: false
     name: build/${{ matrix.arch }}/${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.experimental }}

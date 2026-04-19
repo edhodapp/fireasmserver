@@ -43,7 +43,7 @@ Every commit passes through a multi-gate pipeline before reaching `main`:
 
 **GitHub Actions (on push):**
 - `python-gates.yml` — flake8 + mypy --strict + pylint + pytest with branch coverage, on Python 3.11 and 3.12.
-- `cd-matrix.yml` — four-cell arch × platform build matrix: x86_64/qemu, x86_64/firecracker, aarch64/qemu all on `ubuntu-latest` (x86_64 hosted), plus aarch64/firecracker on `ubuntu-24.04-arm` (experimental until the free arm64 hosted runner's `/dev/kvm` availability is confirmed).
+- `cd-matrix.yml` — four-cell arch × platform build matrix: x86_64/qemu, x86_64/firecracker, aarch64/qemu all on `ubuntu-latest` (x86_64 hosted), plus aarch64/firecracker on `ubuntu-24.04-arm`. Build-only today. aarch64/firecracker cannot go beyond build-level in hosted CI because the free `ubuntu-24.04-arm` runner does not expose `/dev/kvm` (confirmed empirically 2026-04-18); VM-boot coverage for that cell lives in the local Pi tracer bullet instead.
 
 ## Development topology
 
