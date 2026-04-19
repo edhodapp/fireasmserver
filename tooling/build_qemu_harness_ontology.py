@@ -563,10 +563,17 @@ performance_constraints = [
         name="l2-frame-rate-target",
         description=(
             "Target sustained L2 throughput for the shipping "
-            "product. 10 Gbps translates to ~67 ns per "
-            "1518-byte frame on the hot path, which is the "
-            "budget every cross-cutting feature (CRC, barriers, "
-            "observability, VLAN handling) must fit inside."
+            "product. At 10 Gbps the wire-time budget is "
+            "~67 ns for a minimum-size (64-byte) frame and "
+            "~1230 ns for a maximum-size (1518-byte) frame "
+            "(both figures are on-wire, including the 20-byte "
+            "preamble+SFD+IPG overhead the MAC actually sees). "
+            "Every cross-cutting feature (CRC, barriers, "
+            "observability, VLAN handling) must fit inside "
+            "the relevant per-frame budget for the traffic mix "
+            "that cell exercises; the perf ratchet (D040) "
+            "pins both small-frame and large-frame baselines "
+            "once measured."
         ),
         entity_ids=["ethernet-frame"],
         metric="l2_throughput_bps",
