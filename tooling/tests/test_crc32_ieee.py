@@ -58,4 +58,4 @@ def test_crc32_ieee_802_3_vectors_pass(arch: str) -> None:
         f"{arch} CRC-32 driver failed (exit={result.returncode}):\n"
         f"{output}"
     )
-    assert "PASS  all CRC-32 IEEE vectors match" in output, output
+    assert "PASS  all CRC-32 IEEE checks passed" in output, output

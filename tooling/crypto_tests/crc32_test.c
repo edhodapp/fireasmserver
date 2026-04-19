@@ -2,16 +2,18 @@
  * Copyright (c) 2026 Ed Hodapp
  *
  * Host-side test driver for the per-arch crc32_ieee_802_3 assembly
- * routine. Runs a small vector set and exits non-zero on the first
- * mismatch. One binary per arch — the x86_64 binary links
- * arch/x86_64/crypto/build/crc32_ieee.o and runs natively; the
- * aarch64 binary cross-builds with aarch64-linux-gnu-gcc and runs
- * under qemu-aarch64-static.
+ * routines. Tests:
+ *   1. Every named vector on every available entry point.
+ *   2. A length-256 sweep comparing each path against a self-
+ *      contained bit-at-a-time reference (the same polynomial/init/
+ *      final-XOR parameters the assembly is specified against).
+ *   3. Cross-path equivalence where more than one entry point is
+ *      available (x86_64 dispatcher vs. slice8 vs. pclmulqdq).
  *
- * Contract probed:
- *   uint32_t crc32_ieee_802_3(const void *data, size_t len);
- * IEEE 802.3 §3.2.9, polynomial 0xEDB88320 reflected, init/final XOR
- * 0xFFFFFFFF, zero-length → 0x00000000.
+ * The independent bit-by-bit reference here eliminates the
+ * Python-zlib cross-check from the test path — the C driver stands
+ * alone as a correctness gate. Exits 0 on full pass, non-zero on any
+ * mismatch.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -20,13 +22,41 @@
 
 #include "vectors.h"
 
-/* Defined in the linked assembly object. */
+/* Primary public entry — may dispatch or may be the only path. */
 extern uint32_t crc32_ieee_802_3(const void *data, size_t len);
 
-static const unsigned char vec_a[]            = "a";
-static const unsigned char vec_abc[]          = "abc";
-static const unsigned char vec_msg_digest[]   = "message digest";
-static const unsigned char vec_alphabet[]     = "abcdefghijklmnopqrstuvwxyz";
+/* Per-arch additional entries. The x86_64 module exposes three: the
+ * dispatcher, the slice8 fallback, and the pclmulqdq fast path. The
+ * aarch64 module exposes only the single hardware-accelerated entry
+ * (crc32_ieee_802_3). We declare all three as weak so linking against
+ * aarch64's single-entry object file is still valid. */
+extern uint32_t crc32_ieee_802_3_slice8(const void *data, size_t len)
+    __attribute__((weak));
+extern uint32_t crc32_ieee_802_3_pclmulqdq(const void *data, size_t len)
+    __attribute__((weak));
+extern uint32_t crc32_ieee_802_3_has_pclmulqdq(void)
+    __attribute__((weak));
+
+/* Bit-at-a-time reference implementation. Polynomial-correct per
+ * IEEE 802.3 §3.2.9. No external dependencies; self-contained proof
+ * that the assembly matches the specification. */
+static uint32_t crc32_ref(const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; ++k) {
+            uint32_t mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static const unsigned char vec_a[]          = "a";
+static const unsigned char vec_abc[]        = "abc";
+static const unsigned char vec_msg_digest[] = "message digest";
+static const unsigned char vec_alphabet[]   = "abcdefghijklmnopqrstuvwxyz";
 
 static unsigned char vec_1024_zero[1024];
 static unsigned char vec_1024_ff[1024];
@@ -42,66 +72,129 @@ static const struct crc_vector VECTORS[] = {
 };
 #define N_VECTORS (sizeof VECTORS / sizeof VECTORS[0])
 
+typedef uint32_t (*crc_fn_t)(const void *, size_t);
+
+struct path_spec {
+    const char *name;
+    crc_fn_t fn;
+};
+
+static int check_named_vectors(const struct path_spec *p) {
+    int failures = 0;
+    for (size_t i = 0; i < N_VECTORS; ++i) {
+        const struct crc_vector *v = &VECTORS[i];
+        uint32_t got = p->fn(v->data, v->len);
+        if (got != v->expected) {
+            printf("FAIL  [%s] %-16s  len=%4zu  exp=0x%08X"
+                   "  got=0x%08X\n",
+                   p->name, v->name, v->len, v->expected, got);
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+static int sweep_vs_reference(const struct path_spec *p) {
+    /* 256 bytes of a mix-dependency pattern; every residue class mod
+     * 16 is exercised, plus a wide range of fold iterations (up to
+     * 16 folds at length 256). */
+    unsigned char buf[256];
+    for (size_t i = 0; i < sizeof buf; ++i) {
+        buf[i] = (unsigned char)((i * 37u + 13u) & 0xFFu);
+    }
+    int failures = 0;
+    for (size_t len = 0; len <= sizeof buf; ++len) {
+        uint32_t want = crc32_ref(buf, len);
+        uint32_t got = p->fn(buf, len);
+        if (got != want) {
+            printf("FAIL  [%s] sweep        len=%4zu  exp=0x%08X"
+                   "  got=0x%08X\n", p->name, len, want, got);
+            ++failures;
+        }
+    }
+    return failures;
+}
+
+static int check_crossarch_agreement(void) {
+    /* Only meaningful when more than one entry is linked in. */
+    int tested = 0;
+    int failures = 0;
+    unsigned char buf[256];
+    for (size_t i = 0; i < sizeof buf; ++i) {
+        buf[i] = (unsigned char)((i * 37u + 13u) & 0xFFu);
+    }
+    if (crc32_ieee_802_3_slice8 && crc32_ieee_802_3_pclmulqdq) {
+        for (size_t len = 0; len <= sizeof buf; ++len) {
+            uint32_t s = crc32_ieee_802_3_slice8(buf, len);
+            uint32_t p = crc32_ieee_802_3_pclmulqdq(buf, len);
+            if (s != p) {
+                printf("FAIL  slice8/pclmul disagree  len=%4zu"
+                       "  slice8=0x%08X  pclmul=0x%08X\n",
+                       len, s, p);
+                ++failures;
+            }
+        }
+        ++tested;
+    }
+    if (tested) {
+        printf("(cross-path equivalence: %d pair(s) over 257 lengths)"
+               "\n", tested);
+    }
+    return failures;
+}
+
 int main(void) {
     memset(vec_1024_zero, 0x00, sizeof vec_1024_zero);
     memset(vec_1024_ff,   0xFF, sizeof vec_1024_ff);
 
-    int failures = 0;
+    /* Self-check the reference against the compiled-in expected
+     * values — if this fails, something is wrong with the vectors
+     * themselves, not the assembly. */
     for (size_t i = 0; i < N_VECTORS; ++i) {
         const struct crc_vector *v = &VECTORS[i];
-        uint32_t got = crc32_ieee_802_3(v->data, v->len);
-        const char *tag = (got == v->expected) ? "ok  " : "FAIL";
-        printf("%s  %-16s  len=%4zu  exp=0x%08X  got=0x%08X\n",
-               tag, v->name, v->len, v->expected, got);
-        if (got != v->expected) {
-            ++failures;
+        uint32_t ref_got = crc32_ref(v->data, v->len);
+        if (ref_got != v->expected) {
+            printf("FATAL  reference impl mismatch on %s:"
+                   "  exp=0x%08X  got=0x%08X\n",
+                   v->name, v->expected, ref_got);
+            return 2;
         }
     }
 
-    static const unsigned char pangram[] =
-        "The quick brown fox jumps over the lazy dog";
-    const size_t plen = sizeof pangram - 1;  /* strip NUL */
-    const uint32_t expected_pangram = 0x414FA339u;
-    uint32_t got_pangram = crc32_ieee_802_3(pangram, plen);
-    const char *ptag =
-        (got_pangram == expected_pangram) ? "ok  " : "FAIL";
-    printf("%s  %-16s  len=%4zu  exp=0x%08X  got=0x%08X\n",
-           ptag, "pangram", plen, expected_pangram, got_pangram);
-    if (got_pangram != expected_pangram) {
-        ++failures;
+    struct path_spec paths[3];
+    int n_paths = 0;
+    paths[n_paths++] = (struct path_spec){
+        "crc32_ieee_802_3", crc32_ieee_802_3 };
+    if (crc32_ieee_802_3_slice8) {
+        paths[n_paths++] = (struct path_spec){
+            "slice8", crc32_ieee_802_3_slice8 };
+    }
+    if (crc32_ieee_802_3_pclmulqdq) {
+        paths[n_paths++] = (struct path_spec){
+            "pclmulqdq", crc32_ieee_802_3_pclmulqdq };
     }
 
-    /* Length sweep 0..31 exercises every residue class for both the
-     * main-loop start condition and the byte tail. Expected values
-     * were generated by Python zlib.crc32 against the same buffer. */
-    unsigned char buf[32];
-    for (size_t i = 0; i < sizeof buf; ++i) {
-        buf[i] = (unsigned char)(i * 37u + 13u);
+    int total_fail = 0;
+    for (int i = 0; i < n_paths; ++i) {
+        int f = check_named_vectors(&paths[i]);
+        f += sweep_vs_reference(&paths[i]);
+        printf("[%s] %s\n", paths[i].name,
+               f == 0 ? "ok  (7 named + 257 sweep = 264 lengths)"
+                      : "FAILURES");
+        total_fail += f;
     }
-    static const uint32_t pattern_expected[32] = {
-        0x00000000u, 0xACB39330u, 0x3CA03D32u, 0xEFE6DA67u,
-        0x5888C0BBu, 0x2F389E37u, 0x18971599u, 0x6C116888u,
-        0x2CBAE593u, 0xED9B53B5u, 0xE25A8B37u, 0xAAE77CA4u,
-        0xD2A808F1u, 0xFAD2FF1Bu, 0x1F2F3BE1u, 0x81AE5386u,
-        0xFE5ADF55u, 0xDC273D60u, 0x9CDA4BE4u, 0x3D4B25ECu,
-        0xE9518460u, 0x55E31DDBu, 0x3782B29Du, 0xED806BE2u,
-        0xD1598DEAu, 0x0FDECAC9u, 0x06B601A5u, 0x7F63D1CAu,
-        0x131C91F7u, 0x95A33C63u, 0xC74D61F8u, 0xB518E820u,
-    };
-    for (size_t len = 0; len <= 31; ++len) {
-        uint32_t g = crc32_ieee_802_3(buf, len);
-        if (g != pattern_expected[len]) {
-            printf("FAIL  pattern         len=%4zu  exp=0x%08X"
-                   "  got=0x%08X\n", len, pattern_expected[len], g);
-            ++failures;
-        }
-    }
-    printf("(pattern sweep: 32 lengths, 0..31 bytes)\n");
 
-    if (failures == 0) {
-        puts("PASS  all CRC-32 IEEE vectors match");
+    total_fail += check_crossarch_agreement();
+
+    if (crc32_ieee_802_3_has_pclmulqdq) {
+        printf("CPU has PCLMULQDQ: %u\n",
+               crc32_ieee_802_3_has_pclmulqdq());
+    }
+
+    if (total_fail == 0) {
+        puts("PASS  all CRC-32 IEEE checks passed");
         return 0;
     }
-    printf("FAIL  %d mismatch(es)\n", failures);
+    printf("FAIL  %d mismatch(es)\n", total_fail);
     return 1;
 }

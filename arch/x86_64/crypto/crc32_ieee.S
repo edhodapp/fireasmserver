@@ -15,35 +15,41 @@
 #   final XOR   = 0xFFFFFFFF
 #   zero-length = 0x00000000
 #
+# Paths:
+#   - crc32_ieee_802_3_pclmulqdq  — PCLMULQDQ fold-by-1 (fast path).
+#     Requires SSE2 + PCLMULQDQ. Fold-by-1 constants derived from
+#     x^128 mod P(x), x^192 mod P(x) in reflected form:
+#       K_hi33 = rev32(x^192 mod P) << 1 = 0x65673B46
+#       K_lo33 = rev32(x^128 mod P) << 1 = 0x140D44A2E
+#     The <<1 is the standard alignment adjustment from the pclmul
+#     bit-reversal identity. Final 128→32 reduction reuses the
+#     slicing-by-8 helper by treating the 128-bit state as 16 bytes
+#     of "message" with init CRC = 0.
+#   - crc32_ieee_802_3_slice8 — slicing-by-8 (fallback / small inputs).
+#     Kounavis & Berry, Intel 2005. 8 KiB table; 8-byte main loop
+#     plus byte-at-a-time tail.
+#   - crc32_ieee_802_3 — dispatcher. Runtime CPUID check on
+#     CPUID.01H:ECX[PCLMULQDQ=1]; tail-calls the appropriate path.
+#     D034's `HAS_PCLMULQDQ` profile flag is the intended build-time
+#     gate for future profiles that want to skip the CPUID check.
+#
 # References:
 #   IEEE 802.3-2018 §3.2.9 (FCS definition).
+#   Gopal et al., "Fast CRC Computation Using PCLMULQDQ Instruction,"
+#       Intel white paper, 2009.
 #   Kounavis & Berry, "A Systematic Approach to Building High
-#   Performance Software-Based CRC Generators," Intel 2005
-#   (slicing-by-N).
-#
-# Implementation status:
-#   This file ships slicing-by-8 only. D034's build-time profile
-#   flag HAS_PCLMULQDQ is the intended gate for a future PCLMULQDQ
-#   fold-by-N fast path (Intel "Fast CRC Computation Using PCLMULQDQ
-#   Instruction," Gopal et al. 2009), but the profile plumbing does
-#   not yet exist in the Makefile; landing unverified fold constants
-#   would be a silent correctness risk. Tracked as a follow-up.
-#   See docs/side_sessions/2026-04-19_crc32_ieee.md Status.
+#       Performance Software-Based CRC Generators," Intel 2005.
 
     .intel_syntax noprefix
 
 # ---------------------------------------------------------------
-# Slicing-by-8 tables
+# Constants
 # ---------------------------------------------------------------
-# Eight 256-entry tables of uint32_t; 8 KiB total, 64-byte aligned.
-# Derivation:
+# Eight 256-entry slicing-by-8 tables of uint32_t; 8 KiB total,
+# 64-byte aligned. Derivation:
 #   T[0][b] = byte-at-a-time reflected CRC of single byte b.
 #   T[k+1][b] = (T[k][b] >> 8) ^ T[0][T[k][b] & 0xFF].
-# Values were generated with a short Python program run against the
-# reflected polynomial 0xEDB88320 and cross-checked for the entire
-# table against zlib.crc32 via a per-byte walk. The table appears
-# verbatim in many public references (e.g. Linux kernel lib/crc32.c);
-# we treat the values as mathematical facts of the polynomial.
+# Cross-checked against zlib.crc32 for all 2048 entries.
 
     .section .rodata.crc32_table_slice8, "a", @progbits
     .balign 64
@@ -316,85 +322,234 @@ crc32_table_slice8:
     .long 0xff6b144a, 0x33c114d4, 0xbd4e1337, 0x71e413a9, 0x7b211ab0, 0xb78b1a2e, 0x39041dcd, 0xf5ae1d53
     .long 0x2c8e0fff, 0xe0240f61, 0x6eab0882, 0xa201081c, 0xa8c40105, 0x646e019b, 0xeae10678, 0x264b06e6
 
+# PCLMULQDQ fold-by-1 constants.
+# Layout (xmm at rip+crc32_pclmul_fold_constants):
+#   low  64 bits = K_hi33 = rev32(x^192 mod P) << 1  — multiplier for state_lo
+#   high 64 bits = K_lo33 = rev32(x^128 mod P) << 1  — multiplier for state_hi
+    .section .rodata.crc32_pclmul_consts, "a", @progbits
+    .balign 16
+    .type crc32_pclmul_fold_constants, @object
+    .size crc32_pclmul_fold_constants, 16
+crc32_pclmul_fold_constants:
+    .quad 0x0000000065673B46          # K_hi33 (x^192 mod P, reflected)
+    .quad 0x0000000140D44A2E          # K_lo33 (x^128 mod P, reflected)
+
 # ---------------------------------------------------------------
 # Implementation
 # ---------------------------------------------------------------
 
     .section .text
-    .globl crc32_ieee_802_3
-    .type  crc32_ieee_802_3, @function
-    .balign 16
 
-# uint32_t crc32_ieee_802_3(const void *data, size_t len);
-# rdi = data, rsi = len, returns eax.
-# Leaf routine; touches only caller-saved registers.
-crc32_ieee_802_3:
-    mov     eax, 0xFFFFFFFF           # crc = init
+    .globl crc32_ieee_802_3
+    .globl crc32_ieee_802_3_slice8
+    .globl crc32_ieee_802_3_pclmulqdq
+    .globl crc32_ieee_802_3_has_pclmulqdq
+
+# uint32_t _crc32_update_slice8(const void *data, size_t len,
+#                               uint32_t crc_acc /* in eax */)
+#   rdi = data, rsi = len, eax = crc_acc
+#   returns eax = updated crc_acc (no final XOR)
+# Leaf; clobbers rax, rcx, rdx, rdi, rsi, r8-r11. Internal-only —
+# callers must stage rdi/rsi themselves if they need them after the
+# call. The 16-byte main loop advances rdi by +len and ends with
+# rsi = 0; the byte tail leaves rdi at end-of-input and rsi = 0.
+#
+# eax is used (not edx) for the incoming accumulator so the caller
+# can avoid a reg→reg MOV when handing one update's output to the
+# next update (per D047 lint: plain `mov <reg>, <reg>` triggers a
+# false positive; `lea` is the accepted reg-copy idiom).
+    .type _crc32_update_slice8, @function
+    .balign 16
+_crc32_update_slice8:
     test    rsi, rsi
-    jz      .Ldone                    # zero-length: return 0 via final XOR
+    jz      .Lupd_done
     lea     r11, [rip + crc32_table_slice8]
     cmp     rsi, 8
-    jb      .Ltail
-
-# ---- 8-byte slicing-by-8 loop ----
-# rdx holds 8 input bytes (little-endian). XOR current crc into the
-# low 32 bits; the high 32 bits carry the next 4 bytes untouched.
-# Eight table lookups, XORed, produce the new 32-bit crc.
-.Lfold8:
-    mov     rdx, [rdi]
-    mov     r9d, eax
-    xor     rdx, r9                    # 64-bit XOR: low 32 ^= crc, high 32 intact
+    jb      .Lupd_tail
+    lea     rcx, [rdi]                # preserve rdi (LEA reg-copy)
+    lea     r10, [rsi]
+.Lupd_fold8:
+    mov     rdx, [rcx]
+    lea     r9d, [rax]                # zero-extend eax into r9 low 32
+    xor     rdx, r9
 
     movzx   r8d, dl
-    mov     eax, [r11 + r8*4 + 7*1024] # T[7][I & 0xFF]
+    mov     eax, [r11 + r8*4 + 7*1024]
     shr     rdx, 8
     movzx   r8d, dl
-    xor     eax, [r11 + r8*4 + 6*1024] # T[6][(I >> 8) & 0xFF]
+    xor     eax, [r11 + r8*4 + 6*1024]
     shr     rdx, 8
     movzx   r8d, dl
-    xor     eax, [r11 + r8*4 + 5*1024] # T[5][(I >> 16) & 0xFF]
+    xor     eax, [r11 + r8*4 + 5*1024]
     shr     rdx, 8
     movzx   r8d, dl
-    xor     eax, [r11 + r8*4 + 4*1024] # T[4][(I >> 24) & 0xFF]
+    xor     eax, [r11 + r8*4 + 4*1024]
     shr     rdx, 8
     movzx   r8d, dl
-    xor     eax, [r11 + r8*4 + 3*1024] # T[3][H & 0xFF]
+    xor     eax, [r11 + r8*4 + 3*1024]
     shr     rdx, 8
     movzx   r8d, dl
-    xor     eax, [r11 + r8*4 + 2*1024] # T[2][(H >> 8) & 0xFF]
+    xor     eax, [r11 + r8*4 + 2*1024]
     shr     rdx, 8
     movzx   r8d, dl
-    xor     eax, [r11 + r8*4 + 1*1024] # T[1][(H >> 16) & 0xFF]
+    xor     eax, [r11 + r8*4 + 1*1024]
     shr     rdx, 8
-    # After 7 shr-by-8's, rdx holds just the top byte of the
-    # original 8 input bytes in bits 0..7; bits 8..63 are zero.
-    xor     eax, [r11 + rdx*4]         # T[0][H >> 24]
+    xor     eax, [r11 + rdx*4]
 
-    add     rdi, 8
-    sub     rsi, 8
-    cmp     rsi, 8
-    jae     .Lfold8
-
-# ---- tail: 0..7 bytes, byte-at-a-time via T[0] ----
-.Ltail:
+    add     rcx, 8
+    sub     r10, 8
+    cmp     r10, 8
+    jae     .Lupd_fold8
+    lea     rdi, [rcx]                # restore external rdi/rsi
+    lea     rsi, [r10]
+.Lupd_tail:
     test    rsi, rsi
-    jz      .Ldone
-.Lbyte:
-    movzx   r8d, byte ptr [rdi]     # zero-extends; r8 bits 8..63 stay zero
-    xor     r8b, al                 # r8b = (crc ^ byte) & 0xFF; upper bits unchanged
+    jz      .Lupd_done
+.Lupd_byte:
+    movzx   r8d, byte ptr [rdi]
+    xor     r8b, al
     shr     eax, 8
-    xor     eax, [r11 + r8*4]       # T[0][(crc ^ byte) & 0xFF]
+    xor     eax, [r11 + r8*4]
     inc     rdi
     dec     rsi
-    jnz     .Lbyte
-
-.Ldone:
-    not     eax                         # final XOR with 0xFFFFFFFF
+    jnz     .Lupd_byte
+.Lupd_done:
     ret
+    .size _crc32_update_slice8, . - _crc32_update_slice8
 
+# uint32_t crc32_ieee_802_3_slice8(const void *data, size_t len)
+# Entry that runs the slicing-by-8 path unconditionally, including
+# init and final XOR. Suitable for unit-testing the fallback path.
+# `sub rsp, 8` before the call brings rsp to 16-aligned per SysV
+# ABI — the callee is a leaf today, but we pay the one-byte cost to
+# keep the ABI invariant true so future edits can't break silently.
+    .type crc32_ieee_802_3_slice8, @function
+    .balign 16
+crc32_ieee_802_3_slice8:
+    sub     rsp, 8
+    mov     eax, 0xFFFFFFFF
+    call    _crc32_update_slice8
+    add     rsp, 8
+    not     eax
+    ret
+    .size crc32_ieee_802_3_slice8, . - crc32_ieee_802_3_slice8
+
+# uint32_t crc32_ieee_802_3_pclmulqdq(const void *data, size_t len)
+# PCLMULQDQ fold-by-1 fast path. Falls back to slicing-by-8 for
+# inputs shorter than 16 bytes (the minimum fold unit).
+    .type crc32_ieee_802_3_pclmulqdq, @function
+    .balign 16
+crc32_ieee_802_3_pclmulqdq:
+    cmp     rsi, 16
+    jae     .Lpc_main
+    # Small input: just slice-by-8.
+    jmp     crc32_ieee_802_3_slice8
+.Lpc_main:
+    # Load first 16 bytes as 128-bit state, XOR 0xFFFFFFFF into low
+    # 32 bits. That's the start-of-message init for reflected CRC.
+    movdqu  xmm0, [rdi]
+    mov     eax, 0xFFFFFFFF
+    movd    xmm1, eax
+    pxor    xmm0, xmm1
+    add     rdi, 16
+    sub     rsi, 16
+
+    movdqa  xmm2, [rip + crc32_pclmul_fold_constants]
+
+    cmp     rsi, 16
+    jb      .Lpc_reduce
+
+    # --- fold loop: 16 bytes per iteration ---
+    # state' = (pclmul(state_lo, K_hi33) << 32)
+    #       ^ (pclmul(state_hi, K_lo33) << 32)
+    #       ^ new_16_bytes
+    # We shift products left by 32 bits (pslldq by 4 bytes) — this is
+    # the alignment factor that falls out of using low-33 constants
+    # instead of high-64 constants. See file header derivation.
+.Lpc_fold_loop:
+    movdqu  xmm1, [rdi]               # next 16 bytes
+    movdqa  xmm3, xmm0
+    pclmulqdq xmm3, xmm2, 0x00        # state_lo × K_hi33
+    pslldq  xmm3, 4                   # << 32 (byte-shift by 4)
+    movdqa  xmm4, xmm0
+    pclmulqdq xmm4, xmm2, 0x11        # state_hi × K_lo33
+    pslldq  xmm4, 4
+    pxor    xmm3, xmm4
+    pxor    xmm3, xmm1
+    movdqa  xmm0, xmm3
+    add     rdi, 16
+    sub     rsi, 16
+    cmp     rsi, 16
+    jae     .Lpc_fold_loop
+
+.Lpc_reduce:
+    # Reduce 128-bit state to 32-bit CRC by running the slicing-by-8
+    # byte loop on the 16 state bytes with init crc = 0, then on the
+    # remaining 0..15 tail bytes.
+    #
+    # Stack frame layout (rsp-relative, 16-byte aligned):
+    #   [rsp + 0]  .. [rsp + 15]  state bytes
+    #   [rsp + 16] .. [rsp + 23]  saved tail ptr
+    #   [rsp + 24] .. [rsp + 31]  saved tail len
+    #   [rsp + 32] .. [rsp + 39]  padding
+    sub     rsp, 40                   # caller's rsp & 0xF = 8, now 0
+    movdqu  [rsp], xmm0
+    mov     [rsp + 16], rdi
+    mov     [rsp + 24], rsi
+
+    xor     eax, eax                  # init crc = 0 for state reduction
+    lea     rdi, [rsp]
+    mov     rsi, 16
+    call    _crc32_update_slice8      # eax ← crc after state bytes
+
+    mov     rdi, [rsp + 16]
+    mov     rsi, [rsp + 24]
+    call    _crc32_update_slice8      # eax (carried over) ← crc after tail
+
+    add     rsp, 40
+    not     eax                       # final XOR with 0xFFFFFFFF
+    ret
+    .size crc32_ieee_802_3_pclmulqdq, . - crc32_ieee_802_3_pclmulqdq
+
+# uint32_t crc32_ieee_802_3_has_pclmulqdq(void)
+# Returns 1 if CPUID.01H:ECX[PCLMULQDQ=1] is set, else 0.
+# Used by the dispatcher and exported so the test driver can verify
+# which path was actually taken.
+    .type crc32_ieee_802_3_has_pclmulqdq, @function
+    .balign 16
+crc32_ieee_802_3_has_pclmulqdq:
+    push    rbx                       # callee-saved, clobbered by cpuid
+    mov     eax, 1
+    cpuid
+    lea     eax, [rcx]                # eax ← ecx (reg-copy via LEA)
+    shr     eax, 1
+    and     eax, 1
+    pop     rbx
+    ret
+    .size crc32_ieee_802_3_has_pclmulqdq, . - crc32_ieee_802_3_has_pclmulqdq
+
+# Dispatcher. Runtime CPUID check on PCLMULQDQ and tail-call the
+# appropriate path. CPUID is serializing and costs ~100 cycles, so
+# for small-frame hot paths it dominates; D034's `HAS_PCLMULQDQ`
+# build-time profile flag is the intended replacement for this
+# runtime probe.
+#
+# cpuid leaves rdi/rsi/r11 alone (only eax/ebx/ecx/edx), so we only
+# need to save rbx. The push+pop of rbx also keeps rsp 16-aligned
+# across the cpuid so any future insertion here doesn't trip over
+# the implicit alignment.
+    .type crc32_ieee_802_3, @function
+    .balign 16
+crc32_ieee_802_3:
+    push    rbx
+    mov     eax, 1
+    cpuid
+    lea     r11d, [rcx]               # r11 ← ecx (reg-copy via LEA)
+    pop     rbx
+    test    r11d, 2                   # PCLMULQDQ = ECX bit 1
+    jnz     crc32_ieee_802_3_pclmulqdq
+    jmp     crc32_ieee_802_3_slice8
     .size crc32_ieee_802_3, . - crc32_ieee_802_3
 
-# Non-executable stack — silences the ld warning about a missing
-# .note.GNU-stack section and keeps the resulting ELF from being
-# marked RWX just because this object didn't declare otherwise.
+# Non-executable stack marker.
     .section .note.GNU-stack, "", @progbits
