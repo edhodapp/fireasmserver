@@ -16,7 +16,8 @@
 ; Sequence:
 ;   1. Establish ESP, clear DF.
 ;   2. Emit "READY\n" on COM1 with LSR-polled UART writes (16550 THRE
-;      gate, see `emit_bytes`).
+;      gate, see `emit_bytes`). LSR polling has a ~1M-iteration timeout
+;      so a wedged UART emulator doesn't hang the guest.
 ;   3. Probe the virtio-MMIO MagicValue register at the first virtio
 ;      device slot with the memory barriers Virtio 1.2 §4.2.2 mandates.
 ;      Per Firecracker v1.15.1 x86_64 layout:
@@ -26,7 +27,9 @@
 ;      The register value MUST be 0x74726976 ("virt" little-endian)
 ;      per Virtio 1.2 §4.2.2. This is VIO-Q-001/§2.7 territory and the
 ;      first observable cross-check with the device.
-;   4. Emit "VIRTIO:OK\n" on match, "VIRTIO:FAIL\n" on mismatch.
+;   4. Emit "VIRTIO:OK\n" on match, or "VIRTIO:FAIL magic=XXXXXXXX\n"
+;      on mismatch — printing the actual magic is the first thing a
+;      debugger reaches for, so it goes in now.
 ;   5. Halt.
 ;
 ; Assumes the Firecracker JSON config includes a network-interface
@@ -40,6 +43,7 @@ XEN_ELFNOTE_PHYS32_ENTRY equ 18
 COM1_PORT                equ 0x3F8
 COM1_LSR_OFFSET          equ 5            ; LSR port = COM1_PORT + 5 = 0x3FD
 UART_LSR_THRE            equ 0x20         ; Transmit Holding Register Empty
+UART_POLL_TIMEOUT        equ 1 << 20      ; ~1 ms at modern CPU speeds
 VIRTIO_MMIO_BASE         equ 0xC0001000
 VIRTIO_MAGIC             equ 0x74726976   ; "virt" little-endian
 
@@ -60,7 +64,7 @@ section .text
 global _start
 _start:
     ; PVH spec leaves ESP undefined on entry. Point it at 2 MiB, well
-    ; above .text (ends < 0x100100) and inside the 128 MiB guest RAM,
+    ; above .text (ends < 0x100200) and inside the 128 MiB guest RAM,
     ; so our call/ret pairs have somewhere valid to push return
     ; addresses. Without this, the first CALL pushes to [0xfffffffc]
     ; (ESP=0 wraps) — MMIO space past guest RAM — and RET then reads
@@ -98,8 +102,17 @@ _start:
     jmp .halt
 
 .virtio_fail:
+    ; eax holds the actual magic value. Print "VIRTIO:FAIL magic=" then
+    ; the eight hex digits, then "\n". Saves a lot of time versus
+    ; having to bisect from the VMM log that the address was wrong.
+    push eax                        ; preserve magic across emit_bytes
     lea esi, [virtio_fail_msg]
     mov ecx, virtio_fail_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
     call emit_bytes
 
 .halt:
@@ -110,21 +123,31 @@ _start:
 
 ; --- emit_bytes: write <ecx> bytes from <esi> to COM1 in <dx> ---
 ; Polls the 16550 Line Status Register for THRE (Transmit Holding
-; Register Empty, bit 5) before each write. Firecracker's
-; vm_superio::Serial happens to accept writes without ever deasserting
-; THRE, but any stricter UART emulator (bochs, some QEMU serial
-; backends) or real hardware will drop bytes without this gate.
-; `dx` holds COM1 THR on entry and is restored to COM1 THR before
-; return so subsequent callers can reuse it.
+; Register Empty, bit 5) before each write, with a ~1M-iteration
+; timeout so a wedged UART doesn't hang the guest. On timeout,
+; abandons the remaining stream; the caller has already received
+; diagnostic output up to the stall. `dx` holds COM1 THR on entry
+; and is restored to COM1 THR before return so subsequent callers
+; can reuse it.
+; Clobbers: eax, ecx, esi, edi. Preserves: dx, ebx, ebp, esp.
 emit_bytes:
     test ecx, ecx
     jz .done
 .next:
     add dx, COM1_LSR_OFFSET   ; dx = LSR port
+    mov edi, UART_POLL_TIMEOUT
 .wait_thre:
     in  al, dx
     test al, UART_LSR_THRE
-    jz  .wait_thre
+    jnz .have_thre
+    dec edi
+    jnz .wait_thre
+    ; Timeout. Restore dx and abandon. Returning on timeout is
+    ; best-effort: bytes emitted before the stall survived; the rest
+    ; are lost. The guest still halts cleanly without hanging.
+    sub dx, COM1_LSR_OFFSET
+    ret
+.have_thre:
     sub dx, COM1_LSR_OFFSET   ; dx = THR port (== COM1_PORT)
     mov al, [esi]
     out dx, al
@@ -134,11 +157,45 @@ emit_bytes:
 .done:
     ret
 
+; --- emit_hex32: write eax as 8 uppercase hex digits to COM1 in dx ---
+; Uses an 8-byte stack scratch buffer so the emit_bytes LSR-polling
+; helper can do the actual serialization without duplication.
+; Preserves dx (caller's COM1_PORT) and ebx (which we use internally
+; and save on entry).
+; Clobbers: eax, ecx, esi, edi. Preserves: dx, ebx.
+emit_hex32:
+    push ebx
+    sub esp, 8                    ; 8-byte scratch buffer
+    mov ebx, eax                  ; keep source across the rotate loop
+    lea esi, [esp]
+    mov ecx, 8
+.digit:
+    rol ebx, 4                    ; top nibble → low 4 bits of ebx
+    mov eax, ebx
+    and eax, 0x0F
+    cmp al, 10
+    jb .num
+    add al, 'A' - '0' - 10        ; 'A'..'F'
+.num:
+    add al, '0'                   ; '0'..'9' (or adjusted above for hex)
+    mov [esi], al
+    inc esi
+    dec ecx
+    jnz .digit
+    lea esi, [esp]
+    mov ecx, 8
+    call emit_bytes
+    add esp, 8
+    pop ebx
+    ret
+
 ready_msg:       db 'READY', 10
 ready_len        equ $ - ready_msg
 
 virtio_ok_msg:   db 'VIRTIO:OK', 10
 virtio_ok_len    equ $ - virtio_ok_msg
 
-virtio_fail_msg: db 'VIRTIO:FAIL', 10
+virtio_fail_msg: db 'VIRTIO:FAIL magic='
 virtio_fail_len  equ $ - virtio_fail_msg
+
+newline:         db 10

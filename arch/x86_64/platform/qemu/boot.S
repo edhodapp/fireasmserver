@@ -13,9 +13,10 @@
 ;
 ; NASM per D048.
 
-COM1_PORT       equ 0x3F8
-COM1_LSR_OFFSET equ 5             ; LSR port = COM1_PORT + 5 = 0x3FD
-UART_LSR_THRE   equ 0x20          ; Transmit Holding Register Empty
+COM1_PORT         equ 0x3F8
+COM1_LSR_OFFSET   equ 5            ; LSR port = COM1_PORT + 5 = 0x3FD
+UART_LSR_THRE     equ 0x20         ; Transmit Holding Register Empty
+UART_POLL_TIMEOUT equ 1 << 20      ; ~1 ms at modern CPU speeds
 
 MB_MAGIC    equ 0x1BADB002
 MB_FLAGS    equ 0x0
@@ -55,10 +56,18 @@ emit_bytes:
     jz .done
 .next:
     add dx, COM1_LSR_OFFSET
+    mov edi, UART_POLL_TIMEOUT
 .wait_thre:
     in  al, dx
     test al, UART_LSR_THRE
-    jz  .wait_thre
+    jnz .have_thre
+    dec edi
+    jnz .wait_thre
+    ; Timeout: UART wedged. Abandon the remaining stream and return
+    ; so the guest halts cleanly instead of hanging in the spin.
+    sub dx, COM1_LSR_OFFSET
+    ret
+.have_thre:
     sub dx, COM1_LSR_OFFSET
     mov al, [esi]
     out dx, al
