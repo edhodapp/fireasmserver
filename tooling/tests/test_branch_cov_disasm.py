@@ -229,9 +229,12 @@ class TestToBranch:
 
 
 # Integration tests against real guest.elf build artifacts (when present).
-# The x86_64 stub is branch-free; the aarch64 stub contains exactly three
-# conditional branches: one cbnz (MPIDR gate), one cbz (end-of-message),
-# and one tbz (TX-ready poll).
+# The x86_64 stub grew conditional branches as the virtio-net L2 driver
+# took shape (virtio probe, LSR-polled UART emit loop, hex-print helper);
+# the aarch64 stub is still small (cbnz + cbz + tbz as its three
+# branches). Assertions for x86_64 are deliberately loose — checking
+# non-emptiness and mnemonic validity — so every boot.S edit doesn't
+# re-pin the expected count.
 _X86_ELF = Path(
     "/home/ed/fireasmserver/arch/x86_64/build/firecracker/guest.elf",
 )
@@ -239,14 +242,43 @@ _AARCH64_ELF = Path(
     "/home/ed/fireasmserver/arch/aarch64/build/firecracker/guest.elf",
 )
 
+# Exhaustive-ish set of x86_64 conditional-branch mnemonics Capstone can
+# emit for Jcc and loop variants. If the disassembler ever starts
+# handing back a mnemonic outside this set, we want to know.
+_X86_COND_BRANCHES = frozenset({
+    "je", "jne", "jz", "jnz",
+    "jb", "jnb", "jc", "jnc",
+    "jbe", "ja", "jnbe", "jna",
+    "jae", "jnae",
+    "jl", "jnl", "jle", "jnle",
+    "jg", "jng", "jge", "jnge",
+    "js", "jns",
+    "jo", "jno",
+    "jp", "jnp", "jpe", "jpo",
+    "jcxz", "jecxz", "jrcxz",
+    "loop", "loope", "loopne", "loopz", "loopnz",
+})
+
 
 @pytest.mark.skipif(
     not _X86_ELF.exists(),
     reason="x86_64 firecracker build artifact not present",
 )
 def test_enumerate_branches_on_x86_tracer_stub() -> None:
-    """The x86_64 tracer-bullet stub has zero conditional branches."""
-    assert not enumerate_branches(_X86_ELF)
+    """The x86_64 stub has conditional branches across its virtio probe
+    and UART / hex-emit helpers. Assert non-emptiness and mnemonic
+    validity — catches disassembler regressions without pinning a
+    brittle exact count."""
+    branches = enumerate_branches(_X86_ELF)
+    assert branches, (
+        "expected conditional branches in the x86_64 tracer stub "
+        "(virtio probe + LSR-polled UART loop + hex-emit helper)"
+    )
+    mnemonics = {b.mnemonic for b in branches}
+    unexpected = mnemonics - _X86_COND_BRANCHES
+    assert not unexpected, (
+        f"unexpected x86 branch mnemonics from disassembler: {unexpected}"
+    )
 
 
 @pytest.mark.skipif(
