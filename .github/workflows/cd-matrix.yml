@@ -116,10 +116,15 @@ jobs:
           sudo install -m 0755 "$FC_BIN" /usr/local/bin/firecracker
           firecracker --version
 
-      - name: Probe /dev/kvm (informational, firecracker cells only)
+      - name: Probe and open /dev/kvm (firecracker cells only)
         if: matrix.platform == 'firecracker'
         run: |
           if [ -e /dev/kvm ]; then
+            ls -la /dev/kvm
+            # GHA's runner user isn't in the kvm group by default.
+            # chmod 666 grants access for this job. Transient, CI-only,
+            # runs inside a throwaway VM.
+            sudo chmod 666 /dev/kvm
             ls -la /dev/kvm
             echo "::notice::KVM available on ${{ matrix.runner }} — firecracker boot viable"
           else
