@@ -106,6 +106,10 @@ def _run(args: argparse.Namespace) -> int:
     branches = enumerate_branches(args.elf, entry_symbol=args.entry)
     trace = parse_trace(args.trace)
     if args.load_offset:
+        # List comp doubles peak memory (original + adjusted) which is
+        # fine at today's ~hundred-kPC scale. When parse_trace's docstring
+        # scale-threshold (~1M PCs) is reached, fold the offset into a
+        # generator-based _observed_outcomes to keep peak constant.
         trace = [pc - args.load_offset for pc in trace]
     report = compute_coverage(branches, trace)
     _print_report(report)
@@ -121,9 +125,16 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point.
 
     Exit codes:
-      0 — fully covered, no gaps
-      1 — one or more uncovered (branch, outcome) pairs
-      2 — an I/O or parse error prevented the analysis from running
+      0 — advisory mode (no --baseline): gaps are printed but always
+          pass. Ratchet mode (--baseline): gaps exactly equal the
+          baseline.
+      1 — ratchet mode only: at least one NEW gap (regression) or
+          CLOSED gap (stale baseline) detected.
+      2 — an I/O or parse error prevented the analysis from running.
+
+    The advisory-mode exit 0 is deliberate: gap counts without a
+    baseline have no "expected" to ratchet against, so treating them
+    as failure would noise the cell red on every run.
     """
     args = parse_args(argv)
     try:

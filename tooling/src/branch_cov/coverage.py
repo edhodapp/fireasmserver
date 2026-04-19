@@ -131,6 +131,27 @@ class BaselineComparison(BaseModel):
         return not self.new_gaps and not self.closed_gaps
 
 
+def _parse_baseline_entry(
+    path: Path, lineno: int, raw: str,
+) -> tuple[int, BranchOutcome] | None:
+    """Parse one baseline line; return None for blanks/comments."""
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        return None
+    parts = line.split()
+    if len(parts) != 2:
+        msg = (
+            f"{path}:{lineno}: expected '<hex-addr> <outcome>', "
+            f"got {raw.rstrip()!r}"
+        )
+        raise ValueError(msg)
+    try:
+        return int(parts[0], 16), BranchOutcome(parts[1])
+    except ValueError as exc:
+        msg = f"{path}:{lineno}: {raw.rstrip()!r}: {exc}"
+        raise ValueError(msg) from exc
+
+
 def load_baseline(path: Path) -> set[tuple[int, BranchOutcome]]:
     """Parse a baseline file into a set of (addr, outcome) tuples.
 
@@ -145,19 +166,9 @@ def load_baseline(path: Path) -> set[tuple[int, BranchOutcome]]:
     entries: set[tuple[int, BranchOutcome]] = set()
     with open(path, encoding="utf-8") as f:
         for lineno, raw in enumerate(f, start=1):
-            line = raw.split("#", 1)[0].strip()
-            if not line:
-                continue
-            parts = line.split()
-            if len(parts) != 2:
-                msg = (
-                    f"{path}:{lineno}: expected '<hex-addr> <outcome>'"
-                    f", got {raw.rstrip()!r}"
-                )
-                raise ValueError(msg)
-            addr = int(parts[0], 16)
-            outcome = BranchOutcome(parts[1])
-            entries.add((addr, outcome))
+            entry = _parse_baseline_entry(path, lineno, raw)
+            if entry is not None:
+                entries.add(entry)
     return entries
 
 
@@ -165,9 +176,15 @@ def compare_to_baseline(
     report: CoverageReport,
     baseline: set[tuple[int, BranchOutcome]],
 ) -> BaselineComparison:
-    """Diff a CoverageReport's gaps against a baseline set."""
-    observed = {(g.branch.addr, g.missing) for g in report.gaps}
+    """Diff a CoverageReport's gaps against a baseline set.
+
+    Naming note: `current_gaps` is the report's *gap* set (pairs NOT
+    observed). Don't confuse this with `_observed_outcomes`, which
+    counts pairs that WERE observed. Semantics intentionally inverted
+    here because baselines list acknowledged gaps, not observed paths.
+    """
+    current_gaps = {(g.branch.addr, g.missing) for g in report.gaps}
     return BaselineComparison(
-        new_gaps=sorted(observed - baseline),
-        closed_gaps=sorted(baseline - observed),
+        new_gaps=sorted(current_gaps - baseline),
+        closed_gaps=sorted(baseline - current_gaps),
     )

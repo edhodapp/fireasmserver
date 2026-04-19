@@ -207,11 +207,25 @@ class TestLoadBaseline:
         assert ":2:" in str(exc.value)
         assert "bogus_line" in str(exc.value)
 
-    def test_invalid_outcome_raises(self, tmp_path: Path) -> None:
+    def test_invalid_outcome_raises_with_context(
+        self, tmp_path: Path,
+    ) -> None:
         path = tmp_path / "baseline.txt"
         path.write_text("0x48 sideways\n", encoding="utf-8")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as exc:
             load_baseline(path)
+        assert ":1:" in str(exc.value)
+        assert "sideways" in str(exc.value)
+
+    def test_malformed_hex_raises_with_context(
+        self, tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "baseline.txt"
+        path.write_text("xyzzy taken\n", encoding="utf-8")
+        with pytest.raises(ValueError) as exc:
+            load_baseline(path)
+        assert ":1:" in str(exc.value)
+        assert "xyzzy" in str(exc.value)
 
 
 class TestCompareToBaseline:
