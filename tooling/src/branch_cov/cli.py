@@ -6,7 +6,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from branch_cov.coverage import CoverageReport, compute_coverage
+from branch_cov.coverage import (
+    BaselineComparison,
+    BranchOutcome,
+    CoverageReport,
+    compare_to_baseline,
+    compute_coverage,
+    load_baseline,
+)
 from branch_cov.disasm import enumerate_branches
 from branch_cov.trace import parse_trace
 
@@ -41,6 +48,19 @@ def parse_args(
             "loads them at 0x40080000, so pass --load-offset=0x40080000."
         ),
     )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a baseline file listing (addr, outcome) pairs that "
+            "are currently accepted as gaps. If provided, the run fails "
+            "(exit 1) on any delta — a NEW gap indicates a regression, a "
+            "CLOSED gap indicates the baseline is stale and should be "
+            "tightened. Without --baseline, all gaps are advisory and "
+            "exit code is 0 even when gaps exist."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -56,6 +76,31 @@ def _print_report(report: CoverageReport) -> None:
         )
 
 
+def _print_gap_list(
+    label: str,
+    tail: str,
+    gaps: list[tuple[int, BranchOutcome]],
+) -> None:
+    """Print one section of a baseline delta (NEW or CLOSED)."""
+    if not gaps:
+        return
+    print(f"{label} gaps ({len(gaps)}) — {tail}:")
+    for addr, outcome in gaps:
+        print(f"  0x{addr:x} {outcome.value}")
+
+
+def _print_baseline_delta(cmp_: BaselineComparison) -> None:
+    """Print added/closed gaps relative to a baseline."""
+    if cmp_.matches:
+        print("Baseline: MATCH (no new gaps, no closed gaps)")
+        return
+    _print_gap_list("NEW", "regression", cmp_.new_gaps)
+    _print_gap_list(
+        "CLOSED", "baseline is stale and should be tightened",
+        cmp_.closed_gaps,
+    )
+
+
 def _run(args: argparse.Namespace) -> int:
     """Execute the coverage pipeline; raises on I/O or parse errors."""
     branches = enumerate_branches(args.elf, entry_symbol=args.entry)
@@ -64,7 +109,12 @@ def _run(args: argparse.Namespace) -> int:
         trace = [pc - args.load_offset for pc in trace]
     report = compute_coverage(branches, trace)
     _print_report(report)
-    return 0 if report.fully_covered else 1
+    if args.baseline is None:
+        # Advisory mode — gaps do not fail the run.
+        return 0
+    cmp_ = compare_to_baseline(report, load_baseline(args.baseline))
+    _print_baseline_delta(cmp_)
+    return 0 if cmp_.matches else 1
 
 
 def main(argv: list[str] | None = None) -> int:

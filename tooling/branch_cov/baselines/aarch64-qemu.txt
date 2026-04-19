@@ -1,0 +1,20 @@
+# branch-cov baseline — aarch64/qemu tracer bullet
+#
+# Each line: <hex-addr> <taken|not_taken>. These are (branch, outcome)
+# pairs that the single-vCPU tracer-bullet boot legitimately cannot
+# exercise. Any DELTA from this baseline — new gap OR closed gap —
+# fails the run. Tighten this file when:
+#   - new tests cover a branch path (drop the entry)
+#   - boot.S grows new branches (add the entries once we've decided
+#     they're intentionally uncovered)
+#
+# Regenerate by running the tracer bullet under TRACE=1 and reading
+# the "Gaps:" list out of branch-cov's output.
+
+# cbnz x5, .Ldone — secondary-CPU entry. vcpu_count=1 in our config,
+# so the primary always falls through; no secondary ever hits .Ldone.
+0x48 taken
+
+# tbnz w3, #5, .Lwait — wait-while-FIFO-full. QEMU's PL011 emulation
+# drains instantly, so TXFF==1 never observed during this boot.
+0x64 taken

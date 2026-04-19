@@ -176,6 +176,60 @@ class TestLoadOffsetApplied:
         assert "Branches: 0" in capsys.readouterr().out
 
 
+class TestBaseline:
+    """--baseline flips gaps from advisory to ratchet."""
+
+    def test_no_baseline_gaps_are_advisory(
+        self, tmp_path: Path,
+    ) -> None:
+        """Without --baseline, exit 0 even with synthetic gaps."""
+        elf = tmp_path / "g.elf"
+        trace = tmp_path / "t.log"
+        _write_empty_elf(elf)
+        # No branches in empty ELF → no possible gaps → exit 0 trivially.
+        trace.write_text("", encoding="utf-8")
+        rc = main(["--elf", str(elf), "--trace", str(trace)])
+        assert rc == 0
+
+    def test_baseline_match_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Matching baseline → exit 0, report prints MATCH."""
+        elf = tmp_path / "g.elf"
+        trace = tmp_path / "t.log"
+        baseline = tmp_path / "baseline.txt"
+        _write_empty_elf(elf)
+        trace.write_text("", encoding="utf-8")
+        baseline.write_text("", encoding="utf-8")
+        rc = main([
+            "--elf", str(elf),
+            "--trace", str(trace),
+            "--baseline", str(baseline),
+        ])
+        assert rc == 0
+        assert "MATCH" in capsys.readouterr().out
+
+    def test_baseline_with_closed_gaps_exits_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Baseline expects gaps but report has none → closed_gaps, exit 1."""
+        elf = tmp_path / "g.elf"
+        trace = tmp_path / "t.log"
+        baseline = tmp_path / "baseline.txt"
+        _write_empty_elf(elf)
+        trace.write_text("", encoding="utf-8")
+        # Synthetic stale baseline entry — the empty ELF has no branches,
+        # so this (addr, outcome) will appear as a CLOSED gap.
+        baseline.write_text("0x48 taken\n", encoding="utf-8")
+        rc = main([
+            "--elf", str(elf),
+            "--trace", str(trace),
+            "--baseline", str(baseline),
+        ])
+        assert rc == 1
+        assert "CLOSED" in capsys.readouterr().out
+
+
 class TestModuleInvocation:
     """`python -m branch_cov` enters through __main__.py."""
 

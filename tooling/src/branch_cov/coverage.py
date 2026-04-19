@@ -10,11 +10,27 @@ or other discontinuities between a branch and its successor will
 silently miss those outcomes. Callers with interrupt-heavy traces
 should strip handler ranges with branch_cov.trace.filter_trace
 before calling compute_coverage.
+
+Baseline ratchet
+----------------
+A CoverageReport's gaps are raw facts about "what did / didn't
+execute." Most assembly programs have paths that a single-boot trace
+legitimately cannot exercise (secondary-CPU entry, saturated-FIFO
+branches, error handlers). Baselines capture the currently-accepted
+set of gaps and compare an incoming report against them:
+
+    load_baseline(path)       → set[(addr, outcome)]
+    compare_to_baseline(r, b) → BaselineComparison  (new / closed)
+
+Any delta — new gap OR closed-but-still-in-baseline gap — is a
+signal. New gaps mean a regression; closed gaps mean the baseline is
+stale and should be tightened.
 """
 
 from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
 
 from pydantic import BaseModel
 
@@ -100,4 +116,58 @@ def compute_coverage(
         total_branches=len(branches),
         observed_outcomes=len(observed),
         gaps=gaps,
+    )
+
+
+class BaselineComparison(BaseModel):
+    """Delta between a fresh report's gaps and a stored baseline."""
+
+    new_gaps: list[tuple[int, BranchOutcome]]       # observed ∖ baseline
+    closed_gaps: list[tuple[int, BranchOutcome]]    # baseline ∖ observed
+
+    @property
+    def matches(self) -> bool:
+        """True when the report's gaps exactly equal the baseline."""
+        return not self.new_gaps and not self.closed_gaps
+
+
+def load_baseline(path: Path) -> set[tuple[int, BranchOutcome]]:
+    """Parse a baseline file into a set of (addr, outcome) tuples.
+
+    File format: one baseline entry per line, whitespace-separated
+    ``<hex-addr> <outcome>`` where outcome is 'taken' or 'not_taken'.
+    Lines beginning with '#' and blank lines are ignored. Example:
+
+        # baseline for aarch64/qemu tracer bullet
+        0x48 taken       # secondary-CPU entry, not exercised at vcpu=1
+        0x64 taken       # UART-FIFO-full, never seen under PL011 emu
+    """
+    entries: set[tuple[int, BranchOutcome]] = set()
+    with open(path, encoding="utf-8") as f:
+        for lineno, raw in enumerate(f, start=1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                msg = (
+                    f"{path}:{lineno}: expected '<hex-addr> <outcome>'"
+                    f", got {raw.rstrip()!r}"
+                )
+                raise ValueError(msg)
+            addr = int(parts[0], 16)
+            outcome = BranchOutcome(parts[1])
+            entries.add((addr, outcome))
+    return entries
+
+
+def compare_to_baseline(
+    report: CoverageReport,
+    baseline: set[tuple[int, BranchOutcome]],
+) -> BaselineComparison:
+    """Diff a CoverageReport's gaps against a baseline set."""
+    observed = {(g.branch.addr, g.missing) for g in report.gaps}
+    return BaselineComparison(
+        new_gaps=sorted(observed - baseline),
+        closed_gaps=sorted(baseline - observed),
     )

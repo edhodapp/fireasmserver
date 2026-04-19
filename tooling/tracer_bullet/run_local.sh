@@ -154,7 +154,18 @@ if [[ "$TRACE" == "1" && -s "$TRACE_LOG" ]]; then
     if [[ -x "$REPO_ROOT/.venv/bin/python3" ]]; then
         PY="$REPO_ROOT/.venv/bin/python3"
     fi
-    "$PY" -m branch_cov --elf "$ELF" --trace "$TRACE_PCS" \
-        --load-offset "$LOAD_OFFSET" || true
+    # If a baseline file exists for this cell, promote branch-cov from
+    # advisory to ratchet: exit 1 on any delta from the accepted gaps.
+    BASELINE="tooling/branch_cov/baselines/${ARCH}-${PLATFORM}.txt"
+    BASELINE_ARG=()
+    if [[ -f "$BASELINE" ]]; then
+        BASELINE_ARG=(--baseline "$BASELINE")
+    fi
+    if ! "$PY" -m branch_cov --elf "$ELF" --trace "$TRACE_PCS" \
+            --load-offset "$LOAD_OFFSET" "${BASELINE_ARG[@]}"; then
+        # Baseline mismatch is a real failure; propagate.
+        [[ -f "$BASELINE" ]] && exit 1
+        # No baseline → branch-cov's non-zero is just advisory gaps.
+    fi
 fi
 exit 0
