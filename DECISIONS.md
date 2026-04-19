@@ -913,9 +913,14 @@ mixing stages for the same layer.
    malformed frames, runts, giants, bad FCS, crafted VLAN stacks, ARP
    flood, preamble attacks. Automated in CI as a gating step once in
    place.
-6. **Interop matrix.** At least: Linux mainline netdev, FreeBSD, OVS,
+6. ~~**Interop matrix.** At least: Linux mainline netdev, FreeBSD, OVS,
    one enterprise switch (Cisco or Juniper sample). Not exhaustive —
-   representative.
+   representative.~~ **DEPRECATED 2026-04-19T08:10Z — see D042.** The
+   "one enterprise switch" line implied real Cisco/Juniper hardware
+   that is neither affordable nor relevant for firecracker cloud
+   targets. D042 replaces it with a tiered free / on-demand / deferred
+   plan that reflects what fireasmserver's deployment surface actually
+   needs.
 7. **Performance measurement.** Only after 3–6 are green. Measure
    cycles/frame, cache misses, pipeline stalls (OSACA predictions vs.
    `-icount` actuals vs. hardware PMC actuals).
@@ -1038,6 +1043,58 @@ replay follow. All eight before first paying customer.
 multi-tenant per microVM), blast-radius containment at the microVM
 level, cross-region coordination for fly.io. Defer to the deployment-
 phase trigger.
+
+### D042: L2 interop matrix — free / on-demand / deferred (supersedes D038 §6)
+
+**Decision:** Replace D038 stage 6's single "one enterprise switch
+(Cisco or Juniper sample)" line with a tiered plan that matches
+fireasmserver's actual deployment surface:
+
+**Tier 1 — In CI every push (free, containerized, automated):**
+- Linux mainline netdev (`veth` pair in a Docker container)
+- Open vSwitch (OVS) in a Docker container
+- **Arista cEOS-lab** via `containerlab` — free-for-lab-use Docker
+  image; real Arista EOS code path
+- **Nokia SR Linux** via `containerlab` — free for non-production
+
+These four cover ~80% of "does real vendor code accept our frames"
+at L2 and run alongside the existing `cd-matrix.yml` cells at zero
+recurring cost.
+
+**Tier 2 — Pre-sale, OEM-gated (free, on-demand):**
+- **Cisco DevNet Sandbox** (`developer.cisco.com/sandbox`) —
+  reservation-based free access to real Catalyst 9000, Nexus 9000,
+  ISR4000. Run once per customer engagement where Cisco is the stated
+  target, not per release.
+- **Juniper vLabs** — same pattern for Junos.
+- **Arista EOS Central** — vEOS free non-prod (backup to cEOS-lab).
+
+**Tier 3 — Deferred, customer-specific, potentially on-hardware:**
+- Decommissioned physical gear (Catalyst 2960-X on eBay, ~$30–80) if
+  a specific OEM deal demands desk-local silicon. Not before.
+- Paid simulators (Cisco CML Personal Edition, ~$200/yr) if DevNet
+  Sandbox reservation windows prove too constraining.
+
+**Why the matrix looks like this:**
+- fireasmserver's cloud deployment surface (fly.io, AWS EC2, Kata
+  Containers, nested Firecracker) is entirely virtual-switched.
+  Customer traffic never hits an enterprise Cisco.
+- L2 is the most standardized networking layer. Ethernet II,
+  802.1Q, LACP, STP are consistent across vendors in a way that
+  L3+ protocols (BGP dialect quirks, OSPF opaque LSAs) are not.
+  The interop risk at L2 is low enough that cEOS-lab + SR Linux +
+  OVS catches the overwhelming majority of real issues.
+- Real hardware matters for OEM appliance deployment (defense /
+  SCADA / instrumentation per `~/fireasmserver_oem_market_notes.md`),
+  but only as *engagement qualification*, not as per-release gating.
+  Tier 2 (DevNet / vLabs) covers that cadence.
+
+**Convention going forward (feedback-rule level):** when a new
+decision supersedes part or all of an earlier one, strike-through
+the superseded paragraph in the old entry, add a `**DEPRECATED
+<ISO-8601>Z — see DNNN.**` marker with a one-line rationale, and
+write the replacement as a new numbered entry that cites the
+section being superseded. Bidirectional references beat unidirectional.
 
 ## Future decisions (not yet made)
 - virtio-net driver design
