@@ -1,6 +1,8 @@
 # Observability design — proposal
 
-**Status:** draft for Ed's review, pre-D049.
+**Status:** draft for Ed's review, pre-D051 (D049 took ontology,
+D050 took fold-by-N pclmul constants; observability's D-number
+assigns when Ed resolves the 6 open questions at the bottom).
 **Scope:** cross-layer. Lands first in L2 per Ed's 2026-04-19 direction
 ("starting with L2 work, we need dynamically configurable observability
 baked in"). L1 stays as-is (adequate via existing tracer-bullet markers

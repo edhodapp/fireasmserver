@@ -1705,6 +1705,120 @@ Two related sub-decisions:
 - `project_sysengineering_expert_review.md` (memory) — the
   downstream audit reader.
 
+### D050: Fold-by-N with `pslldq 4` reuses fold-by-1 reduction constants
+
+**Decision (2026-04-19):** the x86_64 PCLMULQDQ fold-by-N CRC-32
+path in `arch/x86_64/crypto/crc32_ieee.S` uses the 33-bit constant
+form with `pslldq xmm, 4` as its alignment step, and under that
+form the **reduction chain after the main loop is fold-by-1, not
+fold-by-N**. Consequence: the on-chip constant table has four
+exponents — `x^576 mod P`, `x^512 mod P`, `x^192 mod P`, and
+`x^128 mod P` — **not** the six exponents the fold-by-4 briefing
+initially hinted at (`{512, 448, 384, 320, 192, 128}`).
+
+**Math (abbreviated — full derivation in
+`tooling/crypto_tests/derive_fold_constants.py` with 312 test
+cases per fold factor verified against `zlib.crc32`):**
+
+In the `pclmulqdq + pslldq 4` form used here, each multiply-and-
+shift step advances one accumulator's "running polynomial" by
+exactly 128 bits. When N parallel accumulators are initialized
+from consecutive 16-byte chunks of input, they start staggered:
+accumulator `i ∈ {0..N-1}` holds the contribution of a running
+polynomial at position `128·i` bits ahead of accumulator 0. Each
+main-loop iteration advances **all N accumulators simultaneously**
+by 128 bits — so after any number of iterations, the N
+accumulators remain staggered at the same 128-bit offsets from
+each other. The stagger is preserved end-to-end by the loop.
+
+The post-loop reduction collapses the N accumulators into one.
+Because the stagger between any two adjacent accumulators is
+exactly 128 bits, every step of the reduction chain is a
+fold-by-1 — multiply one accumulator by `x^128 mod P`, XOR into
+the next, repeat. The reduction never needs a fold-by-2 or
+fold-by-4 constant.
+
+The constants actually used:
+
+- **Main loop (fold-by-4 step):** `x^576 mod P` and `x^512 mod P`.
+  Advances each accumulator by 4 × 128 = 512 bits per iteration;
+  the 576 = 512+64 exponent handles the half of the accumulator's
+  internal 128-bit state that's shifted by the pclmul's own
+  alignment.
+- **Reduction chain (fold-by-1):** `x^192 mod P` and `x^128 mod P`.
+  Same two constants the existing fold-by-1 path uses; the
+  reduction reuses the fold-by-1 step three times to collapse
+  four accumulators to one.
+
+**Why this matters:**
+
+- **Smaller constants table.** 4 × 16 B = 64 B of constants, fits
+  in a single cache line. 6 exponents would need 96 B — still one
+  line, but less headroom for future additions (fold-by-8 constants
+  if we ever go there) without straddling a line boundary.
+- **Reduction is branch-free and compact.** Three inline
+  fold-by-1 steps (12 instructions total: 4 × pclmul + 4 × pslldq
+  + 4 × pxor) vs. a mixed fold-by-2-then-fold-by-1 chain that
+  would need different constants per step.
+- **Parallel accumulators** for future fold-by-8 reuse the same
+  reduction path. Adding N=8 would introduce new main-loop
+  constants (`x^1152 mod P`, `x^1088 mod P`) but **not** new
+  reduction constants — the reduction stays fold-by-1 regardless
+  of N, since the post-loop stagger is always 128 bits per
+  accumulator regardless of how many there are.
+
+**Non-obvious corollary (briefing erratum):** the briefing
+suggested "{512, 448, 384, 320, 192, 128}" as the fold-by-4
+exponent set. That enumeration is what you'd need under a
+*different* pclmul form — one that uses `psrldq` or a 64-bit-
+aligned constant — where the N accumulators converge during
+reduction rather than staying staggered. Under our form, that
+enumeration is wrong; the derivation script caught the mismatch
+empirically (zero-mismatch against `zlib.crc32` only for the
+4-exponent set).
+
+**Implementation:**
+
+- `arch/x86_64/crypto/crc32_ieee.S` — fold-by-4 main loop and
+  reduction, constants laid out in `.rodata.crc32_pclmul_consts`.
+- `tooling/crypto_tests/derive_fold_constants.py` — derives the
+  constants from the polynomial via GF(2) modular math, verifies
+  against `zlib.crc32` across 312 length points per fold factor,
+  emits NASM-ready `dq` literals.
+- `tooling/tests/test_derive_fold_constants.py` — 361 pytest
+  tests locking down the derivation.
+
+**Verification:**
+
+- The CRC-32 host-side driver runs 264 lengths × 3 code paths
+  (slice8, pclmulqdq, dispatcher) per arch under the pre-push
+  integration gate, plus the cross-path equivalence check. All
+  green since `b655543`.
+- The 312-length sweep inside the derivation script is
+  redundant with the driver but exercises boundary points the
+  driver doesn't (fold-chunk-stride aligned lengths 64, 128,
+  256, 512, 1024, 4096, 8192).
+
+**Cross-refs:**
+
+- `ETH-005` (CRC-32 IEEE 802.3 — now `implemented`).
+- `D034` — `HAS_PCLMULQDQ` profile flag; this decision is the
+  math specifically for the fold-by-4 path taken when the flag
+  is on.
+- `D040` — perf ratchet; the fold-by-4 throughput baseline lives
+  here once measured.
+- `D048` — NASM-on-x86_64 — the constants are declared via
+  `dq` literals, NASM-idiomatic.
+
+**Attribution:** math derivation + implementation by the
+2026-04-19 fold-by-N side session (briefing at
+`docs/side_sessions/2026-04-19_crc32_pclmul_foldbyn.md`). Content
+shipped on `origin/main` in commits `4fcfc3e` (derivation
+script), `da98b0d` (rename cleanup), and asm content absorbed
+into `b655543` (main-session wide-staging incident per
+`feedback_explicit_git_add_during_parallel_sessions.md`; leave-
+as-is per Ed's disposition).
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
