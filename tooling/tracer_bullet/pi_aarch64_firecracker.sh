@@ -68,7 +68,16 @@ PI_TMP="$(ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" 'mktemp -d /tmp/fireasm-trace
 }
 
 cleanup() {
-    ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "rm -rf '$PI_TMP'" 2>/dev/null || true
+    # Best-effort: if SSH is down or the Pi rebooted mid-run, we still
+    # want the script to exit; a stale /tmp/fireasm-tracer.*/ on the Pi
+    # is a minor leak, not a crisis. Next run of this script or any
+    # boot-time /tmp sweep handles it.
+    if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+            "rm -rf '$PI_TMP'" 2>/dev/null; then
+        echo "--- cleanup: removed $PI_USER@$PI_HOST:$PI_TMP ---"
+    else
+        echo "--- cleanup: could not reach Pi to remove $PI_TMP (Pi may be down) ---"
+    fi
 }
 trap cleanup EXIT INT TERM
 

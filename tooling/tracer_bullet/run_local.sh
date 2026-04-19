@@ -35,7 +35,17 @@ REPO_ROOT="$(realpath -m "$(cd "$(dirname "$0")/../.." && pwd)")"
 cd "$REPO_ROOT"
 
 TMPDIR="$(mktemp -d)"
-trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+# Named cleanup so the output makes the "we did leave nothing behind"
+# contract visible to anyone reading the log. trap covers abnormal
+# exits (Ctrl-C, SIGTERM, errexit); the main flow also calls it
+# directly at the end on the success path.
+cleanup() {
+    if [[ -d "$TMPDIR" ]]; then
+        rm -rf "$TMPDIR"
+        echo "--- cleanup: removed $TMPDIR ---"
+    fi
+}
+trap cleanup EXIT INT TERM
 SERIAL="$TMPDIR/serial.log"
 TRACE_LOG="$TMPDIR/qemu-trace.log"
 TRACE_PCS="$TMPDIR/trace-pcs.txt"

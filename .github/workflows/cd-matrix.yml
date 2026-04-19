@@ -164,3 +164,22 @@ jobs:
         env:
           TRACE: ${{ matrix.trace }}
         run: ./tooling/tracer_bullet/run_local.sh ${{ matrix.arch }} ${{ matrix.platform }}
+
+      # Explicit cleanup: remove build trees and any temp state that
+      # might outlive the step. if:always() so this still fires when a
+      # previous step failed. GitHub-hosted runners are ephemeral, but
+      # this is also the contract for anyone copying the workflow onto
+      # a self-hosted runner, where persistence WOULD leak.
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "=== cleanup ==="
+          rm -rf build/ arch/*/build/
+          # run_local.sh's own mktemp -d is already handled by its trap,
+          # but be explicit in case a future refactor changes that.
+          find /tmp -maxdepth 1 -name 'fireasm-*' -user "$USER" \
+              -exec rm -rf {} + 2>/dev/null || true
+          find /tmp -maxdepth 1 -name 'tmp.*' -user "$USER" \
+              -newer /etc/hostname -mmin -60 \
+              -exec rm -rf {} + 2>/dev/null || true
+          echo "cleanup done"
