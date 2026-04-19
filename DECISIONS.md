@@ -883,6 +883,162 @@ tracer-bullet bring-up.
 against the published checksum, and does a final `firecracker --version`
 sanity check on the Pi post-install.
 
+## 2026-04-19
+
+### D038: L2 implementation methodology
+
+**Decision:** L2 (Ethernet/MAC layer) — and by extension every subsequent
+protocol layer — follows this fixed sequence. No skipping forward; no
+mixing stages for the same layer.
+
+1. **Requirements gather.** Extract conformance requirements from IEEE
+   802.3/802.1 and relevant IETF RFCs into a tracking document that
+   lives at `docs/l2/REQUIREMENTS.md` (analogous in spirit to
+   `DECISIONS.md`). Each requirement gets an ID, a citation, and a
+   status column: `spec` / `tested` / `implemented` / `deviation`.
+   Arch-neutral — x86_64 and AArch64 share this doc.
+2. **Design note.** Short architecture document at
+   `docs/l2/DESIGN.md` covering: VMIO state/transition tables, buffer
+   lifecycle, latency budget (see D039 family below), re-entrancy /
+   atomicity ACL, DMA/cache-coherence model per arch, VLAN scope,
+   observability hook contract. Test plan references concrete design
+   decisions here rather than inventing them line-by-line.
+3. **Test plan.** Behavioral (happy-path) tests first, per the
+   Testability rule in `~/.claude/CLAUDE.md`. Each test cross-
+   references a requirement ID.
+4. **Functional implementation.** x86_64 first (per Ed, 2026-04-19).
+   Assembly follows the design doc; deviations from the design doc
+   update the design doc in the same commit.
+5. **Adversarial.** Fuzz the wire boundary before performance work —
+   malformed frames, runts, giants, bad FCS, crafted VLAN stacks, ARP
+   flood, preamble attacks. Automated in CI as a gating step once in
+   place.
+6. **Interop matrix.** At least: Linux mainline netdev, FreeBSD, OVS,
+   one enterprise switch (Cisco or Juniper sample). Not exhaustive —
+   representative.
+7. **Performance measurement.** Only after 3–6 are green. Measure
+   cycles/frame, cache misses, pipeline stalls (OSACA predictions vs.
+   `-icount` actuals vs. hardware PMC actuals).
+8. **Second arch (AArch64).** Same sequence top-to-bottom. Design doc
+   and requirements doc are *extended*, not forked.
+9. **Production deployment.** After both arches complete. See D041.
+
+**Why codified:** each stage catches a different class of bug. Skipping
+adversarial because "we have unit tests" ships a parser that segfaults
+on a runt. Skipping interop because "the packet looks right to us"
+ships a NIC that nobody can plug into. The order is load-bearing.
+
+### D039: L2 design-doc must explicitly state these five properties
+
+**Decision:** The L2 design doc (`docs/l2/DESIGN.md`, per D038) must
+state, upfront, each of the following — absence is a review-blocking
+bug in the doc, not a runtime surprise to fix later.
+
+1. **Latency and throughput budget.** A concrete target in
+   cycles/frame (or ns/frame) at a stated link speed. "World-class"
+   is not measurable; `sub-400 ns per 64-byte frame at 10 Gbps, single
+   vCPU` is. Set before writing assembly.
+2. **DMA and cache-coherence model.** On x86_64 the virtio rings are
+   coherent-by-default; on AArch64 explicit `dsb`/`dmb` placement is
+   correctness-critical. Document the model once per arch. Do not
+   discover this late.
+3. **VMIO re-entrancy / atomicity ACL.** Astier FSA is thread-free
+   (per D012), but interrupts / exception dispatch can still arrive
+   mid-handler. State which transitions are interruptible, which must
+   be atomic, and how the automaton re-syncs.
+4. **VLAN scope.** Which of 802.1Q, 802.1ad (Q-in-Q), 802.1Qau, 802.1Qbb
+   are in scope. Leaving out is a choice to make deliberately; the
+   product is aimed at enterprise deployments where VLAN is
+   table-stakes.
+5. **Observability hook contract.** How the hot path exposes
+   diagnostic state without tanking throughput. Zero-overhead when
+   disabled; bounded overhead when enabled. Ring-buffer tracing,
+   per-state-counters, sampling. Designed before assembly is written
+   around the hooks.
+
+**Test:** the design-doc review gate asks "does the doc state each of
+the five properties explicitly?" — yes/no per property.
+
+### D040: Perf regression ratchet — baselines per cell
+
+**Decision:** After L2 functional passes, establish per-cell
+performance baselines that ratchet the same way branch-cov's
+`tooling/branch_cov/baselines/<arch>-<platform>.txt` does today.
+A `tooling/perf/baselines/<arch>-<platform>.<metric>.txt` file pins
+the current measurement; CI fails on regression beyond a tolerance
+band.
+
+**Metrics initially in scope (all per L2 receive+transmit path):**
+- cycles/frame (measured via `perf stat` on hosted runners,
+  hardware PMCs on Pi 5)
+- L1d cache miss rate
+- branch-miss rate
+- instructions retired (for cross-cell sanity checks)
+
+**OSACA interplay:** OSACA's predicted throughput (the `CP` column)
+becomes a secondary baseline. A divergence between OSACA prediction
+and measured actuals is itself a signal — either OSACA's DB is
+missing an opcode, or the real hardware is doing something different
+from the microarch model. Ratchet on both. Don't silently accept a
+large predicted/actual gap.
+
+**Not yet decided:** tolerance band (±5%? ±2%? arch-dependent?).
+Deferred until we have five consecutive runs' worth of baseline noise
+to characterize.
+
+**Cost/benefit motivation:** cycles/frame is the only metric that
+separates "world-class" from "works." Measuring without ratcheting
+lets regressions slip in one %-point at a time until the compounding
+ships a product that is slow. Branch-cov's pattern worked — reuse it.
+
+### D041: Production deployment pipeline requirements
+
+**Decision:** The "real deployment" phase of the CD pipeline (unlocks
+per the trigger in
+`~/.claude/projects/-home-ed-fireasmserver/memory/project_cd_delivery_trigger.md`)
+must include the following capabilities before any production
+customer is onboarded. This is the "don't-put-this-off" list.
+
+1. **Failure injection.** Configurable fault modes — dropped packets,
+   reordered frames, corrupted FCS, allocator OOM, DMA stall. Injected
+   in CI and in pre-release testing. Chaos-engineering-style. Fail-fast
+   on regression, fail-loud on new failures.
+2. **Observability.** Hot-path ring-buffer tracing, per-state counters,
+   PMC sampling. Dumpable on fault. Compatible with the observability
+   hook contract mandated by D039.
+3. **Rollback confidence.** Every release is tag-pinned; rolling a
+   specific customer back to `vX.Y.Z` is a one-command operation.
+   Binary artifacts signed (see #6) and retained for at least the
+   support window.
+4. **Canary rollouts.** Percentage-based traffic split at the fly.io /
+   Kata / EC2 level. Canary population observed with separate metrics;
+   automatic rollback on threshold breach.
+5. **Graceful drain.** Existing connections terminate cleanly on
+   rolling deploy. Requires a drain protocol designed in; cannot be
+   retrofitted.
+6. **Backpressure + circuit breakers.** What happens when L2 can't
+   keep up with offered load. Silent drops are the enemy; explicit
+   backpressure signaling upstream is the answer.
+7. **Deterministic replay.** When something breaks in prod, we can
+   reconstruct what the automaton saw. Ring-buffer trace + state dump
+   on fault, retrievable post-incident.
+8. **Signed release artifacts + SBOM + SLSA attestation.** cosign
+   signatures on every release, syft-generated SBOM, SLSA L3 build
+   provenance (GitHub's `actions/attest-build-provenance` gets us
+   most of the way). Required for regulated OEM markets per the
+   market notes.
+
+**Sequencing:** same "functional before perf" pattern. Failure
+injection and observability first — if we can't see what's
+happening, perf numbers lie. Rollback and canary next — they
+presuppose signed, retained artifacts. Graceful drain, backpressure,
+replay follow. All eight before first paying customer.
+
+**Not yet decided:** tenancy model (single-tenant VM per customer vs.
+multi-tenant per microVM), blast-radius containment at the microVM
+level, cross-region coordination for fly.io. Defer to the deployment-
+phase trigger.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
