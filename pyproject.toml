@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
 dependencies = [
     "pydantic>=2.0",
+    "capstone>=5.0",
+    "pyelftools>=0.31",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +24,7 @@ dev = [
 
 [project.scripts]
 qemu-harness = "qemu_harness.cli:main"
+branch-cov = "branch_cov.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["tooling/src"]
@@ -36,6 +39,21 @@ strict = true
 [tool.pytest.ini_options]
 testpaths = ["tooling/tests"]
 pythonpath = ["tooling/src"]
+
+[tool.coverage.run]
+# __main__.py is tested by subprocess in test_branch_cov_cli.py, but
+# coverage.py doesn't track subprocess invocations by default — and the
+# module is pure entry-point scaffolding (imports + sys.exit(main())),
+# with all real logic in cli.py. Omitting keeps the 100% target honest.
+omit = [
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
 
 [tool.pylint.main]
 rcfile = ".pylintrc"

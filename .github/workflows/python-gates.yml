@@ -28,9 +28,9 @@ jobs:
       - name: flake8
         run: flake8 tooling/src/ tooling/tests/
       - name: mypy
-        run: mypy --strict tooling/src/qemu_harness/
+        run: mypy --strict tooling/src/qemu_harness/ tooling/src/branch_cov/
       - name: pylint
-        run: pylint --rcfile=.pylintrc tooling/src/qemu_harness/
+        run: pylint --rcfile=.pylintrc tooling/src/qemu_harness/ tooling/src/branch_cov/
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
@@ -47,4 +47,4 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - run: pip install -e ".[dev]"
-      - run: pytest --cov=qemu_harness --cov-branch --cov-report=term-missing -q
+      - run: pytest --cov=qemu_harness --cov=branch_cov --cov-branch --cov-report=term-missing -q

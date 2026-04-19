@@ -93,8 +93,13 @@ _entry:
     wfe
     b       .Ldone
 
+.section .rodata, "a"
+// Kept out of .text so a branch-coverage disassembler doesn't have to
+// decode the string bytes as instructions. The stub's `adr` loads the
+// address regardless of section; the linker resolves across sections.
 ready_msg:
     .ascii  "READY\n"
 ready_msg_end:
 
+.section .text, "ax"
 _image_end:
