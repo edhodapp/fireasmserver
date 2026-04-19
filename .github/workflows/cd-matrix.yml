@@ -200,7 +200,7 @@ jobs:
       - name: CRC-32 IEEE vector test
         run: |
           if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            make -C tooling/crypto_tests test-x86 CC_X86=gcc
+            make -C tooling/crypto_tests test-x86_64 CC_X86=gcc
           elif [ "${{ matrix.runner }}" = "ubuntu-24.04-arm" ]; then
             make -C tooling/crypto_tests test-aarch64 \
                  CC_AARCH=gcc QEMU_AARCH64=

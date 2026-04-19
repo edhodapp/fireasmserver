@@ -38,11 +38,11 @@ LDFLAGS_AARCH := -static
 SRCS := crc32_test.c
 HDRS := vectors.h
 
-.PHONY: all build-x86 build-aarch64 test test-x86 test-aarch64 clean
+.PHONY: all build-x86_64 build-aarch64 test test-x86_64 test-aarch64 clean
 
 all: $(X86_BIN) $(AARCH_BIN)
 
-build-x86: $(X86_BIN)
+build-x86_64: $(X86_BIN)
 
 build-aarch64: $(AARCH_BIN)
 
@@ -61,9 +61,9 @@ $(AARCH_BIN): $(SRCS) $(HDRS) $(AARCH_OBJ) | $(BUILD_DIR)/aarch64
 $(BUILD_DIR)/x86_64 $(BUILD_DIR)/aarch64:
 	mkdir -p $@
 
-test: test-x86 test-aarch64
+test: test-x86_64 test-aarch64
 
-test-x86: $(X86_BIN)
+test-x86_64: $(X86_BIN)
 	$(X86_BIN)
 
 test-aarch64: $(AARCH_BIN)

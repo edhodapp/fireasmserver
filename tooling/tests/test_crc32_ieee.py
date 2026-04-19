@@ -45,11 +45,21 @@ def _skip_if_missing(arch: str) -> None:
 
 
 def _run_driver(make_target: str) -> subprocess.CompletedProcess[str]:
+    # timeout=60 — the native-gcc build + test usually completes in under
+    # a second; 60s is generous enough for a cross-gcc + qemu-user path
+    # on a slow runner, tight enough that an infinite loop in the asm
+    # doesn't hang the test suite indefinitely.
+    # errors="backslashreplace" — if the driver or make emits non-UTF-8
+    # bytes (crash dump, localized strings), we preserve the output as
+    # lossless escape sequences rather than raising UnicodeDecodeError
+    # and masking the real failure.
     return subprocess.run(
         ["make", "-s", make_target],
         cwd=str(CRYPTO_TESTS_DIR),
         capture_output=True,
         text=True,
+        errors="backslashreplace",
+        timeout=60,
         check=False,
     )
 
@@ -57,7 +67,7 @@ def _run_driver(make_target: str) -> subprocess.CompletedProcess[str]:
 @pytest.mark.parametrize("arch", ["x86_64", "aarch64"])
 def test_crc32_ieee_802_3_vectors_pass(arch: str) -> None:
     _skip_if_missing(arch)
-    target = f"test-{'x86' if arch == 'x86_64' else 'aarch64'}"
+    target = f"test-{arch}"
     result = _run_driver(target)
     output = result.stdout + result.stderr
     assert result.returncode == 0, (
