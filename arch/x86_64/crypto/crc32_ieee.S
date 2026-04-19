@@ -353,8 +353,7 @@ global crc32_ieee_802_3_has_pclmulqdq
 ;
 ; eax is used (not edx) for the incoming accumulator so the caller
 ; can avoid a reg→reg MOV when handing one update's output to the
-; next update (per D047 lint: plain `mov <reg>, <reg>` triggers a
-; false positive; `lea` is the accepted reg-copy idiom).
+; next update.
 align 16
 _crc32_update_slice8:
     test    rsi, rsi
@@ -362,11 +361,11 @@ _crc32_update_slice8:
     lea     r11, [crc32_table_slice8]
     cmp     rsi, 8
     jb      .upd_tail
-    lea     rcx, [rdi]                ; preserve rdi (LEA reg-copy)
-    lea     r10, [rsi]
+    mov     rcx, rdi                  ; preserve rdi across the fold loop
+    mov     r10, rsi
 .upd_fold8:
     mov     rdx, [rcx]
-    lea     r9d, [rax]                ; zero-extend eax into r9 low 32
+    mov     r9d, eax                  ; zero-extend eax into r9
     xor     rdx, r9
 
     movzx   r8d, dl
@@ -396,8 +395,8 @@ _crc32_update_slice8:
     sub     r10, 8
     cmp     r10, 8
     jae     .upd_fold8
-    lea     rdi, [rcx]                ; restore external rdi/rsi
-    lea     rsi, [r10]
+    mov     rdi, rcx                  ; restore external rdi/rsi
+    mov     rsi, r10
 .upd_tail:
     test    rsi, rsi
     jz      .upd_done
@@ -511,7 +510,7 @@ crc32_ieee_802_3_has_pclmulqdq:
     push    rbx                       ; callee-saved, clobbered by cpuid
     mov     eax, 1
     cpuid
-    lea     eax, [rcx]                ; eax ← ecx (reg-copy via LEA)
+    mov     eax, ecx                  ; eax ← ecx
     shr     eax, 1
     and     eax, 1
     pop     rbx
@@ -532,7 +531,7 @@ crc32_ieee_802_3:
     push    rbx
     mov     eax, 1
     cpuid
-    lea     r11d, [rcx]               ; r11 ← ecx (reg-copy via LEA)
+    mov     r11d, ecx                 ; r11 ← ecx
     pop     rbx
     test    r11d, 2                   ; PCLMULQDQ = ECX bit 1
     jnz     crc32_ieee_802_3_pclmulqdq
