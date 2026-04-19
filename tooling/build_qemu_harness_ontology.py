@@ -17,6 +17,7 @@ from ontology import (
     FunctionSpec,
     ModuleSpec,
     Ontology,
+    PerformanceConstraint,
     Property,
     PropertyType,
     Relationship,
@@ -184,6 +185,106 @@ test_result = Entity(
     ],
 )
 
+# Perf-budget anchor entities. Each exists so a
+# PerformanceConstraint can reference a concrete thing that owns
+# the budget, per D049's first-class-referents rule.
+
+fsa_transition = Entity(
+    id="fsa-transition",
+    name="FSATransition",
+    description=(
+        "A single state transition in an FSA automaton under "
+        "D043's runtime model. One transition is the unit "
+        "against which FSA_TRANSITION_BUDGET_NS is enforced: "
+        "handler-body execution plus dispatch bookkeeping."
+    ),
+    properties=[
+        Property(
+            name="from_state",
+            property_type=PropertyType(kind="int"),
+            description="Current state index before the transition.",
+        ),
+        Property(
+            name="event_code",
+            property_type=PropertyType(kind="int"),
+            description="Event that triggered the transition.",
+        ),
+        Property(
+            name="to_state",
+            property_type=PropertyType(kind="int"),
+            description="State index the automaton moves to.",
+        ),
+    ],
+)
+
+ethernet_frame = Entity(
+    id="ethernet-frame",
+    name="EthernetFrame",
+    description=(
+        "A single Ethernet II frame crossing the L2 boundary. "
+        "Per ETH-001..ETH-005, fixed 14-byte header + 46..1500 "
+        "payload + 4-byte FCS. The unit against which the L2 "
+        "throughput budgets (1 Gbps floor, 10 Gbps target per "
+        "D040) are enforced on both RX and TX paths."
+    ),
+    properties=[
+        Property(
+            name="length",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Total frame length including header and FCS, in "
+                "bytes. 64..1518 untagged, 64..1522 with VLAN."
+            ),
+        ),
+        Property(
+            name="ether_type",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Big-endian 16-bit EtherType (≥ 0x0600) or "
+                "802.3 length (< 0x0600; out of scope per "
+                "ETH-002)."
+            ),
+        ),
+    ],
+)
+
+observability_event_site = Entity(
+    id="observability-event-site",
+    name="ObservabilityEventSite",
+    description=(
+        "A single OBS_EMIT macro instance in the runtime code. "
+        "Each site bears a fixed cost when observability is "
+        "disabled, a slightly higher cost when enabled but "
+        "category-gated-off, and the intrinsic emission cost "
+        "when both verbosity and category pass. Per the "
+        "observability proposal (docs/observability.md, "
+        "pre-D050) and D046's assembly-deferral bar, the "
+        "disabled-path cost must stay inside a tight budget "
+        "so shipping observability everywhere doesn't erode "
+        "the L2 frame-rate target."
+    ),
+    properties=[
+        Property(
+            name="category",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "Category name: core / uart / virtio / fsa / "
+                "eth / arp / ip / tcp / http / timer / "
+                "perf_sample / reserved."
+            ),
+        ),
+        Property(
+            name="min_level",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Lowest verbosity level at which this site "
+                "emits (0=off, 1=error, 2=warn, 3=info, "
+                "4=debug, 5=trace)."
+            ),
+        ),
+    ],
+)
+
 # -- Problem Domain: Relationships --
 
 boots_rel = Relationship(
@@ -284,6 +385,156 @@ constraints = [
             "from different threads is a real scenario."
         ),
         entity_ids=["vm-instance"],
+    ),
+]
+
+# -- Problem Domain: Performance Constraints --
+#
+# Quantitative budgets with first-class numeric data. Each row
+# pairs a metric identifier (what the measurement harness emits)
+# with a numeric budget, a comparison direction, a measurement
+# source, and a status in the spec/tested/implemented lifecycle.
+# The audit tool (future O3) will correlate metric names here
+# against emitted samples and flag out-of-budget behaviour.
+#
+# Status legend:
+#   spec        — budget written down; no impl or measurement yet
+#   tested      — impl + at least one measurement; not every
+#                 derived case closed
+#   implemented — full coverage; under verification the system
+#                 satisfies direction(budget)
+#   deviation   — system does NOT satisfy the constraint
+#   n_a         — scoped out for the current profile
+
+performance_constraints = [
+    PerformanceConstraint(
+        name="fsa-transition-budget",
+        description=(
+            "A single FSA transition (handler-body plus "
+            "dispatch bookkeeping) MUST complete within the "
+            "budget. The target is tight because real code "
+            "paths that land on the L2 hot path ride on top of "
+            "the FSA engine, and blown transition budgets "
+            "compound across every derived driver."
+        ),
+        entity_ids=["fsa-transition"],
+        metric="fsa_transition_ns",
+        budget=100.0,
+        unit="ns",
+        direction="max",
+        measured_via=(
+            "OSACA static analysis per handler + runtime perf "
+            "ratchet once FSA engine lands (D040 baseline TBD)."
+        ),
+        rationale="D043 FSA runtime model, §FSA_TRANSITION_BUDGET_NS.",
+        implementation_refs=[],
+        verification_refs=[],
+        status="spec",
+    ),
+    PerformanceConstraint(
+        name="l2-frame-rate-floor",
+        description=(
+            "Minimum sustained L2 throughput at which the "
+            "system must remain correct and non-lossy. Floor "
+            "is the gating line for the first release; missing "
+            "this is an SEV-0-class regression."
+        ),
+        entity_ids=["ethernet-frame"],
+        metric="l2_throughput_bps",
+        budget=1_000_000_000.0,
+        unit="bps",
+        direction="min",
+        measured_via=(
+            "End-to-end synthetic-traffic run under the pre-"
+            "push integration suite once L2 TX/RX paths are "
+            "wired; OSACA per hot instruction window meanwhile."
+        ),
+        rationale=(
+            "D040 perf-regression ratchet; docs/l2/DESIGN.md §2 "
+            "Latency/Throughput targets."
+        ),
+        implementation_refs=[],
+        verification_refs=[],
+        status="spec",
+    ),
+    PerformanceConstraint(
+        name="l2-frame-rate-target",
+        description=(
+            "Target sustained L2 throughput for the shipping "
+            "product. 10 Gbps translates to ~67 ns per "
+            "1518-byte frame on the hot path, which is the "
+            "budget every cross-cutting feature (CRC, barriers, "
+            "observability, VLAN handling) must fit inside."
+        ),
+        entity_ids=["ethernet-frame"],
+        metric="l2_throughput_bps",
+        budget=10_000_000_000.0,
+        unit="bps",
+        direction="min",
+        measured_via=(
+            "Same harness as l2-frame-rate-floor; target is "
+            "compared against measured sustained rate under a "
+            "1518-byte maximum-frame workload."
+        ),
+        rationale=(
+            "D040 perf-regression ratchet; docs/l2/DESIGN.md §2."
+        ),
+        implementation_refs=[],
+        verification_refs=[],
+        status="spec",
+    ),
+    PerformanceConstraint(
+        name="obs-disabled-path-budget",
+        description=(
+            "An OBS_EMIT event site whose verbosity gate is "
+            "OFF must add no more than this many cycles to "
+            "the hot path. Enables shipping observability "
+            "everywhere without eroding frame-rate budgets."
+        ),
+        entity_ids=["observability-event-site"],
+        metric="obs_disabled_path_cycles",
+        budget=5.0,
+        unit="cycles",
+        direction="max",
+        measured_via=(
+            "OSACA port-pressure analysis on the OBS_EMIT "
+            "macro expansion with verbosity gate asserting "
+            "not-taken; cross-checked with a tight-loop "
+            "microbenchmark once the macro lands."
+        ),
+        rationale=(
+            "docs/observability.md pre-D050 proposal; derived "
+            "from frame-rate-target budget math at 10 Gbps."
+        ),
+        implementation_refs=[],
+        verification_refs=[],
+        status="spec",
+    ),
+    PerformanceConstraint(
+        name="obs-category-gated-budget",
+        description=(
+            "An OBS_EMIT event site whose verbosity gate is "
+            "ON but category bitmask is off must add no more "
+            "than this many cycles. Slightly looser than the "
+            "disabled-path budget because it performs one "
+            "additional load + bit-test."
+        ),
+        entity_ids=["observability-event-site"],
+        metric="obs_category_gated_cycles",
+        budget=8.0,
+        unit="cycles",
+        direction="max",
+        measured_via=(
+            "Same harness as obs-disabled-path-budget, with "
+            "verbosity gate asserting taken and category "
+            "bitmask asserting not-taken."
+        ),
+        rationale=(
+            "docs/observability.md pre-D050 proposal."
+        ),
+        implementation_refs=[],
+        verification_refs=[],
+        status="spec",
     ),
 ]
 
@@ -824,9 +1075,13 @@ ext_deps = [
 # -- Assemble and Save --
 
 ontology = Ontology(
-    entities=[guest_image, vm_instance, test_case, test_result],
+    entities=[
+        guest_image, vm_instance, test_case, test_result,
+        fsa_transition, ethernet_frame, observability_event_site,
+    ],
     relationships=[boots_rel, runs_against_rel, produces_rel],
     domain_constraints=constraints,
+    performance_constraints=performance_constraints,
     modules=[
         vm_launcher_mod, guest_builder_mod,
         test_runner_mod, cli_mod,

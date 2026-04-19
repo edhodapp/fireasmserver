@@ -16,18 +16,31 @@
 ;   zero-length = 0x00000000
 ;
 ; Paths:
-;   - crc32_ieee_802_3_pclmulqdq  — PCLMULQDQ fold-by-1 (fast path).
-;     Requires SSE2 + PCLMULQDQ. Fold-by-1 constants derived from
-;     x^128 mod P(x), x^192 mod P(x) in reflected form:
-;       K_hi33 = rev32(x^192 mod P) << 1 = 0x65673B46
-;       K_lo33 = rev32(x^128 mod P) << 1 = 0x140D44A2E
-;     The <<1 is the standard alignment adjustment from the pclmul
-;     bit-reversal identity. Final 128→32 reduction reuses the
-;     slicing-by-8 helper by treating the 128-bit state as 16 bytes
-;     of "message" with init CRC = 0.
-;   - crc32_ieee_802_3_slice8 — slicing-by-8 (fallback / small inputs).
+;   - crc32_ieee_802_3_pclmulqdq  — PCLMULQDQ fold-by-4 (fast path).
+;     Requires SSE2 + PCLMULQDQ. Four parallel 128-bit accumulators
+;     each advance 512 bits per main-loop iteration (64 bytes total
+;     consumed), hiding the 5–7 cycle PCLMULQDQ latency across the
+;     four chains. Constants verified and emitted by
+;     tooling/crypto_tests/derive_fold_constants.py:
+;       fold_by_4 main: rev32(x^576 mod P)<<1, rev32(x^512 mod P)<<1
+;       fold_by_1 pair: rev32(x^192 mod P)<<1, rev32(x^128 mod P)<<1
+;     The four accumulators start staggered 16 bytes apart and stay
+;     staggered after every main iteration (all four advance by the
+;     same amount), so the 4→1 reduction chain is three fold-by-1
+;     steps reusing the fold_by_1 pair. The final 128→32 reduction
+;     runs inline byte-at-a-time through the slice8 table — the
+;     inline form preserves rdi/rsi at their function-entry values
+;     (now pointing at the tail and its length), so the subsequent
+;     _crc32_update_slice8 call for the 0..63 byte tail needs no
+;     save/restore.
+;   - crc32_ieee_802_3_slice8 — slicing-by-8 (fallback / inputs < 64B).
 ;     Kounavis & Berry, Intel 2005. 8 KiB table; 8-byte main loop
-;     plus byte-at-a-time tail.
+;     plus byte-at-a-time tail. All inputs shorter than one fold-by-4
+;     chunk (64 bytes) are routed here — including the 16..63 range
+;     that a fold-by-1 fast path would have accelerated. The
+;     simplicity of one fallback boundary is worth the micro-loss
+;     on sub-minimum-Ethernet-frame inputs; the dominant payload
+;     sizes on the L2 hot path are ≥ 64 bytes.
 ;   - crc32_ieee_802_3 — dispatcher. Runtime CPUID check on
 ;     CPUID.01H:ECX[PCLMULQDQ=1]; tail-calls the appropriate path.
 ;     D034's `HAS_PCLMULQDQ` profile flag is the intended build-time
@@ -321,15 +334,27 @@ crc32_table_slice8:
     dd 0xff6b144a, 0x33c114d4, 0xbd4e1337, 0x71e413a9, 0x7b211ab0, 0xb78b1a2e, 0x39041dcd, 0xf5ae1d53
     dd 0x2c8e0fff, 0xe0240f61, 0x6eab0882, 0xa201081c, 0xa8c40105, 0x646e019b, 0xeae10678, 0x264b06e6
 
-; PCLMULQDQ fold-by-1 constants.
-; Layout (xmm at rip+crc32_pclmul_fold_constants):
-;   low  64 bits = K_hi33 = rev32(x^192 mod P) << 1  — multiplier for state_lo
-;   high 64 bits = K_lo33 = rev32(x^128 mod P) << 1  — multiplier for state_hi
+; PCLMULQDQ fold constants. Derived and verified by
+; tooling/crypto_tests/derive_fold_constants.py (run
+; `python3 tooling/crypto_tests/derive_fold_constants.py --fold-n 4`
+; to reproduce; --emit prints the blocks below verbatim after
+; verification). Each pair packs two 33-bit values into a 128-bit
+; xmm constant; layout:
+;   low  64 bits = K_hi (state_lo multiplier) = rev32(x^(N*128+64) mod P) << 1
+;   high 64 bits = K_lo (state_hi multiplier) = rev32(x^(N*128)    mod P) << 1
+; The <<1 absorbs the "pclmul result is one degree short" quirk
+; (Gopal et al., Intel 2009); the asm fold body adds the residual
+; x^32 alignment as an explicit `pslldq xmm, 4`.
 section .rodata.crc32_pclmul_consts
 align 16
-crc32_pclmul_fold_constants:
-    dq 0x0000000065673B46          ; K_hi33 (x^192 mod P, reflected)
-    dq 0x0000000140D44A2E          ; K_lo33 (x^128 mod P, reflected)
+crc32_pclmul_fold_by_4_constants:                   ; main loop, 512-bit advance
+    dq 0x00000000653D9822          ; rev32(x^576 mod P) << 1 — state_lo mult
+    dq 0x0000000111A288CE          ; rev32(x^512 mod P) << 1 — state_hi mult
+
+align 16
+crc32_pclmul_fold_by_1_constants:                   ; 4→1 reduction + tail
+    dq 0x0000000065673B46          ; rev32(x^192 mod P) << 1 — state_lo mult
+    dq 0x0000000140D44A2E          ; rev32(x^128 mod P) << 1 — state_hi mult
 
 ; ---------------------------------------------------------------
 ; Implementation
@@ -346,10 +371,11 @@ global crc32_ieee_802_3_has_pclmulqdq
 ;                               uint32_t crc_acc /* in eax */)
 ;   rdi = data, rsi = len, eax = crc_acc
 ;   returns eax = updated crc_acc (no final XOR)
-; Leaf; clobbers rax, rcx, rdx, rdi, rsi, r8-r11. Internal-only —
-; callers must stage rdi/rsi themselves if they need them after the
-; call. The 8-byte slicing main loop advances rdi by +len and ends
-; with rsi = 0; the byte tail leaves rdi at end-of-input and rsi = 0.
+; Leaf; clobbers rax, rcx, rdx, r8-r11. **Preserves rdi and rsi** —
+; the working pointer/length live in rcx/r10 for both the 8-byte
+; fold and the byte tail, so callers can compose two updates on the
+; same buffer or stage a state-then-tail pair without a per-call
+; save/restore (see crc32_ieee_802_3_pclmulqdq's reducer).
 ;
 ; eax is used (not edx) for the incoming accumulator so the caller
 ; can avoid a reg→reg MOV when handing one update's output to the
@@ -359,10 +385,10 @@ _crc32_update_slice8:
     test    rsi, rsi
     jz      .upd_done
     lea     r11, [crc32_table_slice8]
-    cmp     rsi, 8
+    mov     rcx, rdi                  ; working ptr (rdi preserved)
+    mov     r10, rsi                  ; working len (rsi preserved)
+    cmp     r10, 8
     jb      .upd_tail
-    mov     rcx, rdi                  ; preserve rdi across the fold loop
-    mov     r10, rsi
 .upd_fold8:
     mov     rdx, [rcx]
     mov     r9d, eax                  ; zero-extend eax into r9
@@ -395,18 +421,16 @@ _crc32_update_slice8:
     sub     r10, 8
     cmp     r10, 8
     jae     .upd_fold8
-    mov     rdi, rcx                  ; restore external rdi/rsi
-    mov     rsi, r10
 .upd_tail:
-    test    rsi, rsi
+    test    r10, r10
     jz      .upd_done
 .upd_byte:
-    movzx   r8d, byte [rdi]
+    movzx   r8d, byte [rcx]
     xor     r8b, al
     shr     eax, 8
     xor     eax, [r11 + r8*4]
-    inc     rdi
-    dec     rsi
+    inc     rcx
+    dec     r10
     jnz     .upd_byte
 .upd_done:
     ret
@@ -426,78 +450,130 @@ crc32_ieee_802_3_slice8:
     not     eax
     ret
 
+; Fold one 128-bit state register forward by the advance encoded in
+; the constant pair, then XOR in a new 16-byte chunk. The "advance"
+; is pair-dependent: fold-by-N pair advances by N*128 bits. Clobbers
+; its scratch argument.
+;
+; Args:
+;   %1 = state_xmm   (modified: receives the folded-and-chunked result)
+;   %2 = scratch_xmm (clobbered)
+;   %3 = const_xmm   (unchanged: fold pair; low 64 = K_hi, high 64 = K_lo)
+;   %4 = chunk_xmm   (unchanged: 16 bytes of new input or another state)
+%macro fold_chunk 4
+    movdqa      %2, %1
+    pclmulqdq   %1, %3, 0x00              ; state_lo × K_hi
+    pclmulqdq   %2, %3, 0x11              ; state_hi × K_lo
+    pslldq      %1, 4                     ; align (x^32 post-factor)
+    pslldq      %2, 4
+    pxor        %1, %2
+    pxor        %1, %4
+%endmacro
+
 ; uint32_t crc32_ieee_802_3_pclmulqdq(const void *data, size_t len)
-; PCLMULQDQ fold-by-1 fast path. Falls back to slicing-by-8 for
-; inputs shorter than 16 bytes (the minimum fold unit).
+; PCLMULQDQ fold-by-4 fast path (64 bytes / main-loop iteration).
+; Falls back to slicing-by-8 for inputs < 64 bytes (one fold chunk).
+;
+; Register map across the function:
+;   xmm0..xmm3      four parallel accumulators
+;   xmm4            fold constants (by-4 during main loop; by-1 in reduce)
+;   xmm5..xmm8      input chunks (loaded per main-loop iteration)
+;   xmm9..xmm12     per-accumulator scratches for the K_lo product
+;   rdi, rsi        preserved across _crc32_update_slice8 (#9 ABI);
+;                   on entry to .pc_tail they already point at the
+;                   tail bytes and tail length respectively, so no
+;                   save/restore is needed around the slice8 call
 align 16
 crc32_ieee_802_3_pclmulqdq:
-    cmp     rsi, 16
+    cmp     rsi, 64
     jae     .pc_main
-    ; Small input: just slice-by-8.
+    ; Small input (< one fold-by-4 chunk): delegate to slicing-by-8.
     jmp     crc32_ieee_802_3_slice8
+
 .pc_main:
-    ; Load first 16 bytes as 128-bit state, XOR 0xFFFFFFFF into low
-    ; 32 bits. That's the start-of-message init for reflected CRC.
-    movdqu  xmm0, [rdi]
+    ; Load 64 bytes as four parallel 128-bit accumulators.
+    movdqu  xmm0, [rdi + 0]
+    movdqu  xmm1, [rdi + 16]
+    movdqu  xmm2, [rdi + 32]
+    movdqu  xmm3, [rdi + 48]
+
+    ; XOR the reflected-CRC init (0xFFFFFFFF) into the low 32 bits
+    ; of the oldest accumulator. Per reflected-CRC convention this
+    ; is the start-of-message init.
     mov     eax, 0xFFFFFFFF
-    movd    xmm1, eax
-    pxor    xmm0, xmm1
-    add     rdi, 16
-    sub     rsi, 16
+    movd    xmm4, eax
+    pxor    xmm0, xmm4
 
-    movdqa  xmm2, [crc32_pclmul_fold_constants]
+    add     rdi, 64
+    sub     rsi, 64
 
-    cmp     rsi, 16
+    movdqa  xmm4, [crc32_pclmul_fold_by_4_constants]
+
+    cmp     rsi, 64
     jb      .pc_reduce
 
-    ; --- fold loop: 16 bytes per iteration ---
-    ; state' = (pclmul(state_lo, K_hi33) << 32)
-    ;       ^ (pclmul(state_hi, K_lo33) << 32)
-    ;       ^ new_16_bytes
-    ; We shift products left by 32 bits (pslldq by 4 bytes) — this is
-    ; the alignment factor that falls out of using low-33 constants
-    ; instead of high-64 constants. See file header derivation.
 .pc_fold_loop:
-    movdqu  xmm1, [rdi]               ; next 16 bytes
-    movdqa  xmm3, xmm0
-    pclmulqdq xmm3, xmm2, 0x00        ; state_lo × K_hi33
-    pslldq  xmm3, 4                   ; << 32 (byte-shift by 4)
-    movdqa  xmm4, xmm0
-    pclmulqdq xmm4, xmm2, 0x11        ; state_hi × K_lo33
-    pslldq  xmm4, 4
-    pxor    xmm3, xmm4
-    pxor    xmm3, xmm1
-    movdqa  xmm0, xmm3
-    add     rdi, 16
-    sub     rsi, 16
-    cmp     rsi, 16
+    movdqu      xmm5, [rdi + 0]
+    movdqu      xmm6, [rdi + 16]
+    movdqu      xmm7, [rdi + 32]
+    movdqu      xmm8, [rdi + 48]
+    fold_chunk  xmm0, xmm9,  xmm4, xmm5
+    fold_chunk  xmm1, xmm10, xmm4, xmm6
+    fold_chunk  xmm2, xmm11, xmm4, xmm7
+    fold_chunk  xmm3, xmm12, xmm4, xmm8
+    add     rdi, 64
+    sub     rsi, 64
+    cmp     rsi, 64
     jae     .pc_fold_loop
 
 .pc_reduce:
-    ; Reduce 128-bit state to 32-bit CRC by running the slicing-by-8
-    ; byte loop on the 16 state bytes with init crc = 0, then on the
-    ; remaining 0..15 tail bytes.
-    ;
-    ; Stack frame layout (rsp-relative, 16-byte aligned):
-    ;   [rsp + 0]  .. [rsp + 15]  state bytes
-    ;   [rsp + 16] .. [rsp + 23]  saved tail ptr
-    ;   [rsp + 24] .. [rsp + 31]  saved tail len
-    ;   [rsp + 32] .. [rsp + 39]  padding
-    sub     rsp, 40                   ; caller's rsp & 0xF = 8, now 0
-    movdqu  [rsp], xmm0
-    mov     [rsp + 16], rdi
-    mov     [rsp + 24], rsi
+    ; After the main loop the four accumulators remain staggered 16
+    ; bytes apart (each advanced by 512 bits per iteration, so the
+    ; initial 16-byte stagger survives). Fold 4→1 with three
+    ; fold-by-1 steps; xmm0 accumulates the combined state.
+    movdqa      xmm4, [crc32_pclmul_fold_by_1_constants]
+    fold_chunk  xmm0, xmm9, xmm4, xmm1
+    fold_chunk  xmm0, xmm9, xmm4, xmm2
+    fold_chunk  xmm0, xmm9, xmm4, xmm3
 
-    xor     eax, eax                  ; init crc = 0 for state reduction
-    lea     rdi, [rsp]
-    mov     rsi, 16
-    call    _crc32_update_slice8      ; eax ← crc after state bytes
+    ; Reduce the 128-bit state to a 32-bit CRC inline, byte-at-a-time
+    ; through the slice8 table. Done inline rather than via a nested
+    ; slice8 call so that rdi/rsi stay at their post-fold values
+    ; (tail pointer and tail length) — the subsequent slice8 call
+    ; for the 0..63 byte tail can then run with no save/restore.
+    movq    r9, xmm0                  ; low 64 bits of state
+    psrldq  xmm0, 8                   ; shift high 64 into low
+    movq    r10, xmm0                 ; high 64 bits (now in low half)
+    xor     eax, eax                  ; init crc = 0
+    lea     r11, [crc32_table_slice8]
 
-    mov     rdi, [rsp + 16]
-    mov     rsi, [rsp + 24]
-    call    _crc32_update_slice8      ; eax (carried over) ← crc after tail
+    mov     ecx, 8
+.pc_state_lo:
+    movzx   r8d, r9b
+    xor     r8b, al
+    shr     eax, 8
+    xor     eax, [r11 + r8*4]
+    shr     r9, 8
+    dec     ecx
+    jnz     .pc_state_lo
 
-    add     rsp, 40
+    mov     ecx, 8
+.pc_state_hi:
+    movzx   r8d, r10b
+    xor     r8b, al
+    shr     eax, 8
+    xor     eax, [r11 + r8*4]
+    shr     r10, 8
+    dec     ecx
+    jnz     .pc_state_hi
+
+    ; eax holds the CRC of the 16 state bytes with init 0; rdi/rsi
+    ; are unchanged from the end of the fold loop (tail ptr / len).
+    ; _crc32_update_slice8 preserves rdi/rsi (#9), so a bare CALL
+    ; suffices; rsp needs a one-slot padding to stay 16-aligned.
+    sub     rsp, 8
+    call    _crc32_update_slice8
+    add     rsp, 8
     not     eax                       ; final XOR with 0xFFFFFFFF
     ret
 
