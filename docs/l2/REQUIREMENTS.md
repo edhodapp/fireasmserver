@@ -61,7 +61,7 @@ Scope-defining decisions landed and cross-referenced from here:
 | `ETH-002` | EtherType ≥ `0x0600` identifies Ethernet II; smaller values are 802.3 Length + LLC header. We support Ethernet II only. | 802.3-2018 §3.2.6, RFC 894 | spec | LLC/SNAP (RFC 1042) out of scope. |
 | `ETH-003` | Minimum frame size: 64 bytes including FCS (512 bit-times). | 802.3-2018 §3.2.7 | spec | Relaxed to 60 if driver strips FCS. |
 | `ETH-004` | Maximum frame size: 1518 bytes untagged, 1522 with one VLAN tag. | 802.3-2018 §3.2.7 | spec | Jumbo-frame rules tracked separately. |
-| `ETH-005` | FCS = CRC-32 over DA..payload, polynomial `0xedb88320` reflected. | 802.3-2018 §3.2.9 | spec | Virtio-net typically offloads FCS. |
+| `ETH-005` | FCS = CRC-32 over DA..payload, polynomial `0xedb88320` reflected. | 802.3-2018 §3.2.9 | implemented | Primitive at `arch/{x86_64,aarch64}/crypto/crc32_ieee.S`; tested against IEEE 802.3 / zlib vectors via `tooling/tests/test_crc32_ieee.py`. x86_64 uses PCLMULQDQ fold-by-1 when available, slicing-by-8 fallback; AArch64 uses FEAT_CRC32 native. L2 TX path still needs to wire in `bswap32`/complement conversion for on-the-wire FCS. Virtio-net typically offloads FCS. |
 | `ETH-006` | MUST accept broadcast DA `FF:FF:FF:FF:FF:FF`. | 802.3-2018 §4.2.2 | spec | |
 | `ETH-007` | MUST accept multicast DA (group-bit-set) matching configured filter set. | 802.3-2018 §4.2.2 | spec | Virtio-net multicast MAC filter list. |
 | `ETH-008` | MUST accept unicast DA equal to the device's assigned MAC. | 802.3-2018 §4.2.2 | spec | |
