@@ -483,15 +483,86 @@ Same as the previous CRC briefing — nothing is relaxed for this work.
 
 ## Status (updated by side session at completion)
 
-- [ ] Constants derivation script + pytest coverage
-- [ ] NASM fold-by-N rewrite
-- [ ] CRC-32 host-side tests green after switch
-- [ ] Pre-push integration suite green
-- [ ] Commit SHAs: <fill in: C1, C2>
+- [x] Constants derivation script + pytest coverage
+- [x] NASM fold-by-N rewrite (fold-by-4 landed; #9 helper ABI cleanup
+      folded in)
+- [x] CRC-32 host-side tests green after switch — 264 lengths × 3
+      paths × cross-path equivalence, both arches
+- [x] Pre-push integration suite — CRC cell green; full pytest suite
+      green (633 passed, 0 failures); tracer-bullet boot cells not
+      run by this session (main session's tree has relevant in-flight
+      work)
+- [x] Commit SHAs:
+      - **C1 (script)**: `4fcfc3e` — derive_fold_constants.py +
+        test_derive_fold_constants.py, 361 tests, 100 % branch cov.
+      - **C1b (rename cleanup)**: `da98b0d` — rename fold_step
+        locals to match FoldPair field roles (post-C1 clean-Claude
+        review finding).
+      - **C2 (asm fold-by-4 + #9)**: *entangled into `b655543`* —
+        the main session's ontology(O3) commit absorbed the staged
+        `arch/x86_64/crypto/crc32_ieee.S` file while my background
+        `git commit` was waiting on its Gemini hook. The asm
+        content is correct and in the tree (verified by grep for
+        fold-by-4 landmarks and constant hex literals); only the
+        commit attribution is wrong. Ed's disposition: leave
+        history as-is, move on (option 3 of surfaced choices).
 
 ### Deviations from briefing
 
-(Side session: fill this in at completion. Every deviation — fold-by-4
-downgraded to fold-by-2, Barrett reduction deferred, alignment
-pre-amble not attempted, etc. — gets a bullet with the reason, per
-the "track every requirements deviation" rule.)
+- **Exponent set for the constants.** Briefing hinted at
+  {512, 448, 384, 320, 192, 128} (six exponents, three pairs). The
+  delivered implementation uses **only {576, 512, 192, 128}** (two
+  pairs): fold-by-4 main-loop pair (x^576 / x^512) plus the
+  pre-existing fold-by-1 pair (x^192 / x^128) reused for the
+  three-step 4→1 reduction chain. Rationale: in the pclmul +
+  `pslldq 4` form this repo uses, N parallel accumulators start
+  staggered 16 bytes apart and *stay* staggered after every main-
+  loop iteration (all four advance simultaneously by N·128 bits),
+  so the reduction chain is all fold-by-1. Empirically verified
+  by C1's derivation script (312 test cases per fold factor vs.
+  zlib.crc32, zero mismatches). Worth codifying in DECISIONS.md
+  as a design note on "fold-by-N in pslldq-4 form reuses the
+  fold-by-1 reduction constants" — leaving that to the main
+  session's discretion.
+
+- **Small-input fallback.** Briefing said "len < one fold chunk
+  must fall through to slice8." Interpreted "one fold chunk" as
+  64 bytes (the fold-by-4 main-loop quantum). Result: the
+  previous fold-by-1 fast path for lengths in [16, 64) is gone;
+  those now route to slice8. Minor perf regression on sub-
+  minimum-Ethernet-frame CRC (ARP-size 60 B and similar); the
+  dominant L2 hot-path sizes are ≥ 64 B. Documented in the file
+  header.
+
+- **Barrett reduction deferred.** Briefing offered this as a
+  C3-class optimization. Not attempted — stayed with inline
+  byte-at-a-time state reduction through the slice8 T[0] column.
+  File header comment already tagged it as a future optimization.
+
+- **Alignment pre-amble not attempted.** Briefing called it
+  optional and performance-contingent. Left off; the existing
+  `movdqu` form tolerates misalignment with a small cache-line-
+  straddling penalty. Could be revisited when a perf measurement
+  actually shows it matters.
+
+- **#9 helper ABI cleanup taken on** (briefing listed it as
+  optional for this session). `_crc32_update_slice8` now
+  preserves `rdi` and `rsi` across its execution (working state
+  in `rcx` / `r10`). Combined with the inline state reduction,
+  eliminates the stack save/restore from the PCLMUL reducer
+  entirely. Main session's scope of #9 is now satisfied.
+
+### Observations for the main session
+
+- `_crc32_update_slice8`'s new contract ("preserves rdi/rsi")
+  is also the right contract for any future Barrett-reduction
+  tail handling. If / when C3 (Barrett) lands, it can reuse the
+  ABI without another helper rewrite.
+
+- Cross-session trunk-based coordination tripped once this
+  session: the asm file was absorbed into an unrelated commit
+  (`b655543`) during a concurrent `git commit` window. Root
+  cause is wide-net staging (`git add -A` / `git commit -a` vs.
+  explicit `git add <file>`). Worth making explicit staging a
+  convention when two sessions are active on the same tree —
+  low-friction fix, prevents recurrence.
