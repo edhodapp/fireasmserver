@@ -22,7 +22,15 @@ from ontology import (
     PropertyType,
     Relationship,
 )
-from ontology.dag import save_dag, save_snapshot
+from ontology.dag import (
+    git_snapshot_label,
+    load_dag,
+    save_dag,
+    snapshot_if_changed,
+)
+
+DAG_PATH = "tooling/qemu-harness.json"
+PROJECT_NAME = "fireasmserver-qemu-harness"
 
 # -- Problem Domain: Entities --
 
@@ -828,14 +836,24 @@ ontology = Ontology(
     external_dependencies=ext_deps,
 )
 
-dag = OntologyDAG(project_name="fireasmserver-qemu-harness")
-save_snapshot(dag, ontology, "post-review-v2")
-save_dag(dag, "tooling/qemu-harness.json")
+# D049: load-then-snapshot-if-changed, so running the builder on
+# unchanged content is a true no-op and consecutive runs don't
+# bloat the DAG with duplicate nodes. Snapshot label embeds the
+# current git SHA so each DAG generation traces back to a source
+# commit with `git show`.
+dag = load_dag(DAG_PATH, project_name=PROJECT_NAME)
+label = git_snapshot_label()
+_node_id, created = snapshot_if_changed(dag, ontology, label)
+save_dag(dag, DAG_PATH)
 
-print("Saved ontology DAG to tooling/qemu-harness.json")
+print(f"Saved ontology DAG to {DAG_PATH}")
 print(f"  Entities: {len(ontology.entities)}")
 print(f"  Relationships: {len(ontology.relationships)}")
 print(f"  Constraints: {len(ontology.domain_constraints)}")
+print(
+    f"  Performance constraints: "
+    f"{len(ontology.performance_constraints)}"
+)
 print(f"  Modules: {len(ontology.modules)}")
 print(
     f"  Functions: "
@@ -845,3 +863,8 @@ print(
     f"  Classes: "
     f"{sum(len(m.classes) for m in ontology.modules)}"
 )
+print(f"  DAG nodes: {len(dag.nodes)}")
+if created:
+    print(f"  Appended snapshot: {label}")
+else:
+    print("  No content change — snapshot skipped (idempotent)")

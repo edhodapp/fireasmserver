@@ -44,3 +44,27 @@ ModuleStatus = Literal[
 ]
 
 Priority = Literal["low", "medium", "high"]
+
+# Status legend for a SysE-style requirement:
+#   spec        — written down, not yet implemented or verified
+#   tested      — implementation plus at least one verification
+#                 method, but not every derived requirement closed
+#   implemented — full coverage; the system demonstrably satisfies
+#                 the constraint under its stated verification
+#   deviation   — the system does NOT satisfy the constraint as
+#                 stated; the rationale field explains why, and the
+#                 audit tool is expected to flag this row for human
+#                 review even though it's "tracked"
+#   n_a         — not applicable to the current platform profile /
+#                 configuration; retained in the ontology for
+#                 traceability against the originating decision
+RequirementStatus = Literal[
+    "spec", "tested", "implemented", "deviation", "n_a",
+]
+
+# Direction of a PerformanceConstraint's budget comparison.
+#   max   — measured value MUST be ≤ budget (latency, cycle count)
+#   min   — measured value MUST be ≥ budget (throughput, bandwidth)
+#   equal — measured value MUST equal budget exactly (rare; used for
+#           protocol-mandated constants like polynomial or magic)
+PerfDirection = Literal["max", "min", "equal"]

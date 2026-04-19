@@ -2,7 +2,7 @@
   "project_name": "fireasmserver-qemu-harness",
   "nodes": [
     {
-      "id": "f1036e3d-be30-4a85-8c84-6dd072b4f9d8",
+      "id": "1c03a47b-abe2-4c44-aaf3-408285ddebef",
       "ontology": {
         "entities": [
           {
@@ -220,7 +220,11 @@
               "guest-image",
               "vm-instance"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           },
           {
             "name": "clean-vm-kill",
@@ -228,7 +232,11 @@
             "entity_ids": [
               "vm-instance"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           },
           {
             "name": "host-side-verification",
@@ -237,7 +245,11 @@
               "test-case",
               "test-result"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           },
           {
             "name": "kvm-required-for-firecracker",
@@ -245,7 +257,11 @@
             "entity_ids": [
               "vm-instance"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           },
           {
             "name": "path-traversal-rejected",
@@ -254,7 +270,11 @@
               "guest-image",
               "vm-instance"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           },
           {
             "name": "blocked-qemu-args",
@@ -262,7 +282,11 @@
             "entity_ids": [
               "vm-instance"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           },
           {
             "name": "thread-safe-registry",
@@ -270,9 +294,14 @@
             "entity_ids": [
               "vm-instance"
             ],
-            "expression": ""
+            "expression": "",
+            "rationale": "",
+            "implementation_refs": [],
+            "verification_refs": [],
+            "status": "spec"
           }
         ],
+        "performance_constraints": [],
         "modules": [
           {
             "name": "vm_launcher",
@@ -913,11 +942,10 @@
         ],
         "open_questions": []
       },
-      "created_at": "2026-04-19T20:06:34.072602+00:00",
-      "label": "post-review-v2",
-      "integrity_hash": ""
+      "created_at": "2026-04-19T20:18:14.260132+00:00",
+      "label": "2026-04-19T20:18:14Z @294ae29+dirty"
     }
   ],
   "edges": [],
-  "current_node_id": "f1036e3d-be30-4a85-8c84-6dd072b4f9d8"
+  "current_node_id": "1c03a47b-abe2-4c44-aaf3-408285ddebef"
 }

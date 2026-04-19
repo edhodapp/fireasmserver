@@ -1545,6 +1545,141 @@ series):
 - `D003` (100% assembly) — unaffected; we're changing assemblers, not
   languages.
 
+### D049: Ontology as formal verifiable requirements — SysE-grade schema with preserved DAG history, git-cross-referenced
+
+**Decision (2026-04-19):** the ontology at `tooling/qemu-harness.json`
+(produced by `tooling/build_qemu_harness_ontology.py`) is the
+project's formal verifiable-requirements artifact, not a planning
+sketch. The **primary abstraction** is a **DAG of ontologies**:
+every DAG node is a complete ontology snapshot, every DAG edge
+carries a `Decision` record, and parallel designs coexist as
+first-class sibling branches rather than being tracked in separate
+documents.
+
+**Prior-art scope (checked 2026-04-19):** the base shape —
+node-is-ontology, edge-carries-decision, parallel-branches,
+navigation API — is already Ed's own public prior art via
+`github.com/edhodapp/python-agent` (BSD-3-Clause, first commit
+2026-03-31). This decision carries forward that shape into
+fireasmserver rather than claiming novelty over it. The
+fireasmserver-specific additions — (a) embedding the git HEAD
+SHA into snapshot labels, (b) idempotent content-hash-gated
+snapshot append so no-op re-runs don't pollute the DAG, (c)
+SysE traceability fields on `DomainConstraint` (rationale,
+implementation_refs, verification_refs, status), (d)
+`PerformanceConstraint` type with first-class numeric budget +
+direction + measurement method, (e) the specific application
+framing as formal verifiable requirements for a real
+systems-engineering artifact — are the parts not in the
+upstream. Whether that combination is meaningfully novel
+against the broader literature we have not exhaustively
+searched; treat the framing as "a useful composition" rather
+than "a breakthrough" when discussing externally.
+
+Standard SysE requirements-management tooling (DOORS, Rational,
+Polarion, linear baseline docs) doesn't natively offer the DAG
+branching + Decision-annotated forks combination either, so the
+shape remains a differentiator against that class of tools even
+after acknowledging the python_agent prior art — the
+application-to-SysE is what's being done newly here, not the
+DAG primitive itself.
+
+Two related sub-decisions:
+
+1. **SysE-grade schema.** `DomainConstraint` grows first-class
+   traceability fields — `rationale` (decision pointer or
+   requirement-row ID), `implementation_refs` (list of
+   `file:symbol` strings), `verification_refs` (list of
+   test/measurement/gate pointers), `status` (one of `spec`,
+   `tested`, `implemented`, `deviation`, `n_a`). A new
+   `PerformanceConstraint` type carries quantitative budgets as
+   first-class numeric data (`metric`, `budget`, `unit`,
+   `direction`, `measured_via`) rather than string-encoding them
+   in description text.
+
+2. **Preserved DAG history cross-referenced to git, with
+   first-class support for parallel designs.** The builder loads
+   the existing DAG on each run and appends a snapshot **only
+   when the ontology content actually changed** (content hash
+   compared against the selected parent node's ontology hash).
+   Each new snapshot label embeds the git HEAD SHA plus a
+   `dirty` marker if the working tree is dirty, so an auditor
+   can locate the source context for any DAG generation with a
+   single `git show` and can locate the DAG generation for any
+   commit by walking the snapshot labels.
+
+   **The DAG is not just a linear history.** Its branching
+   structure is the point: multiple design explorations can
+   coexist as sibling branches off the same parent. Each `DAGEdge`
+   carries a `Decision` record that captures the question / options
+   / choice / rationale for that fork, so an auditor reading a
+   branched DAG sees not just "what did the ontology look like at
+   node X" but "why did we fork here, what alternatives were we
+   weighing." That lets us keep multiple designs in play at once —
+   a baseline and an experimental refactor, two perf-budget
+   scenarios, a conservative and an aggressive variant — and
+   always have every variant at our fingertips for comparison.
+   The branching API itself is inherited from python_agent per
+   the prior-art scope above; what's done newly here is applying
+   it to formal SysE requirements rather than agent planning.
+
+   **Git preserves source-level history** with diff granularity;
+   the **pydantic DAG preserves graph-of-constraints evolution**
+   with structural granularity *and* parallel-design multiplicity.
+   Complementary coverage of three dimensions: source changes
+   (git), graph-shape changes (DAG), and alternative-design
+   multiplicity (DAG branching).
+
+**Why:**
+
+- **External SysE expert review** is planned post-first-release
+  (`project_sysengineering_expert_review.md`). Ad-hoc description
+  text is not defensible as formal requirements; first-class
+  traceability is.
+- **D046 (assembly-deferral bar)** — SysE formalism reshapes how
+  every new constraint is authored. Retrofitting across hundreds
+  of future rows is not viable; the schema must be right at first
+  iteration.
+- **Can't measure what you can't see, can't fix what you can't
+  measure** (Ed, 2026-04-19). Perf constraints pinned as first-class
+  numeric data make the measurement-vs-budget gap surfaceable by a
+  single audit tool; description-text budgets do not.
+- **History preservation** — a single snapshot destroys the
+  evolution record. For external review, "how did we arrive at
+  this constraint set" is as material as "what is the current
+  constraint set." Git alone can't show the graph-structural
+  delta; the pydantic DAG gives us that dimension.
+
+**Not in this decision's scope** (separate D-entries as they land):
+
+- The **audit tool** that reads the ontology + the repo + the
+  perf-ratchet artifacts and emits a requirement → impl →
+  verification matrix with gap flags. Drafted as `O5` in the
+  commit series; will get its own D-entry once it stabilizes.
+- **Schema extensions beyond the ones above** (e.g., attaching
+  `status` and verification_refs to `Property` or `ModuleSpec`).
+  Add as needed under this same decision's umbrella — not each a
+  new D-entry.
+- **Ontology forking from `python_agent`** — captured
+  in the O1 commit message and the fork docstrings; not a
+  decision-log-worthy choice on its own.
+
+**Cross-refs:**
+
+- `D040` — perf-regression ratchet. `PerformanceConstraint.budget`
+  values become the baselines the ratchet enforces once both are
+  wired together.
+- `D046` — assembly-deferral bar. Formal-requirements formalism is
+  the thing being "designed in first iteration" here.
+- `D043` — FSA runtime model. The `fsa_transition_ns` budget
+  (≤ 100 ns) is one of the first `PerformanceConstraint` entries
+  under this schema.
+- `docs/observability.md` — that proposal's status renumbers from
+  "pre-D049" to "pre-D050" (or later) since D049 is now this
+  ontology decision.
+- `project_sysengineering_expert_review.md` (memory) — the
+  downstream audit reader.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
