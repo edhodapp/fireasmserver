@@ -18,12 +18,18 @@
 #
 # Environment:
 #   TIMEOUT   seconds to wait for READY before killing the VM (default 5)
+#   TRACE     set to "1" to additionally capture a QEMU instruction trace
+#             (-d exec -singlestep) and run branch-cov against it. Only
+#             applies to qemu cells — firecracker has no built-in exec
+#             tracing and is a no-op under TRACE=1. branch-cov output is
+#             informational (does not fail this script).
 
 set -euo pipefail
 
 ARCH="${1:?usage: $0 <arch> <platform>}"
 PLATFORM="${2:?usage: $0 <arch> <platform>}"
 TIMEOUT="${TIMEOUT:-5}"
+TRACE="${TRACE:-0}"
 
 REPO_ROOT="$(realpath -m "$(cd "$(dirname "$0")/../.." && pwd)")"
 cd "$REPO_ROOT"
@@ -31,16 +37,40 @@ cd "$REPO_ROOT"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT INT TERM
 SERIAL="$TMPDIR/serial.log"
+TRACE_LOG="$TMPDIR/qemu-trace.log"
+TRACE_PCS="$TMPDIR/trace-pcs.txt"
+
+# Per-cell ELF path and (runtime load address - linker VMA). The linker
+# places x86_64 .text at 0x100000 (matches the runtime load), so offset
+# is 0 there. aarch64 links at 0x0 but the VMMs load the Linux Image at
+# RAM_BASE + text_offset, so branch-cov --load-offset needs the RAM
+# base + 0x80000 for those cells.
+case "$ARCH/$PLATFORM" in
+    x86_64/qemu)        ELF="arch/x86_64/build/qemu/guest.elf";        LOAD_OFFSET=0 ;;
+    x86_64/firecracker) ELF="arch/x86_64/build/firecracker/guest.elf"; LOAD_OFFSET=0 ;;
+    aarch64/qemu)       ELF="arch/aarch64/build/qemu/guest.elf";       LOAD_OFFSET=0x40080000 ;;
+    aarch64/firecracker)
+        ELF="arch/aarch64/build/firecracker/guest.elf";                LOAD_OFFSET=0x80080000 ;;
+esac
 
 echo "=== tracer bullet: $ARCH/$PLATFORM (timeout ${TIMEOUT}s) ==="
+
+_qemu_trace_args() {
+    # Emit additional args for TRACE=1 mode; empty otherwise.
+    if [[ "$TRACE" == "1" ]]; then
+        echo "-d exec -singlestep -D $TRACE_LOG"
+    fi
+}
 
 launch_qemu_x86_64() {
     local guest="arch/x86_64/build/qemu/guest.elf"
     [[ -f "$guest" ]] || { echo "missing $guest — run make first" >&2; exit 1; }
+    # shellcheck disable=SC2046
     timeout "${TIMEOUT}s" qemu-system-x86_64 \
         -machine pc -cpu qemu64 -m 128 \
         -display none -no-reboot \
         -serial "file:$SERIAL" \
+        $(_qemu_trace_args) \
         -kernel "$guest" || true
 }
 
@@ -63,10 +93,12 @@ EOF
 launch_qemu_aarch64() {
     local guest="arch/aarch64/build/qemu/guest.bin"
     [[ -f "$guest" ]] || { echo "missing $guest — run make first" >&2; exit 1; }
+    # shellcheck disable=SC2046
     timeout "${TIMEOUT}s" qemu-system-aarch64 \
         -M virt -cpu cortex-a72 -m 128 \
         -display none -no-reboot \
         -serial "file:$SERIAL" \
+        $(_qemu_trace_args) \
         -kernel "$guest" || true
 }
 
@@ -87,12 +119,32 @@ case "$ARCH/$PLATFORM" in
         ;;
 esac
 
-if grep -q 'READY' "$SERIAL"; then
-    echo "READY observed — PASS"
-    exit 0
+if ! grep -q 'READY' "$SERIAL"; then
+    echo "FAIL: READY not observed in ${TIMEOUT}s"
+    echo "=== serial.log ==="
+    sed 's/^/    /' "$SERIAL"
+    exit 1
 fi
+echo "READY observed — PASS"
 
-echo "FAIL: READY not observed in ${TIMEOUT}s"
-echo "=== serial.log ==="
-sed 's/^/    /' "$SERIAL"
-exit 1
+# Optional: run branch-cov on the captured QEMU trace. Advisory only —
+# current tracer stubs don't exercise every conditional path (e.g.,
+# secondary-CPU entry, UART-FIFO-full) so a coverage gap is expected
+# and must not fail the cell until richer tests exist.
+if [[ "$TRACE" == "1" && -s "$TRACE_LOG" ]]; then
+    echo
+    echo "=== branch-cov report (advisory) ==="
+    # QEMU -d exec -singlestep format:
+    #   Trace 0: <host_ptr> [<cpu_idx>/<guest_pc>/<ccs>/<?>]
+    # Extract the second /-separated hex field inside the [...] bracket.
+    sed -nE 's|.*\[[0-9a-f]+/([0-9a-f]+)/.*|\1|p' "$TRACE_LOG" > "$TRACE_PCS"
+    # Prefer the repo's venv Python if present so `branch_cov` resolves
+    # without activating it; otherwise fall back to system python3.
+    PY="${PYTHON:-python3}"
+    if [[ -x "$REPO_ROOT/.venv/bin/python3" ]]; then
+        PY="$REPO_ROOT/.venv/bin/python3"
+    fi
+    "$PY" -m branch_cov --elf "$ELF" --trace "$TRACE_PCS" \
+        --load-offset "$LOAD_OFFSET" || true
+fi
+exit 0

@@ -30,6 +30,17 @@ def parse_args(
             "stubs whose code is preceded by a 64-byte Image header)."
         ),
     )
+    parser.add_argument(
+        "--load-offset",
+        type=lambda s: int(s, 0),
+        default=0,
+        help=(
+            "Subtracted from every trace PC before matching. Use when the "
+            "guest was linked at one VMA but loaded at another — e.g., "
+            "aarch64 Linux Image stubs are linked at 0x0 but QEMU's -M virt "
+            "loads them at 0x40080000, so pass --load-offset=0x40080000."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -49,6 +60,8 @@ def _run(args: argparse.Namespace) -> int:
     """Execute the coverage pipeline; raises on I/O or parse errors."""
     branches = enumerate_branches(args.elf, entry_symbol=args.entry)
     trace = parse_trace(args.trace)
+    if args.load_offset:
+        trace = [pc - args.load_offset for pc in trace]
     report = compute_coverage(branches, trace)
     _print_report(report)
     return 0 if report.fully_covered else 1

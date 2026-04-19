@@ -1,7 +1,7 @@
 name: CD matrix (arch × platform)
 
 # Every commit to main (and every PR against main) builds AND boots
-# the four (arch, platform) cells from a clean checkout. Each cell:
+# three (arch, platform) cells from a clean checkout. Each cell:
 #   1. installs the cross-toolchain
 #   2. builds guest.{elf,bin} via make
 #   3. installs the cell's VMM (qemu or firecracker)
@@ -38,22 +38,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            platform: qemu
-            runner: ubuntu-latest
-            experimental: false
+          # x86_64/qemu cell intentionally omitted from CI. QEMU's
+          # -machine pc boots through SeaBIOS — ~1M+ lines of BIOS code
+          # to hand off to our 142-byte Multiboot1 stub. The stub code
+          # lives in arch/x86_64/platform/qemu/ for local use and
+          # possible future qemu-microvm coverage, but running it in
+          # hosted CI spends minutes exercising SeaBIOS, not our code.
+          # x86_64/firecracker covers the BIOS-free PVH direct-boot
+          # path; that's where our x86_64 CI signal lives.
           - arch: x86_64
             platform: firecracker
             runner: ubuntu-latest
             experimental: false
+            trace: "0"
           - arch: aarch64
             platform: qemu
             runner: ubuntu-latest
             experimental: false
+            # aarch64 stubs have 3 conditional branches; trace gives
+            # real coverage signal. Boot-under-singlestep stays fast
+            # on aarch64 (no BIOS path).
+            trace: "1"
           - arch: aarch64
             platform: firecracker
             runner: ubuntu-24.04-arm
             experimental: false
+            # firecracker has no -d exec equivalent; even if we
+            # enabled TRACE, run_local.sh's aarch64/firecracker path
+            # is a SKIP in CI (no KVM) so there's nothing to trace.
+            trace: "0"
     name: build/${{ matrix.arch }}/${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.experimental }}
@@ -131,8 +144,23 @@ jobs:
             echo "::warning::KVM NOT available on ${{ matrix.runner }} — firecracker boot would fail here"
           fi
 
+      - name: Install tooling (for branch-cov when TRACE=1)
+        if: matrix.trace == '1'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install branch_cov editable
+        if: matrix.trace == '1'
+        run: pip install -e ".[dev]"
+
       # Launch the built guest and check for the READY marker. For
       # aarch64/firecracker on a KVM-less host this step exits 0 with
       # a SKIP message (see run_local.sh's comment on that cell).
-      - name: Tracer bullet (launch + READY check)
+      # TRACE=1 (set per-cell via matrix.trace) additionally captures a
+      # QEMU -d exec -singlestep trace and runs branch-cov — advisory.
+      - name: Tracer bullet (launch + READY check + optional branch-cov)
+        env:
+          TRACE: ${{ matrix.trace }}
         run: ./tooling/tracer_bullet/run_local.sh ${{ matrix.arch }} ${{ matrix.platform }}

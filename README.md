@@ -46,7 +46,7 @@ Every commit passes through a multi-gate pipeline before reaching `main`:
 
 **GitHub Actions (on push):**
 - `python-gates.yml` — flake8 + mypy --strict + pylint + pytest with branch coverage, on Python 3.11 and 3.12.
-- `cd-matrix.yml` — four-cell arch × platform build matrix: x86_64/qemu, x86_64/firecracker, aarch64/qemu all on `ubuntu-latest` (x86_64 hosted), plus aarch64/firecracker on `ubuntu-24.04-arm`. Build-only today. aarch64/firecracker cannot go beyond build-level in hosted CI because the free `ubuntu-24.04-arm` runner does not expose `/dev/kvm` (confirmed empirically 2026-04-18); VM-boot coverage for that cell lives in the local Pi tracer bullet instead.
+- `cd-matrix.yml` — three-cell arch × platform build-plus-boot matrix: x86_64/firecracker and aarch64/qemu on `ubuntu-latest`, plus aarch64/firecracker on `ubuntu-24.04-arm`. Each cell builds the guest, launches it under its VMM, and verifies the `READY` marker on serial. The aarch64/qemu cell additionally captures a QEMU `-d exec -singlestep` trace and runs `branch-cov` against the boot (advisory). x86_64/qemu is intentionally absent: QEMU's `-machine pc` boots through SeaBIOS, and running our 142-byte stub through a megabyte of BIOS emulation spends CI minutes exercising SeaBIOS, not our code. The x86_64/qemu stub itself is still in the tree for local use. The aarch64/firecracker cell cannot go beyond build-level in hosted CI because the free `ubuntu-24.04-arm` runner does not expose `/dev/kvm` (confirmed empirically 2026-04-18); VM-boot coverage for that cell lives in the local Pi tracer bullet instead.
 
 ## Development topology
 

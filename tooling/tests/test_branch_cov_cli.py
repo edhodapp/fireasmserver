@@ -31,6 +31,26 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             parse_args(["--elf", "/tmp/g.elf"])
 
+    def test_load_offset_defaults_zero(self) -> None:
+        ns = parse_args(
+            ["--elf", "/tmp/g.elf", "--trace", "/tmp/t.log"],
+        )
+        assert ns.load_offset == 0
+
+    def test_load_offset_accepts_hex(self) -> None:
+        ns = parse_args([
+            "--elf", "/tmp/g.elf", "--trace", "/tmp/t.log",
+            "--load-offset", "0x40080000",
+        ])
+        assert ns.load_offset == 0x40080000
+
+    def test_load_offset_accepts_decimal(self) -> None:
+        ns = parse_args([
+            "--elf", "/tmp/g.elf", "--trace", "/tmp/t.log",
+            "--load-offset", "1073741824",
+        ])
+        assert ns.load_offset == 1073741824
+
 
 def _write_empty_elf(path: Path) -> None:
     # Minimal ELF64 header, little-endian, zero sections. Enough for
@@ -130,6 +150,30 @@ class TestErrorPaths:
             elf.chmod(0o644)  # so tmp_path can clean up
         assert rc == 2
         assert "permission denied" in capsys.readouterr().err
+
+
+class TestLoadOffsetApplied:
+    """main() subtracts --load-offset from every trace PC before matching."""
+
+    def test_nonzero_offset_does_not_crash(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # An empty ELF has no branches; any trace including a huge offset
+        # should still produce a fully-covered (0 branches) report.
+        elf = tmp_path / "g.elf"
+        trace = tmp_path / "t.log"
+        _write_empty_elf(elf)
+        # PCs that would be "runtime" addresses above our offset; after
+        # subtraction they become low-range values. No branches to match,
+        # so all we're testing is that the subtraction path runs cleanly.
+        trace.write_text("0x40080040\n0x40080044\n", encoding="utf-8")
+        rc = main([
+            "--elf", str(elf),
+            "--trace", str(trace),
+            "--load-offset", "0x40080000",
+        ])
+        assert rc == 0
+        assert "Branches: 0" in capsys.readouterr().out
 
 
 class TestModuleInvocation:
