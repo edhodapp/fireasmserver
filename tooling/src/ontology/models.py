@@ -34,17 +34,83 @@ from ontology.types import (
 # -- Problem Domain --
 
 
+_SCALAR_KINDS = frozenset({"str", "int", "float", "bool", "datetime"})
+
+
+def _validate_scalar_kind_reference(kind: str, reference: Any) -> None:
+    """Scalar kinds (str/int/float/bool/datetime) take no reference.
+    Presence of one indicates a schema mistake."""
+    if reference is not None:
+        raise ValueError(
+            f"PropertyType kind={kind!r} does not take a reference; "
+            f"got {reference!r}"
+        )
+
+
+def _validate_entity_ref_reference(reference: Any) -> None:
+    """``kind='entity_ref'`` MUST carry a non-empty string reference
+    naming the target Entity id. The RI check below resolves the
+    id against the Ontology's declared entities."""
+    if not isinstance(reference, str) or not reference:
+        raise ValueError(
+            f"PropertyType kind='entity_ref' requires a non-empty "
+            f"string reference naming the target entity; got "
+            f"{reference!r}"
+        )
+
+
+def _validate_enum_reference(reference: Any) -> None:
+    """``kind='enum'`` MUST carry a non-empty list of non-empty
+    strings (the allowed values). Mixed-type lists, empty lists,
+    and empty-string elements are all schema mistakes."""
+    if not isinstance(reference, list) or not reference:
+        raise ValueError(
+            f"PropertyType kind='enum' requires a non-empty list of "
+            f"allowed string values; got {reference!r}"
+        )
+    if not all(isinstance(v, str) and v for v in reference):
+        raise ValueError(
+            f"PropertyType kind='enum' reference must be a list of "
+            f"non-empty strings; got {reference!r}"
+        )
+
+
 class PropertyType(BaseModel):
-    """Type descriptor for an entity property."""
+    """Type descriptor for an entity property.
+
+    The ``kind`` / ``reference`` pair has implicit rules enforced
+    by ``_kind_reference_consistent`` below:
+
+    - Scalar kinds (``str``, ``int``, ``float``, ``bool``,
+      ``datetime``): ``reference`` MUST be ``None``.
+    - ``entity_ref``: ``reference`` MUST be a non-empty string
+      naming a target entity; the containing ``Ontology``'s RI
+      check resolves the id.
+    - ``enum``: ``reference`` MUST be a non-empty list of strings
+      (the allowed values).
+    - ``list``: ``reference`` is permissive for now — a future
+      tightening can require element-type naming when a concrete
+      use case arises.
+    """
 
     kind: PropertyKind
     reference: str | list[str] | None = None
+
+    @model_validator(mode="after")
+    def _kind_reference_consistent(self) -> "PropertyType":
+        if self.kind in _SCALAR_KINDS:
+            _validate_scalar_kind_reference(self.kind, self.reference)
+        elif self.kind == "entity_ref":
+            _validate_entity_ref_reference(self.reference)
+        elif self.kind == "enum":
+            _validate_enum_reference(self.reference)
+        return self
 
 
 class Property(BaseModel):
     """A named, typed property on a domain entity."""
 
-    name: str
+    name: ShortName
     property_type: PropertyType
     description: str = ""
     required: bool = True
@@ -187,7 +253,24 @@ class ExternalDependency(BaseModel):
 
 
 class ModuleSpec(BaseModel):
-    """Specification for a Python module."""
+    """Specification for a Python module.
+
+    ``dependencies`` is a mixed-domain list: entries may be
+    internal module names (resolving to another ``ModuleSpec.name``
+    in the same ontology), Python stdlib module names
+    (``subprocess``, ``pathlib``), or third-party import paths
+    (``urllib.request``). The ``_dependencies_hygiene`` validator
+    catches obvious data problems — empty strings, leading /
+    trailing whitespace, duplicates within a single module — but
+    does NOT resolve references against the ontology, because
+    there is no consistent type-tag distinguishing internal from
+    external today. Splitting into a structured
+    ``internal_module_refs`` field (validated against this
+    ontology's module names) + a free-form ``external_imports``
+    field is an open structural question — tracked in
+    ``project_ontology_hygiene_gaps.md`` for a future refactor
+    when the downstream tooling actually needs the distinction.
+    """
 
     name: str
     responsibility: str
@@ -196,6 +279,36 @@ class ModuleSpec(BaseModel):
     dependencies: list[str] = []
     test_strategy: str = ""
     status: ModuleStatus = "not_started"
+
+    @model_validator(mode="after")
+    def _dependencies_hygiene(self) -> "ModuleSpec":
+        """String hygiene on ``dependencies`` entries — empty,
+        whitespace-containing, or duplicate entries are schema
+        mistakes regardless of whether the entry is internal or
+        external. No valid Python import path contains whitespace
+        in any position, so the check is "any whitespace" rather
+        than "leading/trailing" — simpler rule, same coverage of
+        the leading/trailing case, catches interior-whitespace
+        typos too."""
+        seen: set[str] = set()
+        for dep in self.dependencies:
+            if not dep:
+                raise ValueError(
+                    f"ModuleSpec {self.name!r} has empty string in "
+                    "dependencies"
+                )
+            if any(c.isspace() for c in dep):
+                raise ValueError(
+                    f"ModuleSpec {self.name!r} dependency "
+                    f"{dep!r} contains whitespace"
+                )
+            if dep in seen:
+                raise ValueError(
+                    f"ModuleSpec {self.name!r} has duplicate "
+                    f"dependency {dep!r}"
+                )
+            seen.add(dep)
+        return self
 
 
 # -- Planning State --
@@ -345,6 +458,7 @@ class Ontology(BaseModel):
             known,
         ))
         errors.extend(_check_data_model_refs(self.data_models, known))
+        errors.extend(_check_property_entity_ref_refs(self.entities, known))
         if errors:
             raise ValueError(
                 "referential-integrity violations:\n  - "
@@ -519,6 +633,47 @@ def _check_data_model_refs(
                 f"DataModel for class '{dm.class_name}' references "
                 f"entity '{dm.entity_id}' not in entities"
             )
+    return errors
+
+
+def _property_entity_ref_error(
+    entity_id: str, prop: Property, known: set[str]
+) -> str | None:
+    """Return a dangling-reference message for a single Property
+    with ``kind='entity_ref'``, or None if the property does not
+    hold a dangling reference. The per-property split keeps the
+    outer loop under the cyclomatic-complexity cap."""
+    pt = prop.property_type
+    if pt.kind != "entity_ref":
+        return None
+    # Defensive — the PropertyType cross-field validator
+    # guarantees a non-empty string reference for kind='entity_ref',
+    # but model_construct() bypasses validators and the declared
+    # type is a union, so the isinstance narrowing is load-bearing
+    # both for runtime safety and for mypy.
+    if not isinstance(pt.reference, str):
+        return None
+    if pt.reference in known:
+        return None
+    return (
+        f"Property '{entity_id}.{prop.name}' entity_ref "
+        f"'{pt.reference}' not in entities"
+    )
+
+
+def _check_property_entity_ref_refs(
+    entities: list[Entity],
+    known: set[str],
+) -> list[str]:
+    """Return dangling-reference messages for every ``Property``
+    whose ``PropertyType.kind == 'entity_ref'`` and whose
+    ``reference`` id does not resolve in ``known``."""
+    errors: list[str] = []
+    for ent in entities:
+        for prop in ent.properties:
+            err = _property_entity_ref_error(ent.id, prop, known)
+            if err is not None:
+                errors.append(err)
     return errors
 
 

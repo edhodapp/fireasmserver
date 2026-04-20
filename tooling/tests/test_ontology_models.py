@@ -13,9 +13,12 @@ from ontology import (
     Decision,
     DomainConstraint,
     Entity,
+    ModuleSpec,
     Ontology,
     OntologyDAG,
     PerformanceConstraint,
+    Property,
+    PropertyType,
     Relationship,
     validate_ontology_strict,
 )
@@ -241,3 +244,237 @@ class TestReferentialIntegrity:
         assert "'x'" in message
         assert "'y'" in message
         assert "'z'" in message
+
+
+# ---------------------------------------------------------------
+# PropertyType cross-field validation — 2026-04-20 hygiene pass.
+# ---------------------------------------------------------------
+
+
+class TestPropertyTypeScalarKinds:
+    """Scalar kinds must not carry a reference."""
+
+    @pytest.mark.parametrize("kind", [
+        "str", "int", "float", "bool", "datetime",
+    ])
+    def test_accepts_none_reference(self, kind: str) -> None:
+        pt = PropertyType(kind=kind)  # type: ignore[arg-type]
+        assert pt.reference is None
+
+    @pytest.mark.parametrize("kind", [
+        "str", "int", "float", "bool", "datetime",
+    ])
+    def test_rejects_any_reference(self, kind: str) -> None:
+        with pytest.raises(ValidationError):
+            PropertyType(
+                kind=kind,                  # type: ignore[arg-type]
+                reference="unexpected",
+            )
+        with pytest.raises(ValidationError):
+            PropertyType(
+                kind=kind,                  # type: ignore[arg-type]
+                reference=["also", "bad"],
+            )
+
+
+class TestPropertyTypeEntityRef:
+    """``entity_ref`` requires a non-empty string reference."""
+
+    def test_accepts_non_empty_string(self) -> None:
+        pt = PropertyType(kind="entity_ref", reference="target_id")
+        assert pt.reference == "target_id"
+
+    @pytest.mark.parametrize("bad", [None, "", [], ["a"]])
+    def test_rejects_non_string_or_empty(self, bad: object) -> None:
+        with pytest.raises(ValidationError):
+            PropertyType(
+                kind="entity_ref",
+                reference=bad,              # type: ignore[arg-type]
+            )
+
+
+class TestPropertyTypeEnum:
+    """``enum`` requires a non-empty list of strings."""
+
+    def test_accepts_list_of_strings(self) -> None:
+        pt = PropertyType(kind="enum", reference=["a", "b", "c"])
+        assert pt.reference == ["a", "b", "c"]
+
+    @pytest.mark.parametrize("bad", [
+        None,                           # missing
+        "single_string",                # string, not list
+        [],                             # empty list
+    ])
+    def test_rejects_non_list_or_empty(self, bad: object) -> None:
+        with pytest.raises(ValidationError):
+            PropertyType(
+                kind="enum",
+                reference=bad,              # type: ignore[arg-type]
+            )
+
+    def test_rejects_mixed_type_list(self) -> None:
+        with pytest.raises(ValidationError):
+            PropertyType(
+                kind="enum",
+                reference=["a", 1, "c"],    # type: ignore[list-item]
+            )
+
+    def test_rejects_empty_string_element(self) -> None:
+        """An empty string in an enum's allowed-values list is
+        always a data mistake — the list represents the literal
+        choices the field may take."""
+        with pytest.raises(ValidationError):
+            PropertyType(kind="enum", reference=["a", "", "c"])
+
+
+# ---------------------------------------------------------------
+# Ontology RI check — Property.property_type.reference resolution
+# for entity_ref properties.
+# ---------------------------------------------------------------
+
+
+class TestPropertyEntityRefReferentialIntegrity:
+    """An entity_ref Property whose reference doesn't resolve
+    in this Ontology's entities list must be rejected at
+    construction time, the same way Relationship and
+    DomainConstraint references are."""
+
+    def test_resolvable_entity_ref_accepted(self) -> None:
+        onto = Ontology(entities=[
+            _entity("a"),
+            Entity(id="b", name="B", properties=[
+                Property(
+                    name="owner",
+                    property_type=PropertyType(
+                        kind="entity_ref", reference="a",
+                    ),
+                ),
+            ]),
+        ])
+        assert len(onto.entities) == 2
+
+    def test_dangling_entity_ref_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(entities=[
+                Entity(id="b", name="B", properties=[
+                    Property(
+                        name="owner",
+                        property_type=PropertyType(
+                            kind="entity_ref", reference="ghost",
+                        ),
+                    ),
+                ]),
+            ])
+        message = str(exc.value)
+        assert "b.owner" in message
+        assert "'ghost'" in message
+
+    def test_dangling_entity_ref_joins_other_ri_errors(self) -> None:
+        """Dangling entity_ref pointers surface alongside other
+        RI errors in a single validation pass, consistent with
+        the existing all-errors-together contract."""
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[Entity(id="b", name="B", properties=[
+                    Property(
+                        name="owner",
+                        property_type=PropertyType(
+                            kind="entity_ref", reference="ghost_a",
+                        ),
+                    ),
+                ])],
+                relationships=[Relationship(
+                    source_entity_id="ghost_b", target_entity_id="b",
+                    name="r", cardinality="one_to_one",
+                )],
+            )
+        message = str(exc.value)
+        assert "'ghost_a'" in message
+        assert "'ghost_b'" in message
+
+
+# ---------------------------------------------------------------
+# ModuleSpec.dependencies hygiene.
+# ---------------------------------------------------------------
+
+
+class TestModuleSpecDependenciesHygiene:
+    """String-level hygiene: no empty entries, no
+    leading/trailing whitespace, no duplicates."""
+
+    def test_accepts_clean_list(self) -> None:
+        mod = ModuleSpec(
+            name="m",
+            responsibility="r",
+            dependencies=["subprocess", "pathlib", "vm_launcher"],
+        )
+        assert len(mod.dependencies) == 3
+
+    def test_accepts_empty_list(self) -> None:
+        mod = ModuleSpec(name="m", responsibility="r")
+        assert not mod.dependencies
+
+    def test_rejects_empty_string_entry(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            ModuleSpec(
+                name="m", responsibility="r",
+                dependencies=["pathlib", ""],
+            )
+        assert "empty string" in str(exc.value)
+
+    @pytest.mark.parametrize("bad", [
+        " subprocess",      # leading space
+        "pathlib ",         # trailing space
+        "\turllib",         # tab
+        "subprocess\n",     # newline
+        "path lib",         # interior space — never a valid import
+        "url\tlib",         # interior tab
+    ])
+    def test_rejects_any_whitespace(self, bad: str) -> None:
+        with pytest.raises(ValidationError) as exc:
+            ModuleSpec(
+                name="m", responsibility="r",
+                dependencies=[bad],
+            )
+        assert "whitespace" in str(exc.value)
+
+    def test_rejects_duplicates(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            ModuleSpec(
+                name="m", responsibility="r",
+                dependencies=["pathlib", "subprocess", "pathlib"],
+            )
+        assert "duplicate" in str(exc.value)
+        assert "'pathlib'" in str(exc.value)
+
+
+# ---------------------------------------------------------------
+# Property.name type tightening.
+# ---------------------------------------------------------------
+
+
+class TestPropertyNameShortName:
+    """``Property.name`` is ``ShortName`` (max_length=100). Catches
+    accidental paragraphs-as-names without over-constraining the
+    character set."""
+
+    def test_accepts_normal_length_name(self) -> None:
+        prop = Property(
+            name="serial_path",
+            property_type=PropertyType(kind="str"),
+        )
+        assert prop.name == "serial_path"
+
+    def test_accepts_at_length_boundary(self) -> None:
+        prop = Property(
+            name="a" * 100,
+            property_type=PropertyType(kind="str"),
+        )
+        assert len(prop.name) == 100
+
+    def test_rejects_over_length(self) -> None:
+        with pytest.raises(ValidationError):
+            Property(
+                name="a" * 101,
+                property_type=PropertyType(kind="str"),
+            )
