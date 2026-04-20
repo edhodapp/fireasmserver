@@ -312,6 +312,22 @@ class TestResolvePySymbol:
             )
             assert ref.resolution == "resolved", sym
 
+    def test_indented_assign_regex_fallback(
+        self, tmp_path: Path,
+    ) -> None:
+        # SyntaxError forces the regex fallback; an indented
+        # module-level assign (inside an if/try block) must
+        # still resolve, matching the AST path's container
+        # recursion semantics.
+        (tmp_path / "broken_indent.py").write_text(
+            "if True:\n    BROKEN = (\n    FLAG = 1\n",
+            encoding="utf-8",
+        )
+        ref = resolve_ref(
+            parse_ref("broken_indent.py:FLAG"), tmp_path,
+        )
+        assert ref.resolution == "resolved"
+
     def test_async_def_regex_fallback(
         self, tmp_path: Path,
     ) -> None:

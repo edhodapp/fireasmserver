@@ -43,7 +43,6 @@ implicit filesystem roots) and testable.
 from __future__ import annotations
 
 import ast
-import functools
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -135,39 +134,23 @@ def _check_contained(
     resolve failures (permission denied, dangling symlink under
     ``strict=True``, etc.); either flavor is a containment
     failure from the auditor's view — honest signal rather than
-    an unhandled exception that kills the audit. The repo-root
-    resolve goes through ``_resolve_strict`` so it's cached
-    across every ref in the same audit run.
+    an unhandled exception that kills the audit. Both target
+    and root are resolved per call rather than cached: the
+    earlier ``functools.lru_cache`` cached on the unresolved
+    ``Path`` object, which is CWD-sensitive — a caller that
+    changed working directory between audits could receive a
+    stale resolved path. Per-ref resolves cost a couple of
+    extra stats; measurable only on audits with thousands of
+    refs, which the ontology will not have at this stage.
     """
     try:
         real_target = target.resolve(strict=True)
-        real_root = _resolve_strict(repo_root)
+        real_root = repo_root.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         return f"symlink resolve failed for {raw_path}: {exc}"
     if not real_target.is_relative_to(real_root):
         return f"resolves outside repo: {raw_path} → {real_target}"
     return ""
-
-
-@functools.lru_cache(maxsize=128)
-def _resolve_strict(path: Path) -> Path:
-    """Cached ``Path.resolve(strict=True)``.
-
-    Every call to ``_check_contained`` resolves the repo root;
-    during an audit the root never changes, so re-statting the
-    filesystem per ref wastes cycles. ``lru_cache`` keyed on the
-    hashable ``Path`` argument shares the resolved value across
-    refs. Bounded at 128 so a long-running process doesn't
-    accumulate resolved-path memory indefinitely — the audit
-    tool itself is one-shot, but callers embedding it in a
-    longer service benefit from the bound.
-
-    Exceptions from ``resolve`` are NOT cached: lru_cache only
-    stores return values, so a failing resolve re-raises on the
-    next call — the caller wants fresh feedback if the
-    filesystem state changes.
-    """
-    return path.resolve(strict=True)
 
 
 def _resolve_line(parsed: ParsedRef, target: Path) -> ResolvedRef:
@@ -343,15 +326,19 @@ def _names_from_assign_targets(node: ast.Assign) -> set[str]:
 def _py_regex_fallback(text: str, symbol: str) -> bool:
     """Regex fallback for un-AST-parseable Python. Matches
     ``def <sym>`` / ``async def <sym>`` / ``class <sym>`` /
-    line-start ``<sym> =`` / line-start ``<sym>: ``. Async-def
+    optionally-indented ``<sym> =`` / ``<sym>: ``. Async-def
     support mirrors the AST path's ``AsyncFunctionDef`` handling
     so the fallback doesn't regress coverage on syntax-broken
-    files that still define async functions."""
+    files that still define async functions. Leading whitespace
+    is allowed on the assignment branch so an indented
+    module-level assign (inside an ``if``/``try`` block the AST
+    path would descend into) still resolves even when the file
+    can't be parsed."""
     esc = re.escape(symbol)
     def_or_class = (
         rf"(?:\b(?:async\s+)?def\s+|\bclass\s+){esc}\b"
     )
-    top_assign = rf"(?m)^{esc}\s*[:=]"
+    top_assign = rf"(?m)^\s*{esc}\s*[:=]"
     return bool(
         re.search(def_or_class, text) or re.search(top_assign, text),
     )
