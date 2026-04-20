@@ -56,6 +56,8 @@ VIRTIO_MMIO_DEVICE_FEATURES     equ 0x010
 VIRTIO_MMIO_DEVICE_FEATURES_SEL equ 0x014
 VIRTIO_MMIO_DRIVER_FEATURES     equ 0x020
 VIRTIO_MMIO_DRIVER_FEATURES_SEL equ 0x024
+VIRTIO_MMIO_QUEUE_SEL           equ 0x030
+VIRTIO_MMIO_QUEUE_NUM_MAX       equ 0x034
 VIRTIO_MMIO_STATUS              equ 0x070
 
 ; Device Status bit values (Virtio 1.2 §2.1, "Device Status Field").
@@ -257,7 +259,82 @@ _start:
     lea esi, [features_ok_msg]
     mov ecx, features_ok_len
     call emit_bytes
+
+    ; --- Virtqueue discovery (VIO-007, part 1: QueueNumMax) ---
+    ; Virtio 1.2 §4.2.2: QueueSel selects a queue; QueueNumMax
+    ; returns the device's max supported queue size, or 0 if the
+    ; queue index is unsupported. For virtio-net with no CTRL_VQ
+    ; and no MQ (the only features MVP accepts):
+    ;   queue 0 = RX (receiveq), per §5.1.2
+    ;   queue 1 = TX (transmitq)
+    ; Both must be supported and non-zero to proceed.
+    ;
+    ; This commit is discovery-only. Memory allocation, QueueNum
+    ; write, QueueDesc/Driver/Device physical-address programming,
+    ; and the QueueReady toggle land in the follow-up commit that
+    ; completes VIO-007. The marker here advances as each stage
+    ; does.
+
+    ; Read QueueNumMax for queue 0 (RX).
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], 0
+    mfence
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
+    lfence
+    test eax, eax
+    jz .queue_fail_rx
+    mov ebx, eax                    ; save RX max across next probe
+
+    ; Read QueueNumMax for queue 1 (TX).
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], 1
+    mfence
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
+    lfence
+    test eax, eax
+    jz .queue_fail_tx
+
+    ; Emit: QUEUES:RX=XXXXXXXX TX=XXXXXXXX
+    push eax                        ; preserve TX across emit_bytes
+    lea esi, [queues_rx_prefix_msg]
+    mov ecx, queues_rx_prefix_len
+    call emit_bytes
+    mov eax, ebx                    ; RX max → hex
+    call emit_hex32
+    lea esi, [queues_tx_sep_msg]
+    mov ecx, queues_tx_sep_len
+    call emit_bytes
+    pop eax                         ; restore TX
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
     jmp .halt
+
+.queue_fail_rx:
+    ; QueueSel=0 returned QueueNumMax=0 — device does not support
+    ; the RX queue. Fatal: MVP needs both queues. Emit the marker
+    ; and route through .set_failed (VIO-009).
+    lea esi, [queues_fail_rx_msg]
+    mov ecx, queues_fail_rx_len
+    call emit_bytes
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
+.queue_fail_tx:
+    ; QueueSel=1 returned QueueNumMax=0 — device does not support
+    ; the TX queue. Fatal (same reason as .queue_fail_rx).
+    lea esi, [queues_fail_tx_msg]
+    mov ecx, queues_fail_tx_len
+    call emit_bytes
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
 
 .features_fail_no_v1:
     ; Device did not offer VIRTIO_F_VERSION_1. ebx=dev_lo, eax=dev_hi.
@@ -451,5 +528,17 @@ features_hi_sep_len    equ $ - features_hi_sep_msg
 
 features_rejected_msg: db 'FEATURES:FAIL rejected status='
 features_rejected_len  equ $ - features_rejected_msg
+
+queues_rx_prefix_msg:  db 'QUEUES:RX='
+queues_rx_prefix_len   equ $ - queues_rx_prefix_msg
+
+queues_tx_sep_msg:     db ' TX='
+queues_tx_sep_len      equ $ - queues_tx_sep_msg
+
+queues_fail_rx_msg:    db 'QUEUES:FAIL no-queue q=0 (max=0)'
+queues_fail_rx_len     equ $ - queues_fail_rx_msg
+
+queues_fail_tx_msg:    db 'QUEUES:FAIL no-queue q=1 (max=0)'
+queues_fail_tx_len     equ $ - queues_fail_tx_msg
 
 newline:         db 10

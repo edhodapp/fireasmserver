@@ -219,6 +219,25 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "FEATURES:OK observed — VIO-004..006 feature negotiation verified"
+
+    # Virtqueue discovery (VIO-007 part 1). boot.S reads QueueNumMax
+    # for queue 0 (RX) and queue 1 (TX) after setting each via
+    # QueueSel. Success → QUEUES:RX=<hex> TX=<hex>. Failure →
+    # QUEUES:FAIL no-queue q=<0|1> (max=0) + VIO-009 halt.
+    queues_line=$(grep -E '^QUEUES:RX=[0-9A-F]{8} TX=[0-9A-F]{8}$' \
+        "$SERIAL" | head -1 || true)
+    if [[ -z "$queues_line" ]]; then
+        fail_line=$(grep -E '^QUEUES:FAIL ' "$SERIAL" | head -1 || true)
+        if [[ -n "$fail_line" ]]; then
+            echo "FAIL: virtqueue discovery — $fail_line"
+        else
+            echo "FAIL: QUEUES:RX/TX not observed (guest did not reach VIO-007 discovery)"
+        fi
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "${queues_line} observed — VIO-007 discovery verified"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —
