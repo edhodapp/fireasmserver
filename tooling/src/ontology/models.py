@@ -17,6 +17,8 @@ from pydantic import BaseModel, ValidationError, model_validator
 import re as _re
 
 from ontology.types import (
+    SAFE_ID_MAX_LENGTH,
+    SAFE_ID_PATTERN,
     Cardinality,
     Description,
     IsoDate,
@@ -31,11 +33,13 @@ from ontology.types import (
     SideSessionStatus,
 )
 
-# Extracted for in-file reuse by the OntologyDAG.current_node_id
-# validator — that field admits the empty string as a "no current
-# node" sentinel, so the plain ``SafeId`` annotation would be
-# over-strict. Keep the pattern literal in sync with types.SafeId.
-_SAFE_ID_RE = _re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$")
+# Compiled form of the ``SafeId`` regex for the
+# OntologyDAG.current_node_id validator — that field admits the
+# empty string as a "no current node" sentinel, so the plain
+# ``SafeId`` annotation would be over-strict. Shares the pattern
+# literal with types.SafeId via ``SAFE_ID_PATTERN`` — single
+# source of truth, no drift risk.
+_SAFE_ID_RE = _re.compile(SAFE_ID_PATTERN)
 
 
 # -- Problem Domain --
@@ -440,6 +444,7 @@ class Ontology(BaseModel):
         """
         known = {entity.id for entity in self.entities}
         errors: list[str] = []
+        errors.extend(_check_entity_id_uniqueness(self.entities))
         errors.extend(_check_relationship_refs(self.relationships, known))
         errors.extend(_check_id_list_refs(
             "DomainConstraint",
@@ -457,6 +462,10 @@ class Ontology(BaseModel):
             self.domain_constraints,
             self.performance_constraints,
         ))
+        errors.extend(_check_module_name_uniqueness(self.modules))
+        errors.extend(
+            _check_side_session_task_uniqueness(self.side_session_tasks)
+        )
         if errors:
             raise ValueError(
                 "referential-integrity violations:\n  - "
@@ -534,7 +543,7 @@ class OntologyDAG(BaseModel):
         if not self.current_node_id:
             return self
         if (
-            len(self.current_node_id) > 100
+            len(self.current_node_id) > SAFE_ID_MAX_LENGTH
             or not _SAFE_ID_RE.match(self.current_node_id)
         ):
             raise ValueError(
@@ -698,6 +707,52 @@ def _property_entity_ref_error(
         f"Property '{entity_id}.{prop.name}' entity_ref "
         f"'{pt.reference}' not in entities"
     )
+
+
+def _check_entity_id_uniqueness(entities: list[Entity]) -> list[str]:
+    """Entity ids are the keys for every cross-reference check.
+    Duplicates collapse silently in the ``known`` set used by the
+    other RI helpers, leaving downstream tooling to disambiguate
+    blindly. Flag any id that appears more than once."""
+    counts: dict[str, int] = {}
+    for ent in entities:
+        counts[ent.id] = counts.get(ent.id, 0) + 1
+    return [
+        f"Entity id {eid!r} is not unique (appears {n} times)"
+        for eid, n in sorted(counts.items()) if n > 1
+    ]
+
+
+def _check_module_name_uniqueness(modules: list[ModuleSpec]) -> list[str]:
+    """``ModuleSpec.name`` is the implicit key for an internal-
+    module reference (see ``ModuleSpec.dependencies`` docstring).
+    Duplicates make ``dependencies=['foo']`` ambiguous."""
+    counts: dict[str, int] = {}
+    for mod in modules:
+        counts[mod.name] = counts.get(mod.name, 0) + 1
+    return [
+        f"ModuleSpec name {name!r} is not unique (appears {n} times)"
+        for name, n in sorted(counts.items()) if n > 1
+    ]
+
+
+def _check_side_session_task_uniqueness(
+    tasks: list["SideSessionTask"],
+) -> list[str]:
+    """``(slug, date)`` is the documented uniqueness key for
+    ``SideSessionTask`` (see its docstring + the bootstrap
+    duplicate-check). Enforce it at the ontology layer too so
+    a hand-edited DAG can't ship a duplicate."""
+    counts: dict[tuple[str, str], int] = {}
+    for task in tasks:
+        counts[(task.slug, task.date)] = (
+            counts.get((task.slug, task.date), 0) + 1
+        )
+    return [
+        f"SideSessionTask (slug, date)={(s, d)!r} is not unique "
+        f"(appears {n} times)"
+        for (s, d), n in sorted(counts.items()) if n > 1
+    ]
 
 
 def _check_constraint_name_uniqueness(

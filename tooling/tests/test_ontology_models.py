@@ -20,6 +20,7 @@ from ontology import (
     Property,
     PropertyType,
     Relationship,
+    SideSessionTask,
     validate_ontology_strict,
 )
 
@@ -829,4 +830,74 @@ class TestConstraintNameUniqueness:
                 )],
             )
         assert "'shared'" in str(exc.value)
+        assert "not unique" in str(exc.value)
+
+
+class TestEntityIdUniqueness:
+    """Entity ids are the keys for every cross-reference check —
+    duplicates collapse silently in the ``known`` set used by RI
+    helpers, so they MUST be flagged at the ontology level."""
+
+    def test_unique_ids_accepted(self) -> None:
+        Ontology(entities=[_entity("a"), _entity("b"), _entity("c")])
+
+    def test_duplicate_id_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(entities=[_entity("dup"), _entity("dup")])
+        assert "'dup'" in str(exc.value)
+        assert "not unique" in str(exc.value)
+
+
+class TestModuleNameUniqueness:
+    """``ModuleSpec.name`` is the key for internal-module
+    references in ``ModuleSpec.dependencies``."""
+
+    def test_unique_module_names_accepted(self) -> None:
+        Ontology(modules=[
+            ModuleSpec(name="m1", responsibility="r1"),
+            ModuleSpec(name="m2", responsibility="r2"),
+        ])
+
+    def test_duplicate_module_name_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(modules=[
+                ModuleSpec(name="dup", responsibility="r1"),
+                ModuleSpec(name="dup", responsibility="r2"),
+            ])
+        assert "'dup'" in str(exc.value)
+        assert "ModuleSpec name" in str(exc.value)
+
+
+class TestSideSessionTaskUniqueness:
+    """``(slug, date)`` is the documented uniqueness key for
+    ``SideSessionTask`` — the bootstrap tool's duplicate-check
+    relies on it; the ontology must enforce it too so a
+    hand-edited DAG can't ship a duplicate."""
+
+    def test_unique_slug_date_accepted(self) -> None:
+        Ontology(side_session_tasks=[
+            SideSessionTask(
+                slug="task_a", date="2026-04-20", deliverables="d",
+            ),
+            SideSessionTask(
+                slug="task_b", date="2026-04-20", deliverables="d",
+            ),
+            SideSessionTask(
+                slug="task_a", date="2026-04-21", deliverables="d",
+            ),
+        ])
+
+    def test_duplicate_slug_date_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(side_session_tasks=[
+                SideSessionTask(
+                    slug="dup", date="2026-04-20", deliverables="d",
+                ),
+                SideSessionTask(
+                    slug="dup", date="2026-04-20",
+                    deliverables="d2",
+                ),
+            ])
+        assert "'dup'" in str(exc.value)
+        assert "2026-04-20" in str(exc.value)
         assert "not unique" in str(exc.value)

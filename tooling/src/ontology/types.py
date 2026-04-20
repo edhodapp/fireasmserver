@@ -16,13 +16,21 @@ from pydantic import AfterValidator, StringConstraints
 
 # -- Constrained string types --
 
+# Module-level constant so downstream code (e.g., the
+# ``OntologyDAG.current_node_id`` model_validator in models.py,
+# which admits the empty string as a sentinel and can't use the
+# plain ``SafeId`` annotation) can re-use the exact same pattern
+# without copy-pasting the literal. Single source of truth.
+SAFE_ID_PATTERN = r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$"
+SAFE_ID_MAX_LENGTH = 100
+
 SafeId = Annotated[str, StringConstraints(
     # Must start with alphanumeric or underscore — forbidding a
     # leading dash closes the "shell positional-arg eats `--slug`"
     # failure mode where an id like `-rf` could be mistaken for a
     # flag by downstream tooling. Interior dashes are fine.
-    pattern=r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$",
-    max_length=100,
+    pattern=SAFE_ID_PATTERN,
+    max_length=SAFE_ID_MAX_LENGTH,
 )]
 
 ShortName = Annotated[str, StringConstraints(
