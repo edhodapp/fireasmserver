@@ -186,10 +186,9 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
     # Device-status init prefix (VIO-001..003). boot.S walks the
     # required §2.1.2 step 1-3 sequence (reset, ACKNOWLEDGE, DRIVER),
     # reads the status register back, and emits STATUS:DRIVER on
-    # match or STATUS:FAIL status=<hex> on mismatch. Feature
-    # negotiation (VIO-004..006) and virtqueue setup (VIO-007) land
-    # in follow-up commits; the marker here advances as each stage
-    # does.
+    # match or STATUS:FAIL status=<hex> on mismatch. Virtqueue setup
+    # (VIO-007) and DRIVER_OK (VIO-008) land in follow-up commits;
+    # the marker here advances as each stage does.
     if ! grep -qE '^STATUS:DRIVER$' "$SERIAL"; then
         echo "FAIL: STATUS:DRIVER not observed (init prefix VIO-001..003 failed?)"
         echo "=== serial.log ==="
@@ -197,6 +196,29 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "STATUS:DRIVER observed — VIO-001..003 init prefix verified"
+
+    # Feature negotiation (VIO-004..006). boot.S verifies
+    # VIRTIO_F_VERSION_1 is offered, writes driver-features = VERSION_1
+    # only, sets FEATURES_OK, and re-reads Status to confirm the host
+    # accepted the subset. Success → FEATURES:OK. Failure →
+    # FEATURES:FAIL <reason> <hex-context>, then VIO-009 FAILED-bit
+    # write, then halt.
+    if ! grep -qE '^FEATURES:OK$' "$SERIAL"; then
+        # Positive match on FEATURES:FAIL lets the reason line bubble
+        # up as the top-line CI message rather than disappearing into
+        # the serial-log dump. Absent both markers is its own case
+        # (guest crashed before reaching the negotiation block).
+        fail_line=$(grep -E '^FEATURES:FAIL ' "$SERIAL" | head -1 || true)
+        if [[ -n "$fail_line" ]]; then
+            echo "FAIL: feature negotiation rejected — $fail_line"
+        else
+            echo "FAIL: FEATURES:OK not observed (guest did not reach VIO-004..006)"
+        fi
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "FEATURES:OK observed — VIO-004..006 feature negotiation verified"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —

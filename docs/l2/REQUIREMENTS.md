@@ -126,19 +126,19 @@ of this file by design.
 | `VIO-001` | On init, reset the device (write 0 to Device Status register). | Virtio 1.2 §2.1.2 step 1 | implemented | `arch/x86_64/platform/firecracker/boot.S` init prefix; tracer bullet verifies `STATUS:DRIVER` marker. |
 | `VIO-002` | Set `ACKNOWLEDGE` (bit 0) in status. | Virtio 1.2 §2.1.2 step 2 | implemented | Same site; read-modify-write OR with `VIRTIO_STATUS_ACKNOWLEDGE`. |
 | `VIO-003` | Set `DRIVER` (bit 1) in status. | Virtio 1.2 §2.1.2 step 3 | implemented | Same site; read-modify-write OR with `VIRTIO_STATUS_DRIVER`. Read-back cross-checks both bits before emitting the marker; mismatch emits `STATUS:FAIL status=<hex>` and halts. |
-| `VIO-004` | Read device feature bits; select a subset; write driver feature bits. | Virtio 1.2 §2.1.2 step 4 | spec | |
-| `VIO-005` | Set `FEATURES_OK` (bit 3) in status. | Virtio 1.2 §2.1.2 step 5 | spec | |
-| `VIO-006` | Re-read status; MUST abort init if `FEATURES_OK` is not still set. | Virtio 1.2 §2.1.2 step 6 | spec | Host rejected our feature set. |
+| `VIO-004` | Read device feature bits; select a subset; write driver feature bits. | Virtio 1.2 §2.1.2 step 4 | implemented | `arch/x86_64/platform/firecracker/boot.S` feature-negotiation block; MVP subset is `VIRTIO_F_VERSION_1` only (see VIO-F-001..007 for the per-feature policy). Verified by `FEATURES:OK` marker. |
+| `VIO-005` | Set `FEATURES_OK` (bit 3) in status. | Virtio 1.2 §2.1.2 step 5 | implemented | Same site; RMW OR with `VIRTIO_STATUS_FEATURES_OK`. |
+| `VIO-006` | Re-read status; MUST abort init if `FEATURES_OK` is not still set. | Virtio 1.2 §2.1.2 step 6 | implemented | Same site; equality compare against `ACK\|DRIVER\|FEATURES_OK` catches both FEATURES_OK-cleared and unexpected stray bits. Failure emits `FEATURES:FAIL rejected status=<hex>`. |
 | `VIO-007` | Read device-specific config, discover + initialize virtqueues. | Virtio 1.2 §2.1.2 step 7 | spec | |
 | `VIO-008` | Set `DRIVER_OK` (bit 2) in status; device is now live. | Virtio 1.2 §2.1.2 step 8 | spec | |
-| `VIO-009` | On any fatal driver error, set `FAILED` (bit 7) in status. | Virtio 1.2 §2.1.2 | spec | |
+| `VIO-009` | On any fatal driver error, set `FAILED` (bit 7) in status. | Virtio 1.2 §2.1.2 | implemented | `arch/x86_64/platform/firecracker/boot.S` `.set_failed` helper: RMW ORs `VIRTIO_STATUS_FAILED` (bit 7, value 0x80) into Status before halt. All downstream fail paths (`.status_fail`, `.features_fail_no_v1`, `.features_fail_rejected`) route through it. `.virtio_fail` (MagicValue mismatch) bypasses `.set_failed` — at that point the device's register layout is unverified and a Status write would be blind. |
 
 ### 4.2 Feature negotiation (§5.1.3)
 
 | ID | Requirement | Source | Status | Notes |
 |----|-------------|--------|--------|-------|
-| `VIO-F-001` | MUST negotiate `VIRTIO_F_VERSION_1` (bit 32) — we are a modern driver. | Virtio 1.2 §6 | spec | Legacy/transitional not supported. |
-| `VIO-F-002` | MUST negotiate `VIRTIO_NET_F_MAC` (bit 5) if device offers it, and read MAC from config space. | Virtio 1.2 §5.1.3 | spec | Otherwise random local MAC. |
+| `VIO-F-001` | MUST negotiate `VIRTIO_F_VERSION_1` (bit 32) — we are a modern driver. | Virtio 1.2 §6 | implemented | `arch/x86_64/platform/firecracker/boot.S` feature-negotiation block; `VIRTIO_F_VERSION_1_HIBIT` is the only bit set in driver-features high-page. If the device fails to offer VERSION_1 the guest emits `FEATURES:FAIL no-v1 dev_lo=<hex> dev_hi=<hex>` (both feature pages shown for diagnostics) and halts after setting VIO-009 `FAILED`. |
+| `VIO-F-002` | MUST negotiate `VIRTIO_NET_F_MAC` (bit 5) if device offers it, and read MAC from config space. | Virtio 1.2 §5.1.3 | deviation | MVP accepts no device-specific features in the feature-negotiation commit; MAC is deferred to the VIO-007 device-config / virtqueue-setup commit, which is where config-space reads land. Until then the driver acts as if the device did not offer MAC — a locally-administered random MAC would be generated if this shipped. Tracked as a named deviation so it doesn't silently become a latent bug. |
 | `VIO-F-003` | MAY negotiate `VIRTIO_NET_F_STATUS` (bit 16) to observe link state. | Virtio 1.2 §5.1.3 | spec | |
 | `VIO-F-004` | MAY negotiate `VIRTIO_NET_F_MQ` (bit 22) for multi-queue. | Virtio 1.2 §5.1.3 | deviation-candidate | MVP single-queue; design-doc decision. |
 | `VIO-F-005` | MAY negotiate `VIRTIO_NET_F_CTRL_VQ` (bit 17) to expose the control queue. | Virtio 1.2 §5.1.3 | spec | Needed for MAC-filter / MQ / VLAN config. |

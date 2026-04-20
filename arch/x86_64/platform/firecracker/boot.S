@@ -48,16 +48,32 @@ VIRTIO_MMIO_BASE         equ 0xC0001000
 VIRTIO_MAGIC             equ 0x74726976   ; "virt" little-endian
 
 ; Virtio-MMIO register offsets (Virtio 1.2 §4.2.2, Table 4.1).
-; Full layout isn't needed yet — only the Status register for the
-; VIO-001..003 init prefix. More offsets land with feature
-; negotiation (VIO-004..006) and virtqueue setup (VIO-007).
-VIRTIO_MMIO_STATUS       equ 0x070
+; Full layout isn't needed yet — only the registers touched by the
+; init prefix (VIO-001..003) and feature negotiation (VIO-004..006).
+; Virtqueue registers (QueueSel, QueueDesc*, QueueDriver*, QueueDevice*,
+; QueueReady, QueueNotify) land with VIO-007.
+VIRTIO_MMIO_DEVICE_FEATURES     equ 0x010
+VIRTIO_MMIO_DEVICE_FEATURES_SEL equ 0x014
+VIRTIO_MMIO_DRIVER_FEATURES     equ 0x020
+VIRTIO_MMIO_DRIVER_FEATURES_SEL equ 0x024
+VIRTIO_MMIO_STATUS              equ 0x070
 
 ; Device Status bit values (Virtio 1.2 §2.1, "Device Status Field").
 ; Bit-position numbering in the REQUIREMENTS.md VIO table is the
 ; bit index; the MMIO Status register is written with OR-ed values.
-VIRTIO_STATUS_ACKNOWLEDGE equ 1   ; bit 0 — driver found the device
-VIRTIO_STATUS_DRIVER      equ 2   ; bit 1 — driver knows how to use it
+VIRTIO_STATUS_ACKNOWLEDGE equ 1    ; bit 0 — driver found the device
+VIRTIO_STATUS_DRIVER      equ 2    ; bit 1 — driver knows how to use it
+VIRTIO_STATUS_FEATURES_OK equ 8    ; bit 3 — feature subset accepted
+VIRTIO_STATUS_FAILED      equ 0x80 ; bit 7 — driver has given up (VIO-009)
+
+; Feature bits (Virtio 1.2 §6 — transport + device-specific). Bits
+; are 64-wide; MMIO exposes them via two 32-bit pages selected by
+; DeviceFeaturesSel / DriverFeaturesSel (0=bits 0-31, 1=bits 32-63).
+; VIRTIO_F_VERSION_1 is bit 32 globally → bit 0 of the high page.
+; MVP policy: accept VERSION_1 only. MAC, STATUS, MQ, CSUM, GSO,
+; EVENT_IDX stay off until the code paths that consume them land
+; (see VIO-F-001..007 in docs/l2/REQUIREMENTS.md §4.2).
+VIRTIO_F_VERSION_1_HIBIT  equ 1   ; bit 32 == 1 in the high page
 
 ; PVH ELF note. namesz=4 covers "Xen\0"; descsz=4 is the entry
 ; address that follows. NASM's `note` section-type directive emits
@@ -172,12 +188,113 @@ _start:
     lea esi, [status_driver_msg]
     mov ecx, status_driver_len
     call emit_bytes
+
+    ; --- Feature negotiation (VIO-004, VIO-005, VIO-006) ---
+    ; Virtio 1.2 §2.1.2 steps 4-6. MVP policy (documented with the
+    ; VIRTIO_F_VERSION_1_HIBIT constant near the top): accept
+    ; VERSION_1 only; everything else waits for its consuming code
+    ; to land. Bits 0-31 are left unselected; bits 32-63 get exactly
+    ; one bit — VERSION_1.
+    ;
+    ; Both feature pages are read. We accept nothing from the low
+    ; page in MVP, but the value is saved in ebx (preserved across
+    ; emit_bytes / emit_hex32) so failure diagnostics can show what
+    ; the device actually offered. When MAC / STATUS / CTRL_VQ land
+    ; in follow-up commits, the read stays; only the low-page
+    ; driver-features write gains bits.
+
+    ; VIO-004 part 1a: read low-page offered features, save for diag.
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 0
+    mfence
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES]
+    lfence
+    mov ebx, eax
+
+    ; VIO-004 part 1b: check VERSION_1 is offered (high page bit 0).
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 1
+    mfence
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES]
+    lfence
+    test eax, VIRTIO_F_VERSION_1_HIBIT
+    jz .features_fail_no_v1
+
+    ; VIO-004 part 2: write driver features. Low page = 0 (we accept
+    ; nothing bits 0-31), high page = VERSION_1 only.
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 0
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES], 0
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 1
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES], VIRTIO_F_VERSION_1_HIBIT
+    mfence
+
+    ; VIO-005: set FEATURES_OK in status (RMW).
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    or  eax, VIRTIO_STATUS_FEATURES_OK
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mfence
+
+    ; VIO-006: re-read Status. If FEATURES_OK cleared, the device
+    ; rejected our subset and we MUST abort init. Equality compare
+    ; against the expected full status value (ACK|DRIVER|FEATURES_OK)
+    ; also catches FAILED and any unexpected stray bits, consistent
+    ; with the VIO-003 cross-check above.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    cmp eax, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK
+    jne .features_fail_rejected
+
+    lea esi, [features_ok_msg]
+    mov ecx, features_ok_len
+    call emit_bytes
     jmp .halt
 
+.features_fail_no_v1:
+    ; Device did not offer VIRTIO_F_VERSION_1. ebx=dev_lo, eax=dev_hi.
+    ; Emit: FEATURES:FAIL no-v1 dev_lo=XXXXXXXX dev_hi=XXXXXXXX
+    push eax                        ; preserve dev_hi across emit_bytes
+    lea esi, [features_no_v1_prefix_msg]
+    mov ecx, features_no_v1_prefix_len
+    call emit_bytes
+    mov eax, ebx                    ; dev_lo → hex
+    call emit_hex32
+    lea esi, [features_hi_sep_msg]
+    mov ecx, features_hi_sep_len
+    call emit_bytes
+    pop eax                         ; restore dev_hi
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
+.features_fail_rejected:
+    ; Device cleared FEATURES_OK after we set it (or set an unexpected
+    ; bit). eax holds the observed status; dump it.
+    push eax
+    lea esi, [features_rejected_msg]
+    mov ecx, features_rejected_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
 .status_fail:
-    ; eax holds the masked status value (ACK|DRIVER bits only). Emit
-    ; the marker and the observed value so a debugger sees exactly
-    ; what the device reported.
+    ; eax holds the observed status value. Emit the marker and the
+    ; value so a debugger sees exactly what the device reported.
     push eax
     lea esi, [status_fail_msg]
     mov ecx, status_fail_len
@@ -187,12 +304,15 @@ _start:
     lea esi, [newline]
     mov ecx, 1
     call emit_bytes
-    jmp .halt
+    jmp .set_failed
 
 .virtio_fail:
     ; eax holds the actual magic value. Print "VIRTIO:FAIL magic=" then
     ; the eight hex digits, then "\n". Saves a lot of time versus
     ; having to bisect from the VMM log that the address was wrong.
+    ; Skips .set_failed — if magic didn't match, the device's register
+    ; layout is unverified and a Status write to offset 0x70 would
+    ; be blind.
     push eax                        ; preserve magic across emit_bytes
     lea esi, [virtio_fail_msg]
     mov ecx, virtio_fail_len
@@ -202,6 +322,24 @@ _start:
     lea esi, [newline]
     mov ecx, 1
     call emit_bytes
+    jmp .halt
+
+.set_failed:
+    ; VIO-009: signal the device that the driver has given up. Any
+    ; fatal init error downstream of the MagicValue probe routes
+    ; here before halt. RMW preserves whatever Status bits are
+    ; already set (ACK / DRIVER / FEATURES_OK in various combinations
+    ; depending on which stage failed). Only entered after the probe
+    ; matched — .virtio_fail skips this step for the reason noted
+    ; above.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    or  eax, VIRTIO_STATUS_FAILED
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mfence
+    ; fall through
 
 .halt:
     cli
@@ -301,5 +439,17 @@ status_driver_len  equ $ - status_driver_msg
 
 status_fail_msg:   db 'STATUS:FAIL status='
 status_fail_len    equ $ - status_fail_msg
+
+features_ok_msg:       db 'FEATURES:OK', 10
+features_ok_len        equ $ - features_ok_msg
+
+features_no_v1_prefix_msg: db 'FEATURES:FAIL no-v1 dev_lo='
+features_no_v1_prefix_len  equ $ - features_no_v1_prefix_msg
+
+features_hi_sep_msg:   db ' dev_hi='
+features_hi_sep_len    equ $ - features_hi_sep_msg
+
+features_rejected_msg: db 'FEATURES:FAIL rejected status='
+features_rejected_len  equ $ - features_rejected_msg
 
 newline:         db 10
