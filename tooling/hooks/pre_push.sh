@@ -92,6 +92,22 @@ run_pytest_suite() {
     "$REPO_ROOT/.venv/bin/pytest" -q --no-header
 }
 
+run_ontology_audit() {
+    echo
+    echo "=== pre-push: ontology audit (D051) ==="
+    # audit-ontology verifies that every implementation_refs /
+    # verification_refs entry in tooling/qemu-harness.json resolves
+    # against the working tree and that status ↔ refs fields are
+    # internally consistent. D051 makes this a closing gate so the
+    # ontology cannot drift from the code it claims to describe.
+    if [[ ! -x "$REPO_ROOT/.venv/bin/audit-ontology" ]]; then
+        echo "SKIP: no .venv/bin/audit-ontology" \
+            "(run: pip install -e .[dev] to install console scripts)"
+        return 0
+    fi
+    "$REPO_ROOT/.venv/bin/audit-ontology" --exit-nonzero-on-gap
+}
+
 echo "=== fireasmserver pre-push integration tests ==="
 
 run_local_cell x86_64  firecracker   || fail=1
@@ -103,6 +119,7 @@ run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
 run_crc_tests                        || fail=1
 run_pytest_suite                     || fail=1
+run_ontology_audit                   || fail=1
 
 echo
 if [[ $fail -ne 0 ]]; then

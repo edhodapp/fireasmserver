@@ -1819,6 +1819,69 @@ into `b655543` (main-session wide-staging incident per
 `feedback_explicit_git_add_during_parallel_sessions.md`; leave-
 as-is per Ed's disposition).
 
+### D051: Ontology audit as closing pre-push gate
+
+**Decision (2026-04-19):** every push to `origin/main` must pass
+`audit-ontology --exit-nonzero-on-gap`, which verifies that
+every `implementation_refs` / `verification_refs` entry in the
+committed ontology resolves against the working tree and that
+status ↔ refs fields are internally consistent. Enforcement
+lives in `tooling/hooks/pre_push.sh` alongside the existing
+tracer bullets, CRC vectors, and full pytest suite. Bypassing
+with `--no-verify` remains Ed's prerogative but carries the same
+"you own the broken CI" penalty the other pre-push gates do.
+
+**Why:** the ontology's value as formal requirements depends on
+its refs pointing at code that actually exists. The O4 back-fill
+(`6fe19c7`) technically shipped two latent symbol-resolution
+bugs — `vm_launcher.py:_proc_registry` and
+`vm_launcher.py:_proc_lock` — where refs pointed at module-level
+variables that the initial resolver matched only via substring
+coincidence. They surfaced only when the audit tool's resolver
+was expanded to match module-level assigns properly. Without an
+enforced gate, ontology entries can claim traceability they
+don't have, and the claim rots silently between commits. The
+gate closes that loop.
+
+**Why pre-push not pre-commit:** the audit re-reads the whole
+ontology and resolves all refs — cheap (milliseconds) but not
+free, and the class of drift it catches is cross-commit
+coherence, not per-file correctness. Consistent with the
+existing split: quality gates pre-commit; integration and
+coherence pre-push.
+
+**Why `--exit-nonzero-on-gap` is opt-in rather than the
+default:** the human-readable invocation `audit-ontology` (no
+flag) stays exit-0 so manual inspection of the matrix is
+friction-free. Scripts and hooks opt in via the explicit flag.
+
+**Implementation:**
+- `run_ontology_audit` function added to
+  `tooling/hooks/pre_push.sh` immediately after
+  `run_pytest_suite`.
+- Console-script entry `audit-ontology = "audit_ontology.cli:main"`
+  added to `pyproject.toml` `[project.scripts]`.
+- Running `pip install -e .[dev]` once installs the script into
+  the venv alongside the existing `qemu-harness` and `branch-cov`
+  entries.
+
+**Follow-up:** `.github/workflows/cd-matrix.yml` should grow an
+equivalent audit step so the gate fires on every PR, not just
+every local push. One-line addition after the existing
+`pip install -e .[dev]` setup step. Left for the next CI touch.
+
+**Cross-refs:**
+- `D049` — the ontology schema this gate enforces.
+- `D017` — two-tier quality gates; this adds a coherence gate
+  at the pre-push tier.
+- `D040` — perf ratchet; sibling pre-push gate with the same
+  "fail on drift" posture.
+
+**Attribution:** audit tool built by the 2026-04-19
+`audit_ontology` side session (briefing at
+`docs/side_sessions/2026-04-19_audit_ontology.md`); policy +
+wire-up landed by the main session in the same window.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation

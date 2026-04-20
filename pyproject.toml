@@ -26,6 +26,7 @@ dev = [
 [project.scripts]
 qemu-harness = "qemu_harness.cli:main"
 branch-cov = "branch_cov.cli:main"
+audit-ontology = "audit_ontology.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["tooling/src"]
