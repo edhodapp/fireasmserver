@@ -13,14 +13,29 @@ that previously went unnoticed now surfaces as ``file_missing`` or
 briefing at ``docs/side_sessions/2026-04-19_audit_ontology.md``.
 """
 
+from audit_ontology.audit import (
+    AuditReport,
+    ConstraintReport,
+    Summary,
+    run_audit,
+)
+from audit_ontology.consistency import check_constraint
+from audit_ontology.formatter import format_json, format_text
 from audit_ontology.parser import ParsedRef, RefKind, parse_ref
 from audit_ontology.resolver import ResolvedRef, Resolution, resolve_ref
 
 __all__ = [
+    "AuditReport",
+    "ConstraintReport",
     "ParsedRef",
     "RefKind",
     "Resolution",
     "ResolvedRef",
+    "Summary",
+    "check_constraint",
+    "format_json",
+    "format_text",
     "parse_ref",
     "resolve_ref",
+    "run_audit",
 ]

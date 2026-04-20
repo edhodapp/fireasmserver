@@ -13,14 +13,21 @@ Each ref resolves to one of:
 
 Symbol-lookup strategy per suffix:
 
-* ``.py`` — AST parse, collect every top-level and nested
-  ``FunctionDef`` / ``AsyncFunctionDef`` / ``ClassDef`` name.
-  Briefing allows a ``def`` / ``class`` grep fallback; AST is the
-  rigorous path (per CLAUDE.md "at decision points, take the
-  rigorous path") and the cost difference is noise.
-* ``.S`` / ``.s`` — line-anchored label regex ``^\\s*<sym>\\s*:``.
-  Handles NASM (x86_64 per D048) and GAS (aarch64); both use
-  ``label:`` syntax at line start.
+* ``.py`` — AST parse, collect every ``FunctionDef`` /
+  ``AsyncFunctionDef`` / ``ClassDef`` name AND every
+  ``Assign``/``AnnAssign`` target, so module-level variables
+  like ``vm_launcher._proc_registry`` / ``_proc_lock`` resolve
+  as symbols. Briefing allows a ``def`` / ``class`` grep
+  fallback; AST is the rigorous path (per CLAUDE.md "at decision
+  points, take the rigorous path").
+* ``.S`` / ``.s`` — line-anchored regex for three forms, tried
+  in order: plain label ``^\\s*<sym>\\s*:`` (NASM x86_64 per
+  D048, GAS aarch64), NASM multi-line macro definition
+  ``^\\s*%macro\\s+<sym>\\b``, and NASM single-token macro
+  ``^\\s*%define\\s+<sym>\\b``. Ed flagged upcoming crypto work
+  will define CRC fold constants and related helpers as NASM
+  macros, so the auditor needs to recognize them as first-class
+  symbol definitions.
 * ``.c`` / ``.h`` — ``\\b<sym>\\s*\\(`` captures function
   definitions and declarations alike.
 * everything else (``.md``, ``.sh``, ``.yml``, plain text) —
@@ -134,39 +141,93 @@ def _resolve_symbol(parsed: ParsedRef, target: Path) -> ResolvedRef:
 
 
 def _symbol_in_py(text: str, symbol: str) -> bool:
-    """True iff any FunctionDef / AsyncFunctionDef / ClassDef in
-    ``text`` has name ``symbol``. Unparseable source falls back to
-    a ``def <symbol>`` / ``class <symbol>`` regex — better than
-    returning False on a file the AST briefly trips over (e.g.,
-    during partial edits)."""
+    """True iff ``symbol`` names a function, class, or top-level
+    variable in ``text``.
+
+    Real ontology refs point at module-level variables (e.g.
+    ``vm_launcher.py:_proc_registry``) as well as defs and
+    classes, so all three AST node classes are collected. Source
+    the AST can't parse falls back to a regex that matches
+    ``def``/``class``/``<sym> =``/``<sym>:``.
+    """
     try:
         tree = ast.parse(text)
     except SyntaxError:
         return _py_regex_fallback(text, symbol)
+    return symbol in _collect_py_names(tree)
+
+
+def _collect_py_names(tree: ast.AST) -> set[str]:
+    """Names defined anywhere in ``tree``: FunctionDef /
+    AsyncFunctionDef / ClassDef plus Assign / AnnAssign targets.
+
+    Uses ``ast.walk`` so nested definitions (methods, closures,
+    class-body assignments) also count — the ontology's refs are
+    typically top-level, but the auditor shouldn't false-negative
+    on a perfectly valid nested reference. Per-node dispatch
+    lives in ``_names_from_node`` to keep this pass under the
+    project's McCabe cap.
+    """
+    names: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(
-            node,
-            (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-        ) and node.name == symbol:
-            return True
-    return False
+        names.update(_names_from_node(node))
+    return names
+
+
+def _names_from_node(node: ast.AST) -> set[str]:
+    """Extract any name(s) this AST node defines at its own
+    position. Returns empty when the node is neither a def-class
+    nor a simple assignment."""
+    if isinstance(
+        node,
+        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+    ):
+        return {node.name}
+    if isinstance(node, ast.Assign):
+        return _names_from_assign_targets(node)
+    if isinstance(node, ast.AnnAssign) and isinstance(
+        node.target, ast.Name,
+    ):
+        return {node.target.id}
+    return set()
+
+
+def _names_from_assign_targets(node: ast.Assign) -> set[str]:
+    """``ast.Assign`` can have multiple ``targets`` (``a = b = 1``);
+    only plain ``Name`` targets contribute resolvable symbols —
+    tuple-unpacking, subscripting, and attribute assignment aren't
+    plausible refs from the ontology."""
+    names: set[str] = set()
+    for target in node.targets:
+        if isinstance(target, ast.Name):
+            names.add(target.id)
+    return names
 
 
 def _py_regex_fallback(text: str, symbol: str) -> bool:
     """Regex fallback for un-AST-parseable Python. Matches
-    ``def <symbol>`` / ``async def <symbol>`` / ``class <symbol>``
-    at word boundary."""
-    pattern = rf"(?:\bdef\s+|\bclass\s+){re.escape(symbol)}\b"
-    return re.search(pattern, text) is not None
+    ``def <sym>`` / ``class <sym>`` / line-start ``<sym> =`` /
+    line-start ``<sym>: ``."""
+    esc = re.escape(symbol)
+    def_or_class = rf"(?:\bdef\s+|\bclass\s+){esc}\b"
+    top_assign = rf"(?m)^{esc}\s*[:=]"
+    return bool(
+        re.search(def_or_class, text) or re.search(top_assign, text),
+    )
 
 
 def _symbol_in_asm(text: str, symbol: str) -> bool:
-    """True iff ``text`` contains a ``<symbol>:`` label at the
-    start of a line (optionally after whitespace). Covers NASM
-    (x86_64, D048) and GAS (aarch64) — both use the colon-suffix
-    label syntax."""
-    pattern = rf"(?m)^\s*{re.escape(symbol)}\s*:"
-    return re.search(pattern, text) is not None
+    """True iff ``text`` defines ``symbol`` as a label, NASM
+    ``%macro``, or NASM ``%define``. GAS (aarch64) only uses the
+    label form; NASM (x86_64, D048) uses all three and the
+    upcoming CRC / crypto side session will lean on macros."""
+    esc = re.escape(symbol)
+    patterns = [
+        rf"(?m)^\s*{esc}\s*:",
+        rf"(?m)^\s*%macro\s+{esc}\b",
+        rf"(?m)^\s*%define\s+{esc}\b",
+    ]
+    return any(re.search(p, text) is not None for p in patterns)
 
 
 def _symbol_in_c(text: str, symbol: str) -> bool:
