@@ -47,6 +47,18 @@ UART_POLL_TIMEOUT        equ 1 << 20      ; ~1 ms at modern CPU speeds
 VIRTIO_MMIO_BASE         equ 0xC0001000
 VIRTIO_MAGIC             equ 0x74726976   ; "virt" little-endian
 
+; Virtio-MMIO register offsets (Virtio 1.2 §4.2.2, Table 4.1).
+; Full layout isn't needed yet — only the Status register for the
+; VIO-001..003 init prefix. More offsets land with feature
+; negotiation (VIO-004..006) and virtqueue setup (VIO-007).
+VIRTIO_MMIO_STATUS       equ 0x070
+
+; Device Status bit values (Virtio 1.2 §2.1, "Device Status Field").
+; Bit-position numbering in the REQUIREMENTS.md VIO table is the
+; bit index; the MMIO Status register is written with OR-ed values.
+VIRTIO_STATUS_ACKNOWLEDGE equ 1   ; bit 0 — driver found the device
+VIRTIO_STATUS_DRIVER      equ 2   ; bit 1 — driver knows how to use it
+
 ; PVH ELF note. namesz=4 covers "Xen\0"; descsz=4 is the entry
 ; address that follows. NASM's `note` section-type directive emits
 ; SHT_NOTE directly, no ld name-heuristics needed.
@@ -97,9 +109,83 @@ _start:
     cmp eax, VIRTIO_MAGIC
     jne .virtio_fail
 
-    ; Match — announce and halt.
+    ; Match — announce.
     lea esi, [virtio_ok_msg]
     mov ecx, virtio_ok_len
+    call emit_bytes
+
+    ; --- Device-status init prefix (VIO-001, VIO-002, VIO-003) ---
+    ; Virtio 1.2 §2.1.2 steps 1-3: the driver (a) resets the device by
+    ; writing 0 to Status, (b) sets ACKNOWLEDGE, (c) sets DRIVER.
+    ; Later steps (features, FEATURES_OK, virtqueue init, DRIVER_OK)
+    ; live in follow-up commits — see docs/l2/REQUIREMENTS.md §4.1
+    ; VIO-004..009.
+    ;
+    ; §2.1 "Device Status only supports setting bits, not clearing
+    ; them; clearing can be done only by resetting the device" — so
+    ; the ACK/DRIVER steps are read-modify-write with OR, not blind
+    ; stores that would trash other (spurious) bits.
+    ;
+    ; §4.2.2.2 mandates a memory barrier before and after each MMIO
+    ; register access. The existing MagicValue probe above (lines
+    ; 93-102) documents the x86-TSO barrier choice: lfence for
+    ; loads, mfence for stores. This block follows the same pattern.
+    ; The mfence between a register-only `or` and the subsequent
+    ; store is redundant on x86 TSO — the preceding lfence already
+    ; serializes the prior load — but keeping it matches the literal
+    ; "before AND after each MMIO access" spec phrasing and the
+    ; MagicValue probe's style. Cost is zero on this init-only path.
+
+    ; VIO-001: reset device (write 0 to Status).
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], 0
+    mfence
+
+    ; VIO-002: read-modify-write ACKNOWLEDGE.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    or  eax, VIRTIO_STATUS_ACKNOWLEDGE
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mfence
+
+    ; VIO-003: read-modify-write DRIVER.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    or  eax, VIRTIO_STATUS_DRIVER
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mfence
+
+    ; Confirm both bits stuck and nothing else crept in. Direct
+    ; equality compare (not a masked one) catches FAILED (§2.1.2
+    ; lists it as an error signal the driver must honor) and any
+    ; other bit the device set unexpectedly mid-RMW.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    cmp eax, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
+    jne .status_fail
+
+    lea esi, [status_driver_msg]
+    mov ecx, status_driver_len
+    call emit_bytes
+    jmp .halt
+
+.status_fail:
+    ; eax holds the masked status value (ACK|DRIVER bits only). Emit
+    ; the marker and the observed value so a debugger sees exactly
+    ; what the device reported.
+    push eax
+    lea esi, [status_fail_msg]
+    mov ecx, status_fail_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
     call emit_bytes
     jmp .halt
 
@@ -209,5 +295,11 @@ virtio_ok_len    equ $ - virtio_ok_msg
 
 virtio_fail_msg: db 'VIRTIO:FAIL magic='
 virtio_fail_len  equ $ - virtio_fail_msg
+
+status_driver_msg: db 'STATUS:DRIVER', 10
+status_driver_len  equ $ - status_driver_msg
+
+status_fail_msg:   db 'STATUS:FAIL status='
+status_fail_len    equ $ - status_fail_msg
 
 newline:         db 10

@@ -182,6 +182,21 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "VIRTIO:OK observed — virtio-mmio magic verified"
+
+    # Device-status init prefix (VIO-001..003). boot.S walks the
+    # required §2.1.2 step 1-3 sequence (reset, ACKNOWLEDGE, DRIVER),
+    # reads the status register back, and emits STATUS:DRIVER on
+    # match or STATUS:FAIL status=<hex> on mismatch. Feature
+    # negotiation (VIO-004..006) and virtqueue setup (VIO-007) land
+    # in follow-up commits; the marker here advances as each stage
+    # does.
+    if ! grep -qE '^STATUS:DRIVER$' "$SERIAL"; then
+        echo "FAIL: STATUS:DRIVER not observed (init prefix VIO-001..003 failed?)"
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "STATUS:DRIVER observed — VIO-001..003 init prefix verified"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —

@@ -123,9 +123,9 @@ of this file by design.
 
 | ID | Requirement | Source | Status | Notes |
 |----|-------------|--------|--------|-------|
-| `VIO-001` | On init, reset the device (write 0 to Device Status register). | Virtio 1.2 §2.1.2 step 1 | spec | |
-| `VIO-002` | Set `ACKNOWLEDGE` (bit 0) in status. | Virtio 1.2 §2.1.2 step 2 | spec | |
-| `VIO-003` | Set `DRIVER` (bit 1) in status. | Virtio 1.2 §2.1.2 step 3 | spec | |
+| `VIO-001` | On init, reset the device (write 0 to Device Status register). | Virtio 1.2 §2.1.2 step 1 | implemented | `arch/x86_64/platform/firecracker/boot.S` init prefix; tracer bullet verifies `STATUS:DRIVER` marker. |
+| `VIO-002` | Set `ACKNOWLEDGE` (bit 0) in status. | Virtio 1.2 §2.1.2 step 2 | implemented | Same site; read-modify-write OR with `VIRTIO_STATUS_ACKNOWLEDGE`. |
+| `VIO-003` | Set `DRIVER` (bit 1) in status. | Virtio 1.2 §2.1.2 step 3 | implemented | Same site; read-modify-write OR with `VIRTIO_STATUS_DRIVER`. Read-back cross-checks both bits before emitting the marker; mismatch emits `STATUS:FAIL status=<hex>` and halts. |
 | `VIO-004` | Read device feature bits; select a subset; write driver feature bits. | Virtio 1.2 §2.1.2 step 4 | spec | |
 | `VIO-005` | Set `FEATURES_OK` (bit 3) in status. | Virtio 1.2 §2.1.2 step 5 | spec | |
 | `VIO-006` | Re-read status; MUST abort init if `FEATURES_OK` is not still set. | Virtio 1.2 §2.1.2 step 6 | spec | Host rejected our feature set. |
