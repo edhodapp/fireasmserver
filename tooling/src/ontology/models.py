@@ -12,14 +12,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from datetime import date as _date
-
 from pydantic import BaseModel, ValidationError, model_validator
+
+import re as _re
 
 from ontology.types import (
     Cardinality,
     Description,
     IsoDate,
+    IsoTimestamp,
     ModuleStatus,
     PerfDirection,
     Priority,
@@ -29,6 +30,12 @@ from ontology.types import (
     ShortName,
     SideSessionStatus,
 )
+
+# Extracted for in-file reuse by the OntologyDAG.current_node_id
+# validator — that field admits the empty string as a "no current
+# node" sentinel, so the plain ``SafeId`` annotation would be
+# over-strict. Keep the pattern literal in sync with types.SafeId.
+_SAFE_ID_RE = _re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$")
 
 
 # -- Problem Domain --
@@ -127,10 +134,16 @@ class Entity(BaseModel):
 
 
 class Relationship(BaseModel):
-    """A directed relationship between two entities."""
+    """A directed relationship between two entities.
 
-    source_entity_id: str
-    target_entity_id: str
+    Source and target ids are ``SafeId`` so malformed values are
+    caught at construction time, not only later via the
+    referential-integrity check. The RI check then confirms the
+    id resolves against the containing ``Ontology``'s entity
+    list."""
+
+    source_entity_id: SafeId
+    target_entity_id: SafeId
     name: str
     cardinality: Cardinality
     description: str = ""
@@ -162,7 +175,7 @@ class DomainConstraint(BaseModel):
 
     name: str
     description: str
-    entity_ids: list[str] = []
+    entity_ids: list[SafeId] = []
     expression: str = ""
     rationale: str = ""
     implementation_refs: list[str] = []
@@ -200,7 +213,7 @@ class PerformanceConstraint(BaseModel):
 
     name: str
     description: str
-    entity_ids: list[str] = []
+    entity_ids: list[SafeId] = []
     metric: str
     budget: float
     unit: str
@@ -238,7 +251,7 @@ class ClassSpec(BaseModel):
 class DataModel(BaseModel):
     """Maps a problem-domain entity to a code construct."""
 
-    entity_id: str
+    entity_id: SafeId
     storage: str
     class_name: str
     notes: str = ""
@@ -373,25 +386,6 @@ class SideSessionTask(BaseModel):
     commit_shas: list[str] = []
     merge_commit_sha: str = ""
 
-    @model_validator(mode="after")
-    def _date_is_real_calendar_day(self) -> "SideSessionTask":
-        """``IsoDate`` only enforces the ``YYYY-MM-DD`` shape, so
-        ``2026-02-30`` / ``2026-13-01`` / ``0000-01-01`` would
-        slip past it. Parse with ``datetime.date.fromisoformat``
-        to catch impossible calendar days and out-of-range years
-        (Python's MINYEAR is 1, which conveniently rejects
-        astronomical year 0 that ISO-8601 would otherwise
-        allow). Raises ``ValueError`` that Pydantic surfaces as
-        a ``ValidationError`` on construction."""
-        try:
-            _date.fromisoformat(self.date)
-        except ValueError as exc:
-            raise ValueError(
-                f"date {self.date!r} is structurally ISO-8601 but "
-                f"not a real calendar day: {exc}"
-            ) from exc
-        return self
-
 
 def make_branch_name(slug: str, date: str) -> str:
     """Canonical branch name for a ``SideSessionTask``.
@@ -471,29 +465,49 @@ class Ontology(BaseModel):
 
 
 class Decision(BaseModel):
-    """Records a design decision."""
+    """Records a design decision.
+
+    The ``chosen`` value MUST be one of the ``options`` — otherwise
+    the record represents an impossible state (a decision in favor
+    of something that wasn't even on the list). Enforced by
+    ``_chosen_is_an_option``.
+    """
 
     question: str
     options: list[str]
     chosen: str
     rationale: str
 
+    @model_validator(mode="after")
+    def _chosen_is_an_option(self) -> "Decision":
+        if self.chosen not in self.options:
+            raise ValueError(
+                f"Decision.chosen {self.chosen!r} is not among "
+                f"options {self.options!r}"
+            )
+        return self
+
 
 class DAGEdge(BaseModel):
-    """An edge in the version DAG."""
+    """An edge in the version DAG.
 
-    parent_id: str
-    child_id: str
+    ``parent_id`` and ``child_id`` reference ``DAGNode.id`` values;
+    tightening them to ``SafeId`` matches the entity-id cross-ref
+    pattern (malformed at construction, resolvable at RI time)."""
+
+    parent_id: SafeId
+    child_id: SafeId
     decision: Decision
-    created_at: str
+    created_at: IsoTimestamp
 
 
 class DAGNode(BaseModel):
-    """A node in the version DAG."""
+    """A node in the version DAG. ``id`` is ``SafeId`` for
+    consistency with the rest of the id-typed fields."""
 
-    id: str
+    id: SafeId
     ontology: Ontology
-    created_at: str
+    created_at: IsoTimestamp
     label: str = ""
 
 
@@ -504,6 +518,24 @@ class OntologyDAG(BaseModel):
     nodes: list[DAGNode] = []
     edges: list[DAGEdge] = []
     current_node_id: str = ""
+
+    @model_validator(mode="after")
+    def _current_node_id_shape(self) -> "OntologyDAG":
+        """``current_node_id`` is ``str`` rather than ``SafeId``
+        because the empty string is the "no current node" sentinel
+        used when the DAG is fresh. When non-empty, it MUST match
+        the ``SafeId`` regex so a malformed id can't hide behind
+        the sentinel escape hatch."""
+        if (
+            self.current_node_id
+            and not _SAFE_ID_RE.match(self.current_node_id)
+        ):
+            raise ValueError(
+                f"OntologyDAG.current_node_id {self.current_node_id!r}"
+                " must be empty (the 'no current node' sentinel) "
+                "or match the SafeId pattern"
+            )
+        return self
 
     # -- Navigation --
 

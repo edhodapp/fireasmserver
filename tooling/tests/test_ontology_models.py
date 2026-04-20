@@ -24,6 +24,9 @@ from ontology import (
 )
 
 
+_VALID_TS = "2026-04-20T12:00:00+00:00"
+
+
 def _entity(id_: str) -> Entity:
     return Entity(id=id_, name=id_, description="")
 
@@ -478,3 +481,284 @@ class TestPropertyNameShortName:
                 name="a" * 101,
                 property_type=PropertyType(kind="str"),
             )
+
+
+# ---------------------------------------------------------------
+# Decision.chosen ∈ Decision.options.
+# ---------------------------------------------------------------
+
+
+class TestDecisionChosenAmongOptions:
+    """``Decision.chosen`` MUST be one of ``Decision.options`` —
+    a record that picks an option that wasn't on the list
+    represents an impossible state."""
+
+    def test_accepts_chosen_in_options(self) -> None:
+        d = Decision(
+            question="q",
+            options=["A", "B", "C"],
+            chosen="B",
+            rationale="r",
+        )
+        assert d.chosen == "B"
+
+    def test_rejects_chosen_not_in_options(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Decision(
+                question="q",
+                options=["A", "B"],
+                chosen="C",
+                rationale="r",
+            )
+        message = str(exc.value)
+        assert "'C'" in message
+        assert "options" in message
+
+    def test_rejects_empty_options_with_any_chosen(self) -> None:
+        with pytest.raises(ValidationError):
+            Decision(
+                question="q",
+                options=[],
+                chosen="anything",
+                rationale="r",
+            )
+
+
+# ---------------------------------------------------------------
+# IsoTimestamp — applied to DAGNode.created_at / DAGEdge.created_at.
+# ---------------------------------------------------------------
+
+
+class TestIsoTimestampOnDagNode:
+    """``DAGNode.created_at`` is now ``IsoTimestamp`` — same
+    two-layer validation as ``IsoDate`` (regex + parse)."""
+
+    @pytest.mark.parametrize("ts", [
+        "2026-04-20T12:00:00",
+        "2026-04-20T12:00:00Z",
+        "2026-04-20T12:00:00+00:00",
+        "2026-04-20T12:00:00-07:00",
+        "2026-04-20T12:00:00.123456+00:00",
+    ])
+    def test_accepts_iso_timestamp(self, ts: str) -> None:
+        node = DAGNode(
+            id="n",
+            ontology=Ontology(),
+            created_at=ts,
+        )
+        assert node.created_at == ts
+
+    @pytest.mark.parametrize("bad", [
+        "2026-04-20",                   # date only
+        "2026-04-20 12:00:00",          # space separator
+        "26-04-20T12:00:00",            # two-digit year
+        "not-a-timestamp",
+        "",
+        "2026-02-30T12:00:00",          # impossible day
+        "2026-04-20T25:00:00",          # hour 25
+    ])
+    def test_rejects_bad_timestamp(self, bad: str) -> None:
+        with pytest.raises(ValidationError):
+            DAGNode(
+                id="n",
+                ontology=Ontology(),
+                created_at=bad,
+            )
+
+
+class TestIsoTimestampFractionalSeconds:
+    """Pin the accepted set of fractional-second widths so a
+    future Python upgrade can't silently change behavior. The
+    regex allows ``\\.\\d+`` (any width); ``datetime.fromisoformat``
+    in Python 3.11+ accepts most widths. Tests lock the
+    intersection."""
+
+    @pytest.mark.parametrize("frac", ["1", "12", "123", "123456", "1234567"])
+    def test_accepts_various_fractional_widths(
+        self, frac: str,
+    ) -> None:
+        ts = f"2026-04-20T12:00:00.{frac}+00:00"
+        node = DAGNode(id="n", ontology=Ontology(), created_at=ts)
+        assert node.created_at == ts
+
+
+class TestIsoTimestampOnDagEdge:
+    """Same ``IsoTimestamp`` contract applied to ``DAGEdge.created_at``."""
+
+    def test_applies_to_edges_too(self) -> None:
+        edge = DAGEdge(
+            parent_id="A",
+            child_id="B",
+            decision=Decision(
+                question="q", options=["x"], chosen="x", rationale="r",
+            ),
+            created_at=_VALID_TS,
+        )
+        assert edge.created_at == _VALID_TS
+
+    def test_rejects_bad_timestamp_on_edge(self) -> None:
+        with pytest.raises(ValidationError):
+            DAGEdge(
+                parent_id="A",
+                child_id="B",
+                decision=Decision(
+                    question="q", options=["x"], chosen="x",
+                    rationale="r",
+                ),
+                created_at="not-a-timestamp",
+            )
+
+
+# ---------------------------------------------------------------
+# SafeId tightening on cross-reference fields. Malformed IDs now
+# fail at construction time, in addition to the existing RI check
+# that catches dangling-but-well-formed references.
+# ---------------------------------------------------------------
+
+
+class TestSafeIdOnCrossReferences:
+    """Cross-reference fields (source/target/entity_ids) are now
+    ``SafeId`` — malformed ids caught at construction, not only
+    via the downstream RI check."""
+
+    @pytest.mark.parametrize("bad", [
+        "-leading-dash", "has space", "with/slash", ".",
+    ])
+    def test_relationship_source_rejects_malformed(
+        self, bad: str,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            Relationship(
+                source_entity_id=bad,
+                target_entity_id="b",
+                name="r",
+                cardinality="one_to_one",
+            )
+
+    @pytest.mark.parametrize("bad", [
+        "-leading-dash", "has space", "with/slash",
+    ])
+    def test_relationship_target_rejects_malformed(
+        self, bad: str,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            Relationship(
+                source_entity_id="a",
+                target_entity_id=bad,
+                name="r",
+                cardinality="one_to_one",
+            )
+
+    def test_domain_constraint_entity_ids_reject_malformed(self) -> None:
+        with pytest.raises(ValidationError):
+            DomainConstraint(
+                name="dc",
+                description="d",
+                entity_ids=["valid_one", "has space"],
+            )
+
+    def test_performance_constraint_entity_ids_reject_malformed(
+        self,
+    ) -> None:
+        with pytest.raises(ValidationError):
+            PerformanceConstraint(
+                name="pc",
+                description="d",
+                entity_ids=["-leading-dash"],
+                metric="m",
+                budget=1.0,
+                unit="u",
+                direction="min",
+            )
+
+    def test_data_model_entity_id_rejects_malformed(self) -> None:
+        with pytest.raises(ValidationError):
+            DataModel(
+                entity_id="has space",
+                storage="mem",
+                class_name="C",
+            )
+
+    def test_well_formed_ids_still_accepted(self) -> None:
+        """The tightening must not break the ids already in use
+        across every committed DAG node. Representative sample of
+        slug shapes the existing data contains."""
+        for good in [
+            "guest-image", "vm-instance", "ethernet-frame",
+            "test-case", "no-native-execution", "a",
+        ]:
+            Relationship(
+                source_entity_id=good,
+                target_entity_id="b",
+                name="r",
+                cardinality="one_to_one",
+            )
+
+
+class TestSafeIdOnDagIds:
+    """``DAGNode.id``, ``DAGEdge.parent_id`` / ``child_id``, and
+    ``OntologyDAG.current_node_id`` are also cross-reference ids
+    and carry the same ``SafeId`` shape requirement — the
+    committed DAG uses UUID strings (``1c03a47b-abe2-...``) which
+    match SafeId cleanly."""
+
+    @pytest.mark.parametrize("bad", [
+        "-leading-dash", "has space", "with/slash",
+    ])
+    def test_dag_node_id_rejects_malformed(self, bad: str) -> None:
+        with pytest.raises(ValidationError):
+            DAGNode(
+                id=bad,
+                ontology=Ontology(),
+                created_at=_VALID_TS,
+            )
+
+    def test_dag_edge_parent_id_rejects_malformed(self) -> None:
+        with pytest.raises(ValidationError):
+            DAGEdge(
+                parent_id="has space",
+                child_id="b",
+                decision=Decision(
+                    question="q", options=["x"], chosen="x",
+                    rationale="r",
+                ),
+                created_at=_VALID_TS,
+            )
+
+    def test_dag_edge_child_id_rejects_malformed(self) -> None:
+        with pytest.raises(ValidationError):
+            DAGEdge(
+                parent_id="a",
+                child_id="-leading",
+                decision=Decision(
+                    question="q", options=["x"], chosen="x",
+                    rationale="r",
+                ),
+                created_at=_VALID_TS,
+            )
+
+    def test_uuid_shaped_ids_accepted(self) -> None:
+        """The committed DAG's real ids are UUIDs. Double-check
+        the tightened rule still accepts them."""
+        uuid_like = "1c03a47b-abe2-4c44-aaf3-408285ddebef"
+        DAGNode(id=uuid_like, ontology=Ontology(), created_at=_VALID_TS)
+
+    def test_current_node_id_empty_is_the_sentinel(self) -> None:
+        """Empty ``current_node_id`` means "no current node" —
+        it's the fresh-DAG default and MUST pass validation."""
+        dag = OntologyDAG(project_name="p")
+        assert dag.current_node_id == ""
+
+    def test_current_node_id_rejects_malformed_when_non_empty(
+        self,
+    ) -> None:
+        with pytest.raises(ValidationError) as exc:
+            OntologyDAG(project_name="p", current_node_id="has space")
+        assert "current_node_id" in str(exc.value)
+
+    def test_current_node_id_accepts_valid_safeid(self) -> None:
+        dag = OntologyDAG(
+            project_name="p",
+            current_node_id="1c03a47b-abe2-4c44-aaf3-408285ddebef",
+        )
+        assert dag.current_node_id.startswith("1c03a47b")

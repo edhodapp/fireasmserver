@@ -8,9 +8,11 @@ here flow back to `~/python_agent` when that interface stabilizes.
 
 from __future__ import annotations
 
+from datetime import date as _date
+from datetime import datetime as _datetime
 from typing import Annotated, Literal
 
-from pydantic import StringConstraints
+from pydantic import AfterValidator, StringConstraints
 
 # -- Constrained string types --
 
@@ -31,14 +33,57 @@ Description = Annotated[str, StringConstraints(
     max_length=4000,
 )]
 
-# ISO-8601 date, "YYYY-MM-DD" exactly. Rejects two-digit years,
-# missing zero-padding, trailing whitespace, and any non-date
-# content. Stays a string for lossless round-trip through JSON;
-# callers convert to/from ``datetime.date`` locally if arithmetic
-# matters. Used by ``SideSessionTask`` (D052).
-IsoDate = Annotated[str, StringConstraints(
-    pattern=r"^\d{4}-\d{2}-\d{2}$",
-)]
+
+def _parse_iso_date(value: str) -> str:
+    """Verify ``value`` is a real calendar day. The regex on
+    ``IsoDate`` already enforced ``YYYY-MM-DD`` structure, so
+    this step catches impossible calendar dates like
+    ``2026-02-30`` / ``2026-13-01`` and year 0000 (Python's
+    ``date`` MINYEAR is 1). Returns the value unchanged on
+    success; raises ``ValueError`` otherwise."""
+    _date.fromisoformat(value)
+    return value
+
+
+def _parse_iso_timestamp(value: str) -> str:
+    """Verify ``value`` is a parseable ISO-8601 timestamp.
+    Same pattern as ``_parse_iso_date``: regex catches shape
+    mistakes, this layer catches impossible-but-structural
+    values."""
+    _datetime.fromisoformat(value)
+    return value
+
+
+# ISO-8601 date, "YYYY-MM-DD" exactly. Two layers of validation:
+# (1) ``StringConstraints`` regex enforces the literal shape —
+#     no two-digit years, no missing zero-padding, no whitespace.
+# (2) ``AfterValidator`` calls ``date.fromisoformat`` to reject
+#     impossible calendar days (Feb 30, month 13, non-leap
+#     Feb-29, ISO astronomical year 0).
+# Stays a string for lossless round-trip through JSON; callers
+# convert to ``datetime.date`` locally if arithmetic matters.
+IsoDate = Annotated[
+    str,
+    StringConstraints(pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    AfterValidator(_parse_iso_date),
+]
+
+# ISO-8601 timestamp: "YYYY-MM-DDTHH:MM:SS[.ffffff][±HH:MM|Z]".
+# Same two-layer pattern as ``IsoDate``. Used by ``DAGNode.created_at``
+# and ``DAGEdge.created_at`` so those fields match the stricter
+# bar already set for ``SideSessionTask.date``.
+IsoTimestamp = Annotated[
+    str,
+    StringConstraints(
+        pattern=(
+            r"^\d{4}-\d{2}-\d{2}"                      # date
+            r"T\d{2}:\d{2}:\d{2}"                      # time
+            r"(\.\d+)?"                                # optional fractional
+            r"([+-]\d{2}:\d{2}|Z)?$"                   # optional tz
+        ),
+    ),
+    AfterValidator(_parse_iso_timestamp),
+]
 
 # -- Literal types for enum-like fields --
 

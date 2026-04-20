@@ -783,7 +783,11 @@ def _build_dag_with_two_constraints(
         performance_constraints=[perf],
     )
     dag = OntologyDAG(project_name="t")
-    node = DAGNode(id="n1", ontology=ontology, created_at="now")
+    node = DAGNode(
+        id="n1",
+        ontology=ontology,
+        created_at="2026-04-20T12:00:00+00:00",
+    )
     dag.nodes.append(node)
     dag.current_node_id = "n1"
     save_dag(dag, str(dag_path))
@@ -836,7 +840,7 @@ class TestRunAudit:
         )
         dag = OntologyDAG(project_name="t")
         dag.nodes.append(DAGNode(
-            id="n", ontology=ontology, created_at="now",
+            id="n", ontology=ontology, created_at="2026-04-20T12:00:00+00:00",
         ))
         dag.current_node_id = "n"
         save_dag(dag, str(dag_path))
@@ -1053,7 +1057,7 @@ class TestCLIMain:
         )
         dag = OntologyDAG(project_name="t")
         dag.nodes.append(DAGNode(
-            id="n", ontology=ontology, created_at="now",
+            id="n", ontology=ontology, created_at="2026-04-20T12:00:00+00:00",
         ))
         dag.current_node_id = "n"
         save_dag(dag, str(dag_path))
