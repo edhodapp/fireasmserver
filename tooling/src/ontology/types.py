@@ -15,7 +15,11 @@ from pydantic import StringConstraints
 # -- Constrained string types --
 
 SafeId = Annotated[str, StringConstraints(
-    pattern=r"^[a-zA-Z0-9_-]+$",
+    # Must start with alphanumeric or underscore — forbidding a
+    # leading dash closes the "shell positional-arg eats `--slug`"
+    # failure mode where an id like `-rf` could be mistaken for a
+    # flag by downstream tooling. Interior dashes are fine.
+    pattern=r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$",
     max_length=100,
 )]
 
@@ -25,6 +29,15 @@ ShortName = Annotated[str, StringConstraints(
 
 Description = Annotated[str, StringConstraints(
     max_length=4000,
+)]
+
+# ISO-8601 date, "YYYY-MM-DD" exactly. Rejects two-digit years,
+# missing zero-padding, trailing whitespace, and any non-date
+# content. Stays a string for lossless round-trip through JSON;
+# callers convert to/from ``datetime.date`` locally if arithmetic
+# matters. Used by ``SideSessionTask`` (D052).
+IsoDate = Annotated[str, StringConstraints(
+    pattern=r"^\d{4}-\d{2}-\d{2}$",
 )]
 
 # -- Literal types for enum-like fields --
@@ -68,3 +81,21 @@ RequirementStatus = Literal[
 #   equal — measured value MUST equal budget exactly (rare; used for
 #           protocol-mandated constants like polynomial or magic)
 PerfDirection = Literal["max", "min", "equal"]
+
+# Lifecycle of a dispatched side-session task. Transitions are
+# NOT enforced at the Pydantic level — the model records the
+# current state; the bootstrap tool and subsequent status-change
+# subcommands drive the state machine (D052).
+#   dispatched  — bootstrap has cut the branch and written the
+#                 node; the side session has not yet started
+#                 (or has not yet signaled it has started).
+#   in_progress — the side session is actively committing on its
+#                 branch.
+#   merged      — the side branch has been merged into main; the
+#                 merge commit's SHA is recorded in
+#                 ``merge_commit_sha``.
+#   reverted    — dispatch was abandoned; the branch and
+#                 worktree have been cleaned up without merge.
+SideSessionStatus = Literal[
+    "dispatched", "in_progress", "merged", "reverted",
+]

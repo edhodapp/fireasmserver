@@ -12,11 +12,14 @@ from __future__ import annotations
 
 from typing import Any
 
+from datetime import date as _date
+
 from pydantic import BaseModel, ValidationError, model_validator
 
 from ontology.types import (
     Cardinality,
     Description,
+    IsoDate,
     ModuleStatus,
     PerfDirection,
     Priority,
@@ -24,6 +27,7 @@ from ontology.types import (
     RequirementStatus,
     SafeId,
     ShortName,
+    SideSessionStatus,
 )
 
 
@@ -208,6 +212,86 @@ class OpenQuestion(BaseModel):
     resolution: str = ""
 
 
+class SideSessionTask(BaseModel):
+    """A scoped task dispatched to a side session (per D052).
+
+    First ontology-dogfooding instance for non-requirements
+    content: the task spec lives here, the markdown briefing
+    is a rendering of it, and the git branch + commits reference
+    the task node by slug+date. Lifecycle mirrors the
+    ``RequirementStatus`` pattern with a task-appropriate set
+    of states (see ``SideSessionStatus``).
+
+    Fields:
+    - ``slug`` — snake_case identifier; ``SafeId`` regex rejects
+      path-traversal sequences, spaces, and git-ref-illegal
+      characters, closing the 2026-04-20 Gemini MEDIUM finding
+      about slug injection.
+    - ``date`` — dispatch date as ``YYYY-MM-DD``. Combined with
+      slug it forms the (slug, date) uniqueness key the
+      bootstrap duplicate-check uses.
+    - ``scope_paths`` — repo-relative paths the side session
+      may touch. Declarative only; enforcement is the merging
+      main session's review job (possibly future audit tool).
+    - ``required_reading`` — reference tags resolved by the
+      briefing renderer into a reading list.
+    - ``deliverables`` — one-sentence summary for the briefing
+      header and at-a-glance DAG inspection.
+    - ``rationale`` — optional longer justification.
+    - ``parent_commit_sha`` — main's tip at dispatch time; the
+      branch is cut here.
+    - ``status`` — lifecycle; see ``SideSessionStatus``.
+    - ``commit_shas`` — SHAs of commits made on the side branch.
+    - ``merge_commit_sha`` — set by the main session on merge.
+
+    ``branch_name`` is derived from slug+date via
+    ``make_branch_name`` below rather than stored, so the name
+    cannot drift out of sync with the slug+date key.
+    """
+
+    slug: SafeId
+    date: IsoDate
+    scope_paths: list[str] = []
+    required_reading: list[str] = []
+    deliverables: Description
+    rationale: Description = ""
+    parent_commit_sha: str = ""
+    status: SideSessionStatus = "dispatched"
+    commit_shas: list[str] = []
+    merge_commit_sha: str = ""
+
+    @model_validator(mode="after")
+    def _date_is_real_calendar_day(self) -> "SideSessionTask":
+        """``IsoDate`` only enforces the ``YYYY-MM-DD`` shape, so
+        ``2026-02-30`` / ``2026-13-01`` / ``0000-01-01`` would
+        slip past it. Parse with ``datetime.date.fromisoformat``
+        to catch impossible calendar days and out-of-range years
+        (Python's MINYEAR is 1, which conveniently rejects
+        astronomical year 0 that ISO-8601 would otherwise
+        allow). Raises ``ValueError`` that Pydantic surfaces as
+        a ``ValidationError`` on construction."""
+        try:
+            _date.fromisoformat(self.date)
+        except ValueError as exc:
+            raise ValueError(
+                f"date {self.date!r} is structurally ISO-8601 but "
+                f"not a real calendar day: {exc}"
+            ) from exc
+        return self
+
+
+def make_branch_name(slug: str, date: str) -> str:
+    """Canonical branch name for a ``SideSessionTask``.
+
+    Single source of truth so the bootstrap tool, the test
+    suite, and any future listing/merge helpers all agree on
+    the format. Callers pass raw ``slug`` and ``date`` — this
+    function does NOT re-validate them (the ``SideSessionTask``
+    model does at construction time).
+    """
+    return f"side/{date}_{slug}"
+
+
 class Ontology(BaseModel):
     """Complete ontology snapshot.
 
@@ -229,6 +313,7 @@ class Ontology(BaseModel):
     data_models: list[DataModel] = []
     external_dependencies: list[ExternalDependency] = []
     open_questions: list[OpenQuestion] = []
+    side_session_tasks: list[SideSessionTask] = []
 
     @model_validator(mode="after")
     def _check_referential_integrity(self) -> "Ontology":

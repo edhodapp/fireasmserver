@@ -534,3 +534,52 @@ def test_cli_refusal_returns_nonzero_and_prints_to_stderr(
     captured = capsys.readouterr()
     assert captured.err != ""
     assert captured.out == ""
+
+
+def test_cli_rejects_slug_with_path_traversal_or_special_chars(
+    minimal_repo: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closes the 2026-04-20 Gemini MEDIUM finding about
+    unvalidated slugs: a slug containing ``..``, spaces, slashes,
+    or git-ref-illegal characters must be rejected before ANY
+    state is created.
+
+    The model-layer validation (see
+    ``test_side_session_task_model.py``) locks the raw Pydantic
+    rejection; this test locks the user-observable behavior: the
+    CLI exits non-zero, no error leaks to stdout, and nothing is
+    created on disk. Goes GREEN once the CLI layer wires to the
+    model validator (C6 at the latest; may go green earlier if
+    the Bootstrapper constructs a ``SideSessionTask`` during
+    ``run()``)."""
+    # Snapshot the sibling-directory set BEFORE the run so we can
+    # assert exactly this set persists after the refusal — a
+    # stronger post-condition than substring-matching for known
+    # bogus fragments.
+    siblings_before = {p.name for p in minimal_repo.parent.iterdir()}
+    branches_before = _git(
+        minimal_repo, "branch", "--list"
+    ).stdout
+
+    monkeypatch.chdir(minimal_repo)
+    exit_code = cli_module.main([
+        "--slug", "../escape",
+        "--scope", "tooling/src/demo/",
+        "--required-reading", "DECISIONS.md:D049",
+        "--deliverables", "demo deliverables",
+        "--date", "2026-04-20",
+    ])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err != ""
+
+    # No new directories — anywhere outside minimal_repo — and no
+    # new branches. Catches bypasses the old "endswith('..')"
+    # pattern would miss (e.g., a slug that creates a wholly
+    # unrelated sibling name through some unforeseen substitution).
+    siblings_after = {p.name for p in minimal_repo.parent.iterdir()}
+    branches_after = _git(minimal_repo, "branch", "--list").stdout
+    assert siblings_after == siblings_before
+    assert branches_after == branches_before

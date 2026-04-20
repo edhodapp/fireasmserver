@@ -25,8 +25,11 @@ from ontology.models import (
     Property,
     PropertyType,
     Relationship,
+    SideSessionTask,
+    make_branch_name,
     validate_ontology_strict,
 )
+from ontology.types import SideSessionStatus
 
 __all__ = [
     "ClassSpec",
@@ -46,6 +49,9 @@ __all__ = [
     "Property",
     "PropertyType",
     "Relationship",
+    "SideSessionStatus",
+    "SideSessionTask",
     "dag_transaction",
+    "make_branch_name",
     "validate_ontology_strict",
 ]
