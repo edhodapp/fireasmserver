@@ -1882,6 +1882,115 @@ every local push. One-line addition after the existing
 `docs/side_sessions/2026-04-19_audit_ontology.md`); policy +
 wire-up landed by the main session in the same window.
 
+## 2026-04-20
+
+### D052: Side-session isolation via `git worktree` — supersedes branch-and-merge-only rule
+
+**Decision (2026-04-20):** concurrent Claude Code sessions on
+this repo run in separate `git worktree` instances, not in the
+same working tree on separate branches. The primary worktree
+stays at `/home/ed/fireasmserver` on `main`. Each side session
+gets its own sibling worktree at `/home/ed/fireasmserver-<slug>/`
+on branch `side/<YYYY-MM-DD>_<slug>`, cut at the `main`-tip
+`SideSessionTask`-dispatch commit.
+
+A `side-session-bootstrap` CLI tool (under construction in the
+main session, at `tooling/src/side_session_bootstrap/`) is the
+single entry point that:
+
+1. Writes a `SideSessionTask` ontology node to `main`'s DAG
+   (`status=dispatched`) and commits it on `main` — so the
+   main session can enumerate in-flight tasks by reading the
+   ontology rather than holding them in its head.
+2. Runs `git worktree add <path> -b <branch>` to create the
+   peer worktree at that dispatch commit; the side worktree
+   inherits the node for free.
+3. Creates a fresh `.venv` inside the side worktree and runs
+   `pip install -e .[dev]` pointed at the *side* worktree's
+   `tooling/src/` — critical so the side session's package
+   edits take effect when it imports its own package.
+4. Renders the briefing markdown inside the side worktree.
+5. Prints the worktree path + branch + paste-ready launch
+   prompt for Ed to start a Claude Code session in that
+   directory.
+6. Full rollback on any mid-run failure (no partial state on
+   any of: DAG, briefing file, worktree, venv).
+
+**Why:** two incidents on 2026-04-19 (`b655543` wide-net
+staging; `77d5826` cross-session `git reset` on the shared
+index) exposed the fact that the earlier "branch and merge"
+discipline wasn't sufficient — the primitive it sat on (shared
+working tree / shared HEAD / shared index) leaked state between
+sessions regardless of which branch each thought it was on.
+`git worktree` is the correct primitive: each session has its
+own HEAD, index, and files on disk; the shared `.git/` directory
+provides mutual branch visibility at zero extra plumbing.
+
+**Scaling property:** the worktree approach supports N
+concurrent side sessions with no extra machinery — each gets
+its own slug-keyed worktree, branch, and venv; the dispatch
+DAG records the full set; `git worktree list` enumerates them.
+Not a requirement for today's N=1 workflow, but a free
+consequence of the primitive choice (per
+`feedback_no_future_proof_no_future_kill.md`).
+
+**Venv isolation rationale:** a shared venv would make the
+side session's `import <package>` resolve against the main
+worktree's source via the editable install's pinned `sys.path`,
+leaving the side session unable to test its own edits.
+Per-worktree venv is correct scoping, not duplication for its
+own sake. Rebuilds in each worktree are ~10–20 s, amortized
+over the session's lifetime.
+
+**Why no `--worktree-root` CLI flag:** sibling convention
+suffices today; a knob with no concrete consumer stays out.
+Addable later without rename churn.
+
+**Implementation lifecycle:** the bootstrap tool itself is
+built in the main session (not dispatched to a side session),
+which sidesteps the chicken-and-egg: a tool that dispatches
+side sessions cannot itself be dispatched by the mechanism it
+is building. Once the tool is landed + tested, it dispatches
+all future side sessions.
+
+**D051 interaction:** the ontology audit tool is scoped to
+`DomainConstraint` and `PerformanceConstraint`; `SideSessionTask`
+is a new entity kind that the audit should pass through
+silently. Verification is part of the main-session build — the
+test suite adds a synthetic `SideSessionTask` to a fixture DAG
+and asserts `audit-ontology --exit-nonzero-on-gap` exits 0.
+
+**Cleanup on merge:** when a side branch lands on `main`, the
+corresponding worktree is removed (`git worktree remove
+<path>`), the local branch deleted (`git branch -d side/<slug>`),
+and the remote ref pruned (`git push origin --delete
+side/<slug>`). Automation of these steps is a possible
+follow-up tool but not in scope for the first cut.
+
+**Supersedes:**
+- The "branch-and-merge on shared working tree" language in
+  `~/.claude/projects/-home-ed-fireasmserver/memory/project_parallelization_strategy.md`.
+  That memory is being updated in the same commit as this
+  D-entry to point at D052 and drop the superseded mechanics.
+- The hand-written side-session briefing at
+  `docs/side_sessions/2026-04-19_side_session_bootstrap.md`
+  is deleted in the same commit — it described a
+  shared-working-tree dispatch flow that's no longer the
+  architecture.
+
+**Cross-refs:**
+- `D049` — the ontology schema that `SideSessionTask` extends.
+- `D051` — the pre-push audit gate; the build includes
+  verification that it ignores the new entity kind.
+- `feedback_shared_index_coordination.md` — the lesson from
+  the 2026-04-19 shared-index incidents that motivated this
+  pivot.
+- `project_ontology_dogfooding.md` — `SideSessionTask` is the
+  first non-requirements ontology dogfood instance.
+
+**Attribution:** main-session design + implementation,
+2026-04-20.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
