@@ -43,7 +43,9 @@ implicit filesystem roots) and testable.
 from __future__ import annotations
 
 import ast
+import functools
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
 
@@ -133,16 +135,39 @@ def _check_contained(
     resolve failures (permission denied, dangling symlink under
     ``strict=True``, etc.); either flavor is a containment
     failure from the auditor's view — honest signal rather than
-    an unhandled exception that kills the audit.
+    an unhandled exception that kills the audit. The repo-root
+    resolve goes through ``_resolve_strict`` so it's cached
+    across every ref in the same audit run.
     """
     try:
         real_target = target.resolve(strict=True)
-        real_root = repo_root.resolve(strict=True)
+        real_root = _resolve_strict(repo_root)
     except (OSError, RuntimeError) as exc:
         return f"symlink resolve failed for {raw_path}: {exc}"
     if not real_target.is_relative_to(real_root):
         return f"resolves outside repo: {raw_path} → {real_target}"
     return ""
+
+
+@functools.lru_cache(maxsize=128)
+def _resolve_strict(path: Path) -> Path:
+    """Cached ``Path.resolve(strict=True)``.
+
+    Every call to ``_check_contained`` resolves the repo root;
+    during an audit the root never changes, so re-statting the
+    filesystem per ref wastes cycles. ``lru_cache`` keyed on the
+    hashable ``Path`` argument shares the resolved value across
+    refs. Bounded at 128 so a long-running process doesn't
+    accumulate resolved-path memory indefinitely — the audit
+    tool itself is one-shot, but callers embedding it in a
+    longer service benefit from the bound.
+
+    Exceptions from ``resolve`` are NOT cached: lru_cache only
+    stores return values, so a failing resolve re-raises on the
+    next call — the caller wants fresh feedback if the
+    filesystem state changes.
+    """
+    return path.resolve(strict=True)
 
 
 def _resolve_line(parsed: ParsedRef, target: Path) -> ResolvedRef:
@@ -221,16 +246,62 @@ def _collect_py_names(tree: ast.AST) -> set[str]:
     return names
 
 
+_CONTAINER_STMTS = (
+    ast.If, ast.Try, ast.With, ast.AsyncWith,
+    ast.For, ast.AsyncFor, ast.While,
+)
+
+
 def _names_from_stmt(stmt: ast.stmt) -> set[str]:
-    """Names a top-level (module or class-body) statement
-    defines. Delegates assignment handling to
-    ``_names_from_assign_like`` so both code paths stay under the
-    project's McCabe cap."""
+    """Names a statement defines in its enclosing scope.
+
+    Function and class statements contribute their own name.
+    Control-flow containers (``if``/``try``/``with``/``for``/
+    ``while``) don't introduce a name themselves, but their
+    child bodies still run at the enclosing scope — a
+    version-gated import or a try/except fallback import is a
+    real module-level symbol, so we recurse into container
+    bodies rather than stopping at the container boundary.
+    Function bodies remain opaque: local variables inside
+    ``def foo(): ...`` don't leak out as module symbols.
+    """
     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return {stmt.name}
     if isinstance(stmt, ast.ClassDef):
         return _names_from_classdef(stmt)
+    if isinstance(stmt, _CONTAINER_STMTS):
+        return _names_from_container(stmt)
     return _names_from_assign_like(stmt)
+
+
+def _names_from_container(stmt: ast.stmt) -> set[str]:
+    """Collect names from every child statement-list inside a
+    control-flow block. Recurses via ``_names_from_stmt`` so
+    nested containers and ``def`` / ``class`` definitions inside
+    the block are captured at the same scope they'd have at
+    runtime."""
+    names: set[str] = set()
+    for child in _container_children(stmt):
+        names.update(_names_from_stmt(child))
+    return names
+
+
+def _container_children(stmt: ast.stmt) -> Iterator[ast.stmt]:
+    """Yield every statement directly contained in ``stmt``'s
+    body-like attributes.
+
+    Handles the union of body-bearing fields across the
+    container types: ``body`` (all), ``orelse`` (If/For/While/
+    Try), ``finalbody`` (Try), plus the ``handlers`` list of
+    ExceptHandlers on Try (each handler itself has a ``body``).
+    ``getattr(..., ())`` lets the same function handle every
+    container type without an isinstance ladder.
+    """
+    for attr in ("body", "orelse", "finalbody"):
+        for child in getattr(stmt, attr, ()):
+            yield child
+    for handler in getattr(stmt, "handlers", ()):
+        yield from handler.body
 
 
 def _names_from_classdef(stmt: ast.ClassDef) -> set[str]:
@@ -271,10 +342,15 @@ def _names_from_assign_targets(node: ast.Assign) -> set[str]:
 
 def _py_regex_fallback(text: str, symbol: str) -> bool:
     """Regex fallback for un-AST-parseable Python. Matches
-    ``def <sym>`` / ``class <sym>`` / line-start ``<sym> =`` /
-    line-start ``<sym>: ``."""
+    ``def <sym>`` / ``async def <sym>`` / ``class <sym>`` /
+    line-start ``<sym> =`` / line-start ``<sym>: ``. Async-def
+    support mirrors the AST path's ``AsyncFunctionDef`` handling
+    so the fallback doesn't regress coverage on syntax-broken
+    files that still define async functions."""
     esc = re.escape(symbol)
-    def_or_class = rf"(?:\bdef\s+|\bclass\s+){esc}\b"
+    def_or_class = (
+        rf"(?:\b(?:async\s+)?def\s+|\bclass\s+){esc}\b"
+    )
     top_assign = rf"(?m)^{esc}\s*[:=]"
     return bool(
         re.search(def_or_class, text) or re.search(top_assign, text),

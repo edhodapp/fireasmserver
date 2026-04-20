@@ -259,6 +259,75 @@ class TestResolvePySymbol:
         )
         assert ref.resolution == "resolved"
 
+    def test_conditional_import_resolves(
+        self, tmp_path: Path,
+    ) -> None:
+        # Version-gated imports and definitions inside module-
+        # level ``if`` blocks ARE module symbols and must resolve.
+        (tmp_path / "gated.py").write_text(
+            "import sys\n"
+            "if sys.version_info >= (3, 11):\n"
+            "    FLAG = 1\n"
+            "    def new_helper():\n        pass\n"
+            "else:\n"
+            "    FLAG = 0\n",
+            encoding="utf-8",
+        )
+        for sym in ("FLAG", "new_helper"):
+            ref = resolve_ref(
+                parse_ref(f"gated.py:{sym}"), tmp_path,
+            )
+            assert ref.resolution == "resolved", sym
+
+    def test_try_except_finally_resolves(
+        self, tmp_path: Path,
+    ) -> None:
+        # ``try`` body + except handler body + ``finally`` block
+        # all contribute module-level names.
+        (tmp_path / "trial.py").write_text(
+            "try:\n    primary = 1\n"
+            "except Exception:\n    fallback = 2\n"
+            "finally:\n    always = 3\n",
+            encoding="utf-8",
+        )
+        for sym in ("primary", "fallback", "always"):
+            ref = resolve_ref(
+                parse_ref(f"trial.py:{sym}"), tmp_path,
+            )
+            assert ref.resolution == "resolved", sym
+
+    def test_with_and_for_blocks_resolve(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "blocks.py").write_text(
+            "from contextlib import nullcontext\n"
+            "with nullcontext():\n    held = 1\n"
+            "for i in range(1):\n    LAST_I = i\n"
+            "while False:\n    never = 0\n",
+            encoding="utf-8",
+        )
+        for sym in ("held", "LAST_I", "never"):
+            ref = resolve_ref(
+                parse_ref(f"blocks.py:{sym}"), tmp_path,
+            )
+            assert ref.resolution == "resolved", sym
+
+    def test_async_def_regex_fallback(
+        self, tmp_path: Path,
+    ) -> None:
+        # SyntaxError forces the regex fallback; async def must
+        # still be recognized, matching the AST path's
+        # AsyncFunctionDef handling.
+        (tmp_path / "broken_async.py").write_text(
+            "def oops(\n"
+            "async def job():\n    pass\n",
+            encoding="utf-8",
+        )
+        ref = resolve_ref(
+            parse_ref("broken_async.py:job"), tmp_path,
+        )
+        assert ref.resolution == "resolved"
+
     def test_function_local_not_exposed(
         self, tmp_path: Path,
     ) -> None:
