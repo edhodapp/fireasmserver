@@ -11,13 +11,14 @@ downstream consumers.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from typing import Any
 
 from audit_ontology.audit import (
     AuditReport,
     ConstraintReport,
     Summary,
 )
+from audit_ontology.resolver import ResolvedRef
 
 
 def format_text(report: AuditReport) -> str:
@@ -71,7 +72,7 @@ def _format_constraint(row: ConstraintReport) -> list[str]:
     return lines
 
 
-def _ref_line(label: str, refs: Sequence[object]) -> str:
+def _ref_line(label: str, refs: list[ResolvedRef]) -> str:
     """Render one impl/verify line; ``—`` when no refs declared."""
     if not refs:
         return f"    {label}: — (none declared)"
@@ -79,7 +80,7 @@ def _ref_line(label: str, refs: Sequence[object]) -> str:
     return f"    {label}: {rendered}"
 
 
-def _ref_display(ref: object) -> str:
+def _ref_display(ref: ResolvedRef) -> str:
     """Compact representation of a single resolved ref.
 
     Resolved refs show only the raw string; unresolved refs
@@ -87,14 +88,9 @@ def _ref_display(ref: object) -> str:
     matrix can spot the break without dropping into the gaps
     section.
     """
-    # Duck-type access: tests pass a ResolvedRef but the
-    # formatter is happier not importing it across modules.
-    resolution = getattr(ref, "resolution", "unknown")
-    parsed = getattr(ref, "parsed", None)
-    raw = getattr(parsed, "raw", "?") if parsed else "?"
-    if resolution == "resolved":
-        return raw
-    return f"{raw}!{resolution}"
+    if ref.resolution == "resolved":
+        return ref.parsed.raw
+    return f"{ref.parsed.raw}!{ref.resolution}"
 
 
 def _format_gaps(reports: list[ConstraintReport]) -> list[str]:
@@ -146,7 +142,7 @@ def _percent(numerator: int, denominator: int) -> int:
     return round(100 * numerator / denominator)
 
 
-def _constraint_to_dict(row: ConstraintReport) -> dict[str, object]:
+def _constraint_to_dict(row: ConstraintReport) -> dict[str, Any]:
     """JSON-shape dict for one constraint, matching the briefing
     appendix schema."""
     return {
@@ -164,17 +160,13 @@ def _constraint_to_dict(row: ConstraintReport) -> dict[str, object]:
     }
 
 
-def _ref_to_dict(ref: object) -> dict[str, object]:
+def _ref_to_dict(ref: ResolvedRef) -> dict[str, Any]:
     """JSON-shape dict for one resolved ref: ``raw``,
     ``resolved`` (bool), ``kind`` (parser-level kind)."""
-    resolution = getattr(ref, "resolution", "invalid")
-    parsed = getattr(ref, "parsed", None)
-    raw = getattr(parsed, "raw", "") if parsed else ""
-    kind = getattr(parsed, "kind", "invalid") if parsed else "invalid"
     return {
-        "raw": raw,
-        "resolved": resolution == "resolved",
-        "kind": kind,
-        "resolution": resolution,
-        "detail": getattr(ref, "detail", ""),
+        "raw": ref.parsed.raw,
+        "resolved": ref.resolution == "resolved",
+        "kind": ref.parsed.kind,
+        "resolution": ref.resolution,
+        "detail": ref.detail,
     }

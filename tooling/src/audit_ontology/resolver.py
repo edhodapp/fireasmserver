@@ -56,6 +56,7 @@ Resolution = Literal[
     "file_missing",
     "symbol_missing",
     "line_out_of_range",
+    "outside_repo",
     "invalid",
 ]
 
@@ -77,9 +78,13 @@ class ResolvedRef(BaseModel):
 def resolve_ref(parsed: ParsedRef, repo_root: Path) -> ResolvedRef:
     """Resolve one parsed ref against ``repo_root``.
 
-    Dispatches on ``parsed.kind``. File existence is checked once
-    at the top so the three file-dependent branches can assume a
-    readable path.
+    Dispatches on ``parsed.kind``. Layered defense: parser rejects
+    absolute and ``..`` paths, resolver rejects paths whose
+    symlink-resolved target escapes ``repo_root`` — an in-repo
+    symlink pointing at ``/etc/shadow`` would otherwise be read
+    on every CI audit. File-existence + containment checks live
+    in ``_check_file_and_containment`` to keep this dispatch under
+    the project's McCabe cap.
     """
     if parsed.kind == "invalid":
         return ResolvedRef(
@@ -87,16 +92,57 @@ def resolve_ref(parsed: ParsedRef, repo_root: Path) -> ResolvedRef:
             detail=parsed.error,
         )
     target = repo_root / parsed.path
-    if not target.is_file():
-        return ResolvedRef(
-            parsed=parsed, resolution="file_missing",
-            detail=f"no such file: {parsed.path}",
-        )
+    early = _check_file_and_containment(target, repo_root, parsed)
+    if early is not None:
+        return early
     if parsed.kind == "whole_file":
         return ResolvedRef(parsed=parsed, resolution="resolved")
     if parsed.kind == "line":
         return _resolve_line(parsed, target)
     return _resolve_symbol(parsed, target)
+
+
+def _check_file_and_containment(
+    target: Path, repo_root: Path, parsed: ParsedRef,
+) -> ResolvedRef | None:
+    """Return a failure ResolvedRef when ``target`` is missing or
+    escapes ``repo_root`` via symlink, else ``None`` so the caller
+    proceeds to kind-specific resolution."""
+    if not target.is_file():
+        return ResolvedRef(
+            parsed=parsed, resolution="file_missing",
+            detail=f"no such file: {parsed.path}",
+        )
+    escape_detail = _check_contained(target, repo_root, parsed.path)
+    if escape_detail:
+        return ResolvedRef(
+            parsed=parsed, resolution="outside_repo",
+            detail=escape_detail,
+        )
+    return None
+
+
+def _check_contained(
+    target: Path, repo_root: Path, raw_path: str,
+) -> str:
+    """Empty when ``target`` resolves inside ``repo_root``; an
+    error detail string otherwise.
+
+    ``Path.resolve()`` raises ``RuntimeError`` on circular
+    symlinks (ELOOP, Python 3.11+) and ``OSError`` for other
+    resolve failures (permission denied, dangling symlink under
+    ``strict=True``, etc.); either flavor is a containment
+    failure from the auditor's view — honest signal rather than
+    an unhandled exception that kills the audit.
+    """
+    try:
+        real_target = target.resolve(strict=True)
+        real_root = repo_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        return f"symlink resolve failed for {raw_path}: {exc}"
+    if not real_target.is_relative_to(real_root):
+        return f"resolves outside repo: {raw_path} → {real_target}"
+    return ""
 
 
 def _resolve_line(parsed: ParsedRef, target: Path) -> ResolvedRef:
@@ -158,37 +204,56 @@ def _symbol_in_py(text: str, symbol: str) -> bool:
 
 
 def _collect_py_names(tree: ast.AST) -> set[str]:
-    """Names defined anywhere in ``tree``: FunctionDef /
-    AsyncFunctionDef / ClassDef plus Assign / AnnAssign targets.
+    """Module-level names plus class-body names in ``tree``.
 
-    Uses ``ast.walk`` so nested definitions (methods, closures,
-    class-body assignments) also count — the ontology's refs are
-    typically top-level, but the auditor shouldn't false-negative
-    on a perfectly valid nested reference. Per-node dispatch
-    lives in ``_names_from_node`` to keep this pass under the
-    project's McCabe cap.
+    Deliberately does NOT walk into function bodies: a function-
+    local ``data = ...`` is not a module symbol, and matching it
+    would false-positive on common loop-variable names (``x``,
+    ``i``, ``data``) that reviewers never intend as refs. Matches
+    the regex fallback's line-start-only scope, which was the
+    previous inconsistency Gemini flagged.
     """
     names: set[str] = set()
-    for node in ast.walk(tree):
-        names.update(_names_from_node(node))
+    if not isinstance(tree, ast.Module):
+        return names
+    for stmt in tree.body:
+        names.update(_names_from_stmt(stmt))
     return names
 
 
-def _names_from_node(node: ast.AST) -> set[str]:
-    """Extract any name(s) this AST node defines at its own
-    position. Returns empty when the node is neither a def-class
-    nor a simple assignment."""
-    if isinstance(
-        node,
-        (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+def _names_from_stmt(stmt: ast.stmt) -> set[str]:
+    """Names a top-level (module or class-body) statement
+    defines. Delegates assignment handling to
+    ``_names_from_assign_like`` so both code paths stay under the
+    project's McCabe cap."""
+    if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return {stmt.name}
+    if isinstance(stmt, ast.ClassDef):
+        return _names_from_classdef(stmt)
+    return _names_from_assign_like(stmt)
+
+
+def _names_from_classdef(stmt: ast.ClassDef) -> set[str]:
+    """Class name plus every statement directly inside its body
+    (methods, class attributes). Recurses via ``_names_from_stmt``
+    so a nested class still contributes its own name plus its
+    methods — an ontology ref to a nested-class method is rare
+    but valid."""
+    names = {stmt.name}
+    for inner in stmt.body:
+        names.update(_names_from_stmt(inner))
+    return names
+
+
+def _names_from_assign_like(stmt: ast.stmt) -> set[str]:
+    """Names introduced by a plain or annotated assignment at
+    statement scope."""
+    if isinstance(stmt, ast.Assign):
+        return _names_from_assign_targets(stmt)
+    if isinstance(stmt, ast.AnnAssign) and isinstance(
+        stmt.target, ast.Name,
     ):
-        return {node.name}
-    if isinstance(node, ast.Assign):
-        return _names_from_assign_targets(node)
-    if isinstance(node, ast.AnnAssign) and isinstance(
-        node.target, ast.Name,
-    ):
-        return {node.target.id}
+        return {stmt.target.id}
     return set()
 
 

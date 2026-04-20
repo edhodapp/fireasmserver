@@ -5,6 +5,7 @@ module per the briefing's definition of done.
 
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import sys
@@ -28,7 +29,11 @@ from audit_ontology.audit import (
 )
 from audit_ontology.cli import _exit_code_for, main
 from audit_ontology.parser import ParsedRef
-from audit_ontology.resolver import ResolvedRef
+from audit_ontology.resolver import (
+    ResolvedRef,
+    _check_contained,
+    _collect_py_names,
+)
 from ontology import (
     DAGNode,
     DomainConstraint,
@@ -254,6 +259,56 @@ class TestResolvePySymbol:
         )
         assert ref.resolution == "resolved"
 
+    def test_function_local_not_exposed(
+        self, tmp_path: Path,
+    ) -> None:
+        # A name defined inside a function body must NOT resolve
+        # as a module symbol — otherwise common loop variables
+        # (``i``, ``data``) false-positive on any ref that shares
+        # the name.
+        (tmp_path / "locals.py").write_text(
+            "def outer():\n"
+            "    data = 42\n"
+            "    return data\n",
+            encoding="utf-8",
+        )
+        ref = resolve_ref(
+            parse_ref("locals.py:data"), tmp_path,
+        )
+        assert ref.resolution == "symbol_missing"
+        # ``outer`` is still resolvable (module-level def).
+        ok = resolve_ref(
+            parse_ref("locals.py:outer"), tmp_path,
+        )
+        assert ok.resolution == "resolved"
+
+    def test_class_body_names_resolve(
+        self, tmp_path: Path,
+    ) -> None:
+        # Methods and class-attribute assignments at class body
+        # scope DO resolve — they're part of the module's public
+        # surface, just not top-level.
+        (tmp_path / "clazz.py").write_text(
+            "class Widget:\n"
+            "    color: str = 'red'\n"
+            "    def paint(self):\n"
+            "        pass\n",
+            encoding="utf-8",
+        )
+        for sym in ("Widget", "paint", "color"):
+            ref = resolve_ref(
+                parse_ref(f"clazz.py:{sym}"), tmp_path,
+            )
+            assert ref.resolution == "resolved", sym
+
+    def test_non_module_ast_returns_empty(self) -> None:
+        # Direct _collect_py_names call on a non-Module AST
+        # (e.g., an Expression) returns the empty set — a
+        # module-only collector shouldn't invent names on
+        # unexpected tree shapes.
+        expr = ast.parse("1 + 2", mode="eval")
+        assert _collect_py_names(expr) == set()
+
     def test_non_name_assign_target_ignored(
         self, tmp_path: Path,
     ) -> None:
@@ -444,6 +499,49 @@ class TestResolveOtherSymbol:
             parse_ref("README.md:not-there"), scratch_repo,
         )
         assert ref.resolution == "symbol_missing"
+
+
+class TestResolveSymlink:
+    """Resolver rejects refs whose target resolves outside
+    ``repo_root`` — defense-in-depth against in-repo symlinks
+    that point at sensitive system files."""
+
+    def test_symlink_escape_rejected(self, tmp_path: Path) -> None:
+        # Create a file OUTSIDE the fake repo and a symlink
+        # INSIDE that points to it; parser-level checks accept
+        # the relative path, resolver must catch the symlink
+        # escape.
+        outside = tmp_path.parent / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        link = repo / "escape.txt"
+        link.symlink_to(outside)
+        ref = resolve_ref(parse_ref("escape.txt"), repo)
+        assert ref.resolution == "outside_repo"
+        assert "outside repo" in ref.detail
+
+    def test_circular_symlink_reports_unsafe(
+        self, tmp_path: Path,
+    ) -> None:
+        # A → B → A. ``target.is_file()`` returns False on a
+        # broken symlink chain, so the resolver short-circuits to
+        # ``file_missing`` rather than reaching the resolve()
+        # path. Directly invoke ``_check_contained`` to exercise
+        # the OSError branch.
+        link_a = tmp_path / "a"
+        link_b = tmp_path / "b"
+        link_a.symlink_to(link_b)
+        link_b.symlink_to(link_a)
+        detail = _check_contained(link_a, tmp_path, "a")
+        assert "symlink resolve failed" in detail
+
+    def test_symlink_inside_repo_ok(self, tmp_path: Path) -> None:
+        # A symlink that resolves INSIDE the repo is fine.
+        (tmp_path / "real.txt").write_text("x", encoding="utf-8")
+        (tmp_path / "alias.txt").symlink_to(tmp_path / "real.txt")
+        ref = resolve_ref(parse_ref("alias.txt"), tmp_path)
+        assert ref.resolution == "resolved"
 
 
 class TestResolveInvalid:
