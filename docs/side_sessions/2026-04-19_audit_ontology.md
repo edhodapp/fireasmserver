@@ -342,35 +342,151 @@ Standard:
 
 ## Status (updated by side session at completion)
 
-- [ ] Parser module + tests
-- [ ] Resolver module + tests
-- [ ] Consistency checker + tests
-- [ ] Formatter (human + JSON) + tests
-- [ ] CLI entry point + tests
-- [ ] 100 % branch coverage on the new module
-- [ ] Ran clean against current ontology; output reviewed for
+- [x] Parser module + tests
+- [x] Resolver module + tests
+- [x] Consistency checker + tests
+- [x] Formatter (human + JSON) + tests
+- [x] CLI entry point + tests
+- [x] 100 % branch coverage on the new module
+- [x] Ran clean against current ontology; output reviewed for
       accuracy against known state
-- [ ] Pre-push integration suite green
-- [ ] Commit SHAs recorded: <fill in at completion>
+- [x] Pre-push integration suite green
+- [x] Commit SHAs recorded:
+      - `f4936f5` — C1: ref parser + repo resolver
+      - `46a60db` — C2: consistency + audit + formatter + CLI
+      - `5423b02` — C2a: symlink guard + AST-scope tightening
+      - `eb0691e` — C2b: container-block recursion + async-def
+        fallback + root cache
+      - `8fa291f` — C2c: drop CWD-sensitive cache + indent-tolerate
+        regex fallback
 
 ### New CD surface (flag for main session per
 `feedback_cd_pipeline_main_owns_side_flags.md`)
 
-- New test file(s): `<fill in>`
-- New runtime dependencies (if any): `<fill in — likely none;
-  stdlib + pydantic (already a dep) should suffice>`
-- New CLI console entry: `<if you add one to pyproject.toml,
-  note it here>`
-- Any non-pytest gates introduced: `<likely none>`
+- **New test file(s):**
+  `tooling/tests/test_audit_ontology.py` — picked up
+  automatically by `pytest -q` collection in both the pre-push
+  hook and CI `cd-matrix.yml`; zero-wiring addition.
+- **New runtime dependencies:** none. Stdlib (`ast`, `re`,
+  `json`, `argparse`, `functools`, `pathlib`, `collections.abc`,
+  `contextlib`) plus pydantic (already a dep) plus the in-repo
+  `ontology` package (forked 2026-04-19 into
+  `tooling/src/ontology/`).
+- **New CLI console entry (NOT added — flagged for main):** the
+  `[project.scripts]` table in `pyproject.toml` would benefit
+  from
+  `audit-ontology = "audit_ontology.cli:main"` so Ed can run
+  `audit-ontology` instead of
+  `PYTHONPATH=tooling/src python -m audit_ontology`.
+  Side session did NOT add this per
+  `feedback_cd_pipeline_main_owns_side_flags.md` (pyproject is
+  main-session territory).
+- **Non-pytest gates introduced:** none. The tool itself could
+  become a non-pytest gate in a future pass (
+  `audit-ontology --exit-nonzero-on-gap` as a pre-push step once
+  Ed wants broken-ref CI enforcement), but that's a
+  main-session call to wire into `tooling/hooks/pre_push.sh`.
 
 ### Deviations from briefing
 
-(Side session: fill this in at completion. Every deviation from
-the plan above gets a bullet with reason, per the "track every
-requirements deviation" rule.)
+- **Parser path-traversal guard.** Briefing didn't specify one;
+  clean-Claude review flagged `Path(root) / "/etc/passwd"`
+  silently drops `root`, so the parser now rejects absolute
+  paths and `..` segments at parse time. Mirrors
+  `vm_launcher.py:_reject_traversal` posture. Ed's call
+  (approved).
+- **Resolver outside-repo symlink guard.** Briefing didn't
+  specify one; Gemini round-2 flagged in-repo symlinks to
+  sensitive system files as a CI risk. Resolver now rejects
+  refs whose `Path.resolve(strict=True)` lands outside
+  `repo_root` with a new `outside_repo` resolution. Ed's call
+  (approved).
+- **`.py` symbol lookup expanded to module-level assigns AND
+  class-body names AND container-block bodies (if / try /
+  with / for / while).** Briefing specified "AST parse,
+  FunctionDef / AsyncFunctionDef / ClassDef"; live-ontology
+  run surfaced that refs like `vm_launcher.py:_proc_lock`
+  point at module-level variables and previously
+  false-positive-resolved via substring coincidence. Expanded
+  to module + class body (but NOT function bodies — local
+  variables don't leak as module symbols). Container-block
+  recursion added post-C2a so version-gated imports resolve.
+- **`.S` symbol lookup expanded from label-only to label +
+  NASM `%macro` + NASM `%define`.** Ed flagged mid-task that
+  the upcoming CRC / crypto work will define fold-by-N
+  helpers as NASM macros — added the regex alternatives so
+  refs to those macros resolve when they land.
+- **Two consistency-check extensions.** Briefing listed four
+  gap rules; Ed approved two extensions: `status=tested` with
+  empty impl_refs is a gap (verifying what isn't implemented
+  is incoherent), and `status=implemented` with empty
+  verify_refs is a gap ("implemented but unverified" is a
+  claim, not a fact).
+- **No `pyproject.toml` edit.** Briefing's Commit C3 proposed
+  a console-script entry; side session skipped per
+  `feedback_cd_pipeline_main_owns_side_flags.md`. Flagged
+  above as a main-session integration task.
 
 ### Observations for the main session
 
-(Anything the main session should know when integrating — cross-
-cutting concerns, surprising findings, things to codify as
-D-entries.)
+- **Live audit is currently clean** (12 constraints, 24
+  resolved refs, 0 gaps) against the committed ontology at
+  node `a8e4d129-2055-4869-8526-1d08fffb998d`. This was
+  NOT true before C1 landed — the O4 back-fill commit
+  (`6fe19c7`) technically shipped two latent
+  symbol-resolution bugs (`_proc_registry` / `_proc_lock`
+  referenced as module-level vars but the audit tool's first
+  version only knew defs/classes); they'd have surfaced as
+  `symbol_missing` if the tool had landed first. Worth
+  adding a D-entry noting the tool is now the closing gate
+  on ontology edits: "run `audit-ontology
+  --exit-nonzero-on-gap` before committing ontology
+  changes."
+- **Pre-push gate wiring.** Consider adding
+  `audit-ontology --exit-nonzero-on-gap` to
+  `tooling/hooks/pre_push.sh` once CI is ready to enforce.
+  Currently optional, but enforcing prevents broken refs
+  from landing on `origin/main`. Main session's call.
+- **Deferred Gemini findings (same "add on first real need"
+  line as C-macro loosening).** Current ontology doesn't
+  exercise any of these; noting for future triage:
+  - `ast.Match` (Python 3.10+) blocks — add to container
+    list + handle `MatchCase` body when match shows up in
+    tooling code.
+  - `ast.Import` / `ast.ImportFrom` target capture — when
+    the ontology starts referencing re-exports via
+    `__init__.py:Name`.
+  - Tuple/list unpacking in `Assign` targets (`X, Y = ...`)
+    — trivial extension of `_names_from_assign_targets`
+    when needed.
+  - `_py_regex_fallback`'s `def_or_class` pattern is not
+    line-anchored (unlike the assign branch); could
+    false-positive on `# def foo()` in a comment. Only
+    matters on SyntaxError-recovery path; tighten if it
+    ever bites.
+  - `_symbol_in_c` matches function calls as well as
+    definitions; Ed explicitly chose to keep briefing's
+    `<sym>(` pattern for now. Revisit when C code appears
+    in the ontology or when the call-vs-definition
+    distinction starts mattering.
+  - `_resolve_line` / `_resolve_symbol` read the whole file;
+    OK at current scale (~24 refs × ≤ few-KB files). Revisit
+    if the ontology grows thousands of refs or starts
+    pointing into generated data.
+- **Commit mis-attribution incident.** First C1 attempt hit
+  a parallel-session index collision (main session's commit
+  landed between my `git add` and `git commit`, lost my
+  staged state; pre-commit hook reported "No Python files
+  staged" and my `_proc_registry` / `_proc_lock`-fixing
+  resolver work briefly looked committed when it wasn't). No
+  content lost — files existed in working tree, re-staged
+  and landed as `f4936f5`. Relevant for
+  `feedback_explicit_git_add_during_parallel_sessions.md`:
+  the rule "explicit per-file add" held; the failure mode
+  was index concurrency, not wide-net staging.
+- **Resolver module now embeds some fireasmserver-specific
+  knowledge** (NASM macro syntax, GAS label syntax,
+  `.py`/`.S`/`.c`/`.h`/`.md` suffix routing). If this tool
+  ever gets extracted to be reusable across projects, the
+  suffix-to-handler map should become a constructor-injected
+  registry. Not a today-problem.
