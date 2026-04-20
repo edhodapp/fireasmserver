@@ -762,3 +762,71 @@ class TestSafeIdOnDagIds:
             current_node_id="1c03a47b-abe2-4c44-aaf3-408285ddebef",
         )
         assert dag.current_node_id.startswith("1c03a47b")
+
+    def test_current_node_id_rejects_over_100_chars(self) -> None:
+        """Even if the regex matches, a non-empty
+        ``current_node_id`` must honor ``SafeId``'s
+        ``max_length=100`` bound. A valid-shaped id longer than
+        that would silently bypass length checks elsewhere."""
+        with pytest.raises(ValidationError) as exc:
+            OntologyDAG(project_name="p", current_node_id="a" * 101)
+        assert "current_node_id" in str(exc.value)
+
+
+class TestConstraintNameUniqueness:
+    """``DomainConstraint.name`` and ``PerformanceConstraint.name``
+    are used as identifiers in the RI error messages, so
+    duplicates within an ontology produce ambiguous diagnostics.
+    The uniqueness check spans both lists — a domain constraint
+    named the same as a performance constraint is also a clash."""
+
+    def test_unique_names_accepted(self) -> None:
+        Ontology(
+            entities=[_entity("a")],
+            domain_constraints=[
+                DomainConstraint(
+                    name="dc1", description="", entity_ids=["a"],
+                ),
+                DomainConstraint(
+                    name="dc2", description="", entity_ids=["a"],
+                ),
+            ],
+            performance_constraints=[PerformanceConstraint(
+                name="pc1", description="", entity_ids=["a"],
+                metric="m", budget=1.0, unit="u", direction="min",
+            )],
+        )
+
+    def test_duplicate_domain_constraint_name_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                domain_constraints=[
+                    DomainConstraint(
+                        name="dup", description="", entity_ids=["a"],
+                    ),
+                    DomainConstraint(
+                        name="dup", description="", entity_ids=["a"],
+                    ),
+                ],
+            )
+        assert "'dup'" in str(exc.value)
+        assert "not unique" in str(exc.value)
+
+    def test_duplicate_across_kinds_rejected(self) -> None:
+        """A DomainConstraint and a PerformanceConstraint
+        sharing the same name also counts as a collision —
+        error messages can't distinguish them."""
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                domain_constraints=[DomainConstraint(
+                    name="shared", description="", entity_ids=["a"],
+                )],
+                performance_constraints=[PerformanceConstraint(
+                    name="shared", description="", entity_ids=["a"],
+                    metric="m", budget=1.0, unit="u", direction="min",
+                )],
+            )
+        assert "'shared'" in str(exc.value)
+        assert "not unique" in str(exc.value)

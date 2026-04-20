@@ -453,6 +453,10 @@ class Ontology(BaseModel):
         ))
         errors.extend(_check_data_model_refs(self.data_models, known))
         errors.extend(_check_property_entity_ref_refs(self.entities, known))
+        errors.extend(_check_constraint_name_uniqueness(
+            self.domain_constraints,
+            self.performance_constraints,
+        ))
         if errors:
             raise ValueError(
                 "referential-integrity violations:\n  - "
@@ -524,16 +528,19 @@ class OntologyDAG(BaseModel):
         """``current_node_id`` is ``str`` rather than ``SafeId``
         because the empty string is the "no current node" sentinel
         used when the DAG is fresh. When non-empty, it MUST match
-        the ``SafeId`` regex so a malformed id can't hide behind
-        the sentinel escape hatch."""
+        the full ``SafeId`` contract — both the regex AND the
+        ``max_length=100`` bound — so a malformed or over-long id
+        can't hide behind the sentinel escape hatch."""
+        if not self.current_node_id:
+            return self
         if (
-            self.current_node_id
-            and not _SAFE_ID_RE.match(self.current_node_id)
+            len(self.current_node_id) > 100
+            or not _SAFE_ID_RE.match(self.current_node_id)
         ):
             raise ValueError(
                 f"OntologyDAG.current_node_id {self.current_node_id!r}"
                 " must be empty (the 'no current node' sentinel) "
-                "or match the SafeId pattern"
+                "or match the SafeId pattern (regex + max_length=100)"
             )
         return self
 
@@ -691,6 +698,26 @@ def _property_entity_ref_error(
         f"Property '{entity_id}.{prop.name}' entity_ref "
         f"'{pt.reference}' not in entities"
     )
+
+
+def _check_constraint_name_uniqueness(
+    domain_constraints: list[DomainConstraint],
+    performance_constraints: list[PerformanceConstraint],
+) -> list[str]:
+    """Constraint names are used as identifiers in the RI error
+    messages (`_check_id_list_refs` cites `{owner}.{name}`), so
+    duplicates within a single ontology make those messages
+    ambiguous. Flag any name that appears more than once within
+    either kind, or across the two kinds."""
+    counts: dict[str, int] = {}
+    for dc in domain_constraints:
+        counts[dc.name] = counts.get(dc.name, 0) + 1
+    for pc in performance_constraints:
+        counts[pc.name] = counts.get(pc.name, 0) + 1
+    return [
+        f"constraint name {name!r} is not unique (appears {n} times)"
+        for name, n in sorted(counts.items()) if n > 1
+    ]
 
 
 def _check_property_entity_ref_refs(
