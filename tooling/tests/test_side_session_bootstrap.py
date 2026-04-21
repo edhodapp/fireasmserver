@@ -549,9 +549,6 @@ def test_briefing_includes_caller_supplied_required_reading(
 # ---------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True, reason="RED until C6 (CLI argparse + exit codes)",
-)
 def test_cli_success_returns_zero_and_prints_launch_prompt(
     minimal_repo: Path,
     capsys: pytest.CaptureFixture[str],
@@ -573,9 +570,6 @@ def test_cli_success_returns_zero_and_prints_launch_prompt(
     assert "side/2026-04-20_demo_task" in out
 
 
-@pytest.mark.xfail(
-    strict=True, reason="RED until C6 (CLI argparse + exit codes)",
-)
 def test_cli_refusal_returns_nonzero_and_prints_to_stderr(
     minimal_repo: Path,
     capsys: pytest.CaptureFixture[str],
@@ -602,9 +596,6 @@ def test_cli_refusal_returns_nonzero_and_prints_to_stderr(
     assert captured.out == ""
 
 
-@pytest.mark.xfail(
-    strict=True, reason="RED until C6 (CLI argparse + exit codes)",
-)
 def test_cli_rejects_slug_with_path_traversal_or_special_chars(
     minimal_repo: Path,
     capsys: pytest.CaptureFixture[str],
