@@ -125,14 +125,20 @@ class Bootstrapper:
                 ),
             )
             self._setup_venv(worktree_path)
-            self._render_briefing(worktree_path)
+            self._render_briefing(worktree_path, task)
         except BootstrapError:
-            _run_rollback(rollback)
+            _run_rollback(rollback, reraise_annotation=False)
             raise
         except Exception as exc:
-            _run_rollback(rollback)
+            cleanup_errs = _run_rollback(
+                rollback, reraise_annotation=True,
+            )
+            suffix = (
+                f" — rollback issues: {cleanup_errs}"
+                if cleanup_errs else ""
+            )
             raise BootstrapError(
-                f"rollback fired: {exc}"
+                f"rollback fired: {exc}{suffix}"
             ) from exc
 
         briefing_path = self._briefing_path(worktree_path)
@@ -212,15 +218,21 @@ class Bootstrapper:
         except venv_ops.VenvSetupError as exc:
             raise BootstrapError(f"venv setup failed: {exc}") from exc
 
-    def _render_briefing(self, worktree_path: Path) -> None:
+    def _render_briefing(
+        self, worktree_path: Path, task: SideSessionTask,
+    ) -> None:
         """Render the canonical briefing markdown into
         ``<worktree>/docs/side_sessions/<date>_<slug>.md``.
+        Takes the pre-built ``task`` to avoid re-running
+        SideSessionTask's Pydantic validators a second time.
 
         Defined as a method so behavioral rollback tests can
         monkeypatch it with raising=True."""
         briefing_path = self._briefing_path(worktree_path)
         briefing_path.parent.mkdir(parents=True, exist_ok=True)
-        briefing_path.write_text(render_briefing(self._build_task()))
+        briefing_path.write_text(
+            render_briefing(task), encoding="utf-8",
+        )
 
     def _cleanup_worktree_and_branch(
         self, worktree_path: Path, branch: str,
@@ -289,15 +301,26 @@ class Bootstrapper:
         )
 
 
-def _run_rollback(rollback: list[Callable[[], None]]) -> None:
-    """Fire registered rollback hooks in reverse order. Each
-    hook is best-effort — a failure inside rollback is
-    swallowed so later hooks still run, because partial cleanup
-    is strictly better than no cleanup."""
+def _run_rollback(
+    rollback: list[Callable[[], None]],
+    *,
+    reraise_annotation: bool,
+) -> list[str]:
+    """Fire registered rollback hooks in reverse order.
+
+    Each hook's exception is caught so later hooks still run
+    (partial cleanup beats no cleanup). When
+    ``reraise_annotation`` is True, the caller receives a list
+    of error-summary strings to append to the outer
+    ``BootstrapError`` — so a silent cleanup failure can't
+    leave the operator staring at a "rolled back OK" message
+    while the filesystem has a ghost worktree. Returns an empty
+    list when no hook errored."""
+    errors: list[str] = []
     for hook in reversed(rollback):
         try:
             hook()
-        except Exception:  # pylint: disable=broad-except
-            # Intentional — we're already in the failure path;
-            # an exception here would mask the original cause.
-            pass
+        except Exception as exc:  # pylint: disable=broad-except
+            if reraise_annotation:
+                errors.append(f"{type(exc).__name__}: {exc}")
+    return errors
