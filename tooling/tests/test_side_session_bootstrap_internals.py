@@ -17,8 +17,15 @@ from typing import Any
 
 import pytest
 
+from pydantic import ValidationError
+
 from ontology import Entity, Ontology, OntologyDAG, SideSessionTask
 from ontology.dag import save_dag, save_snapshot
+from side_session_bootstrap.bootstrap import (
+    BootstrapError,
+    Bootstrapper,
+    _format_validation_error,
+)
 from side_session_bootstrap.ontology_writer import (
     OntologyWriteError,
     write_dispatch_node,
@@ -329,3 +336,66 @@ class TestWriteDispatchNode:
         current = dag.get_current_node()
         assert current is not None
         assert len(current.ontology.side_session_tasks) == 3
+
+
+# ---------------------------------------------------------------
+# _format_validation_error — stderr readability
+# (closes hygiene-gaps.md #20)
+# ---------------------------------------------------------------
+
+
+class TestFormatValidationError:
+    """The operator-facing formatter must produce a flat,
+    readable line rather than Python's list-of-dicts repr."""
+
+    def _raise_invalid(self, **overrides: object) -> ValidationError:
+        """Helper — trigger a SideSessionTask ValidationError
+        with one or more field overrides that violate the model."""
+        kwargs: dict[str, object] = {
+            "slug": "good_slug",
+            "date": "2026-04-20",
+            "deliverables": "d",
+        }
+        kwargs.update(overrides)
+        try:
+            SideSessionTask(**kwargs)  # type: ignore[arg-type]
+        except ValidationError as exc:
+            return exc
+        raise AssertionError("expected ValidationError")
+
+    def test_single_field_error_is_flat(self) -> None:
+        exc = self._raise_invalid(slug="../bad")
+        out = _format_validation_error(exc)
+        assert "slug" in out
+        # No Python-list brackets leaking through.
+        assert not out.startswith("[")
+        assert not out.endswith("]")
+
+    def test_multi_field_errors_joined_with_semicolons(self) -> None:
+        exc = self._raise_invalid(slug="../bad", date="not-a-date")
+        out = _format_validation_error(exc)
+        # Both offending fields present.
+        assert "slug" in out
+        assert "date" in out
+        # Semicolon separator rather than list-comma.
+        assert "; " in out
+
+    def test_bootstrapper_build_task_uses_formatter(self) -> None:
+        """``Bootstrapper._build_task`` routes ValidationError
+        through the formatter before wrapping in BootstrapError."""
+        bs = Bootstrapper(
+            slug="../traversal",
+            scope_paths=[],
+            required_reading=[],
+            deliverables="d",
+            rationale="",
+            date="2026-04-20",
+            repo_root=Path("/tmp"),
+        )
+        with pytest.raises(BootstrapError) as excinfo:
+            bs._build_task()  # pylint: disable=protected-access
+        message = str(excinfo.value)
+        assert "invalid task input:" in message
+        # Formatter output, not raw list repr.
+        assert "slug:" in message
+        assert "[{'" not in message

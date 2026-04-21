@@ -299,7 +299,7 @@ class Bootstrapper:
             )
         except ValidationError as exc:
             raise BootstrapError(
-                f"invalid task input: {exc.errors()}",
+                f"invalid task input: {_format_validation_error(exc)}",
             ) from exc
 
     def _worktree_path(self) -> Path:
@@ -335,6 +335,21 @@ class Bootstrapper:
             f"worktree. Do not checkout other branches. "
             f"Report your plan before writing implementation code."
         )
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """Render a Pydantic ``ValidationError`` into a flat
+    operator-readable string. Pydantic's ``.errors()`` returns a
+    list of dicts whose Python repr leaks to stderr unreadably;
+    this formatter joins per-field lines with "; ". Closes
+    ``project_ontology_hygiene_gaps.md`` #20."""
+    lines: list[str] = []
+    for err in exc.errors():
+        loc_path = err.get("loc", ())
+        loc = ".".join(str(part) for part in loc_path) or "<root>"
+        msg = err.get("msg", "validation failed")
+        lines.append(f"{loc}: {msg}")
+    return "; ".join(lines)
 
 
 def _handle_dispatch_failure(
