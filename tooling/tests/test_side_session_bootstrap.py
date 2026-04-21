@@ -409,19 +409,22 @@ def test_bootstrap_rollback_on_briefing_write_failure(
 # ---------------------------------------------------------------
 
 
+# Markdown header form (``## <name>``) — bare substrings would
+# match the word "task" appearing earlier in prose, since the
+# test uses ``find()``.
 CANONICAL_SECTION_HEADERS = [
-    "Read these before writing any code",
-    "Two firm rules from Ed",
-    "Task",
-    "Quality expectations",
-    "Directory scope",
-    "Coordination with parent",
-    "Gates to respect",
-    "Commit + push discipline",
-    "Definition of done",
-    "Status",
-    "Deviations from briefing",
-    "Observations for the main session",
+    "## Read these before writing any code",
+    "## Two firm rules from Ed",
+    "## Task",
+    "## Quality expectations",
+    "## Directory scope",
+    "## Coordination with parent",
+    "## Gates to respect",
+    "## Commit + push discipline",
+    "## Definition of done",
+    "## Status",
+    "## Deviations from briefing",
+    "## Observations for the main session",
 ]
 
 
