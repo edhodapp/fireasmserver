@@ -74,6 +74,16 @@ def is_working_tree_clean(repo: Path) -> bool:
     return result.stdout.strip() == ""
 
 
+def current_branch_name(repo: Path) -> str:
+    """Return the current branch name (symbolic-ref HEAD).
+    Fails via ``GitOpError`` when HEAD is detached (no branch) —
+    which is itself a reason to refuse dispatch, so the caller
+    doesn't need a special-case for that state."""
+    return _git(
+        repo, "symbolic-ref", "--short", "HEAD",
+    ).stdout.strip()
+
+
 def branch_exists(repo: Path, branch: str) -> bool:
     """Return True iff ``branch`` exists as a local ref in
     ``repo``. Checked via ``git show-ref`` exit code rather than

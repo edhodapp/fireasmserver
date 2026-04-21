@@ -34,6 +34,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _make_parser()
     args = parser.parse_args(argv)
     try:
+        repo_root = _find_repo_root(Path.cwd())
         bootstrapper = Bootstrapper(
             slug=args.slug,
             scope_paths=args.scope,
@@ -41,7 +42,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             deliverables=args.deliverables,
             rationale=args.rationale or "",
             date=args.date or _date.today().isoformat(),
-            repo_root=Path.cwd(),
+            repo_root=repo_root,
         )
         result = bootstrapper.run()
     except BootstrapError as exc:
@@ -49,6 +50,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     print(result.launch_prompt)
     return 0
+
+
+def _find_repo_root(start: Path) -> Path:
+    """Walk up from ``start`` looking for a ``.git`` entry.
+    Lets the tool be invoked from any subdirectory of the main
+    worktree instead of insisting on CWD==repo root —
+    hygiene-gaps.md #18. Raises ``BootstrapError`` if no git
+    repo is found on the way up."""
+    path = start.resolve()
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    raise BootstrapError(
+        f"not in a git repository: {start} (searched upward "
+        "for a .git entry, found none)",
+    )
 
 
 def _make_parser() -> argparse.ArgumentParser:

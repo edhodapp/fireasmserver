@@ -82,64 +82,57 @@ class Bootstrapper:
     def run(self) -> BootstrapResult:
         """Perform the D052 dispatch steps with full rollback on
         any mid-run failure."""
-        # Validate slug + date + deliverables shape BEFORE any
-        # path is constructed — a malicious slug like
-        # ``../../target`` would otherwise reach
-        # ``self._worktree_path()`` and produce an
-        # attacker-controlled filesystem probe via the
-        # ``worktree_path.exists()`` check. Building the task
-        # first runs SideSessionTask's SafeId/IsoDate/Description
-        # validators at the earliest possible point.
-        task = self._build_task()
-
-        worktree_path = self._worktree_path()
-        branch = make_branch_name(self.slug, self.date)
-        self._validate_preconditions(worktree_path, branch)
-
-        rollback: list[Callable[[], None]] = []
-        # Register the main-reset hook BEFORE the first mutation
-        # so a mid-step failure in ``_write_and_commit_dispatch``
-        # (e.g., the ``write_dispatch_node`` file-update succeeds
-        # but ``stage_and_commit`` fails) still has a rollback
-        # hook available. ``git reset --hard`` restores both the
-        # commit state AND the working tree, so the modified
-        # ``qemu-harness.json`` gets reverted too.
+        # Read-only validation first — dirty tree, correct branch
+        # (D052 requires "main"), capture main's tip sha.
+        self._check_clean_main()
         saved_head = worktree_ops.current_head_sha(self.repo_root)
-        rollback.append(
+
+        # Build the task WITH parent_commit_sha baked in. Runs
+        # SideSessionTask's SafeId/IsoDate/Description validators
+        # at the earliest possible point, so a malicious slug
+        # never reaches path construction. ``parent_commit_sha``
+        # pins the DAG record back to the git HEAD it was cut
+        # from, closing hygiene-gaps.md #14.
+        task = self._build_task(parent_commit_sha=saved_head)
+        worktree_path = self._worktree_path()
+        branch = make_branch_name(task.slug, task.date)
+        self._check_no_preexisting_paths(worktree_path, branch)
+
+        # Mutation block. Rollback hooks are pre-registered with
+        # idempotent helpers so a mid-step failure anywhere below
+        # reliably unwinds. reset_hard_to restores both the
+        # commit and the working tree. cleanup_worktree_and_branch
+        # is a no-op if the worktree / branch never got created
+        # (remove/delete use check=False), which is why we can
+        # register it up-front rather than after create_worktree
+        # returns.
+        rollback: list[Callable[[], None]] = [
             lambda: worktree_ops.reset_hard_to(
                 self.repo_root, saved_head,
             ),
-        )
+            lambda: self._cleanup_worktree_and_branch(
+                worktree_path, branch,
+            ),
+        ]
         try:
-            self._write_and_commit_dispatch(task)
-            worktree_ops.create_worktree(
-                self.repo_root, worktree_path, branch,
+            self._execute_mutation(
+                task, worktree_path, branch,
             )
-            # Single combined cleanup — order matters: the
-            # worktree has to be removed before the branch it
-            # held can be deleted, since git refuses to delete
-            # a branch that's checked out.
-            rollback.append(
-                lambda: self._cleanup_worktree_and_branch(
-                    worktree_path, branch,
-                ),
-            )
-            self._setup_venv(worktree_path)
-            self._render_briefing(worktree_path, task)
-        except BootstrapError:
+        except BootstrapError as exc:
+            _handle_dispatch_failure(exc, rollback, wrap=False)
+        # pylint: disable=broad-exception-caught
+        # Intentional: any non-BootstrapError / non-BaseException
+        # exception from the mutation block must trigger
+        # rollback and get wrapped as BootstrapError so the CLI
+        # surfaces a consistent operator-facing error type.
+        except Exception as exc:
+            _handle_dispatch_failure(exc, rollback, wrap=True)
+        except BaseException:
+            # Ctrl-C / SystemExit: best-effort cleanup without
+            # annotation (the interpreter is likely tearing down
+            # anyway). hygiene-gaps.md #12.
             _run_rollback(rollback, reraise_annotation=False)
             raise
-        except Exception as exc:
-            cleanup_errs = _run_rollback(
-                rollback, reraise_annotation=True,
-            )
-            suffix = (
-                f" — rollback issues: {cleanup_errs}"
-                if cleanup_errs else ""
-            )
-            raise BootstrapError(
-                f"rollback fired: {exc}{suffix}"
-            ) from exc
 
         briefing_path = self._briefing_path(worktree_path)
         return BootstrapResult(
@@ -153,31 +146,66 @@ class Bootstrapper:
 
     # -- Validation --
 
-    def _validate_preconditions(
-        self, worktree_path: Path, branch: str,
-    ) -> None:
-        """Fail fast before any mutation if the primary worktree
-        is dirty, the sibling path exists, or the branch exists.
-        Duplicate-task detection lands inside
-        ``_write_and_commit_dispatch`` via the ontology's
-        uniqueness model_validator."""
+    def _check_clean_main(self) -> None:
+        """Dispatch requires the primary worktree to be on
+        ``main`` with no dirty state — the dispatch record
+        commits there (D052), and any uncommitted changes would
+        be swept up by the commit."""
         if not worktree_ops.is_working_tree_clean(self.repo_root):
             raise BootstrapError(
                 "primary worktree has dirty / uncommitted changes; "
-                "stash or commit before dispatching a side session"
+                "stash or commit before dispatching a side session",
             )
+        try:
+            head_branch = worktree_ops.current_branch_name(
+                self.repo_root,
+            )
+        except worktree_ops.GitOpError as exc:
+            raise BootstrapError(
+                f"primary worktree HEAD is detached or unresolvable "
+                f"— cannot determine current branch: {exc}",
+            ) from exc
+        if head_branch != "main":
+            raise BootstrapError(
+                f"primary worktree must be on 'main' for dispatch "
+                f"(D052); currently on {head_branch!r}",
+            )
+
+    def _check_no_preexisting_paths(
+        self, worktree_path: Path, branch: str,
+    ) -> None:
+        """Target sibling path and branch name must both be free
+        before any mutation. Duplicate (slug, date) detection
+        happens inside ``_write_and_commit_dispatch`` via the
+        ontology's uniqueness model_validator."""
         if worktree_path.exists():
             raise BootstrapError(
                 f"target worktree path {worktree_path} already "
-                "exists; remove it or choose a different slug"
+                "exists; remove it or choose a different slug",
             )
         if worktree_ops.branch_exists(self.repo_root, branch):
             raise BootstrapError(
                 f"branch {branch!r} already exists; delete it or "
-                "choose a different slug / date"
+                "choose a different slug / date",
             )
 
     # -- Mutation steps --
+
+    def _execute_mutation(
+        self,
+        task: SideSessionTask,
+        worktree_path: Path,
+        branch: str,
+    ) -> None:
+        """The four ordered mutation steps. Extracted to keep
+        ``run()``'s cyclomatic complexity under the project
+        cap."""
+        self._write_and_commit_dispatch(task)
+        worktree_ops.create_worktree(
+            self.repo_root, worktree_path, branch,
+        )
+        self._setup_venv(worktree_path)
+        self._render_briefing(worktree_path, task)
 
     def _write_and_commit_dispatch(self, task: SideSessionTask) -> None:
         """Update ``qemu-harness.json`` with the new
@@ -246,12 +274,19 @@ class Bootstrapper:
 
     # -- Helpers --
 
-    def _build_task(self) -> SideSessionTask:
+    def _build_task(
+        self, *, parent_commit_sha: str = "",
+    ) -> SideSessionTask:
         """Construct and validate the SideSessionTask. SafeId /
         IsoDate / Description validators fire here; invalid input
         (path-traversal slug, malformed date, empty deliverables)
         is converted to ``BootstrapError`` with the underlying
-        Pydantic detail so the CLI can surface a clean error."""
+        Pydantic detail so the CLI can surface a clean error.
+
+        ``parent_commit_sha`` pins the task back to main's git
+        HEAD at dispatch time — closes hygiene-gaps.md #14.
+        Caller passes the value captured by
+        ``worktree_ops.current_head_sha`` before any mutation."""
         try:
             return SideSessionTask(
                 slug=self.slug,
@@ -260,10 +295,11 @@ class Bootstrapper:
                 required_reading=self.required_reading,
                 deliverables=self.deliverables,
                 rationale=self.rationale,
+                parent_commit_sha=parent_commit_sha,
             )
         except ValidationError as exc:
             raise BootstrapError(
-                f"invalid task input: {exc.errors()}"
+                f"invalid task input: {exc.errors()}",
             ) from exc
 
     def _worktree_path(self) -> Path:
@@ -299,6 +335,38 @@ class Bootstrapper:
             f"worktree. Do not checkout other branches. "
             f"Report your plan before writing implementation code."
         )
+
+
+def _handle_dispatch_failure(
+    exc: BaseException,
+    rollback: list[Callable[[], None]],
+    *,
+    wrap: bool,
+) -> None:
+    """Run rollback hooks, then re-raise with rollback-failure
+    annotations appended when any cleanup step failed.
+    ``wrap=True`` turns a non-BootstrapError into a
+    BootstrapError; ``wrap=False`` preserves an already
+    operator-facing BootstrapError's message. Always raises."""
+    errs = _run_rollback(rollback, reraise_annotation=True)
+    annotation = (
+        f" — rollback issues: {_fmt_errs(errs)}" if errs else ""
+    )
+    if wrap:
+        raise BootstrapError(
+            f"rollback fired: {exc}{annotation}",
+        ) from exc
+    if annotation:
+        raise BootstrapError(f"{exc}{annotation}") from exc
+    raise exc
+
+
+def _fmt_errs(errors: list[str]) -> str:
+    """Human-readable joining of rollback-hook error strings.
+    Python's default ``[...]`` repr is noisy inside a flat
+    error message; semicolon-joined reads better in a terminal.
+    hygiene-gaps.md #15."""
+    return "; ".join(errors)
 
 
 def _run_rollback(

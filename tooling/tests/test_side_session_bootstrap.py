@@ -1,13 +1,9 @@
 """Behavioral tests for ``side_session_bootstrap`` (DECISIONS.md D052).
 
-**Written before implementation.** Each test describes an
-observable outcome of the dispatch flow — the success path,
-four refusal modes, two rollback cases, the canonical briefing
-shape, and the launch-prompt contents. Until the implementation
-commits (C3 ontology model, C4 renderer + ontology-writer, C5
-worktree + venv ops, C6 CLI) land, these tests go RED at
-``Bootstrapper.run()`` raising ``NotImplementedError``. Each
-subsequent commit turns a subset green.
+Each test describes an observable outcome of the dispatch flow
+— the success path, four refusal modes, two rollback cases,
+the canonical briefing shape, and the launch-prompt contents.
+All thirteen are GREEN.
 
 Each test runs against a throwaway ``tmp_path`` git repo with a
 minimal DAG fixture. Tests never touch the real fireasmserver
@@ -37,19 +33,13 @@ from side_session_bootstrap import (
 from side_session_bootstrap import cli as cli_module
 
 
-# As of C5 (worktree + venv + rollback), most behavioral tests
-# go GREEN. Three CLI-layer tests stay xfail until C6 wires the
-# ``cli.main()`` argparse + exit-code layer; per-test markers
-# below handle those.
-#
-# C5 also introduces an autouse fixture below that stubs
-# ``Bootstrapper._setup_venv`` to a fast no-op (creates the
-# ``.venv`` directory but skips the 10-20s ``pip install``).
-# Rollback tests override it with a raising stub; happy-path
-# tests inherit the fast one. Venv-integration coverage lives
-# in the per-module unit tests rather than the behavioral
-# suite — behavioral tests verify the orchestrator's contract,
-# not pip's.
+# Autouse fixture below stubs ``Bootstrapper._setup_venv`` to
+# a fast no-op (creates the ``.venv`` directory but skips the
+# 10-20s ``pip install``). Rollback tests override it with a
+# raising stub. Venv-integration coverage lives in the per-
+# module unit tests rather than the behavioral suite —
+# behavioral tests verify the orchestrator's contract, not
+# pip's.
 
 
 @pytest.fixture(autouse=True)
