@@ -20,12 +20,15 @@ D051 (pre-push audit gate).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from ontology import Ontology, SideSessionTask
+from ontology.dag import load_dag, save_dag, save_snapshot
 from side_session_bootstrap import (
     Bootstrapper,
     BootstrapError,
@@ -34,20 +37,34 @@ from side_session_bootstrap import (
 from side_session_bootstrap import cli as cli_module
 
 
-# All behavioral tests in this file are RED until the
-# implementation lands across commits C3–C6. ``strict=True`` means
-# an xpass (test unexpectedly passes before I've removed the
-# marker) becomes a real failure — forcing me to keep the marker
-# structure in sync with reality as each commit turns a slice
-# green. As tests go green, this module-level marker narrows to
-# per-test markers for the ones still waiting.
-pytestmark = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "RED until C3 (ontology model), C4 (renderer + writer), "
-        "C5 (worktree + venv + rollback), C6 (CLI wiring)"
-    ),
-)
+# As of C5 (worktree + venv + rollback), most behavioral tests
+# go GREEN. Three CLI-layer tests stay xfail until C6 wires the
+# ``cli.main()`` argparse + exit-code layer; per-test markers
+# below handle those.
+#
+# C5 also introduces an autouse fixture below that stubs
+# ``Bootstrapper._setup_venv`` to a fast no-op (creates the
+# ``.venv`` directory but skips the 10-20s ``pip install``).
+# Rollback tests override it with a raising stub; happy-path
+# tests inherit the fast one. Venv-integration coverage lives
+# in the per-module unit tests rather than the behavioral
+# suite — behavioral tests verify the orchestrator's contract,
+# not pip's.
+
+
+@pytest.fixture(autouse=True)
+def _stub_setup_venv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the real ``pip install -e .[dev]`` path with a
+    lightweight directory-creation stub for speed. Rollback
+    tests override this with a raising stub — their
+    ``monkeypatch.setattr`` runs after the autouse fixture, so
+    their override wins."""
+    def _fast(bootstrapper: Bootstrapper, worktree_path: Path) -> None:
+        del bootstrapper  # unused — match signature of real method
+        (worktree_path / ".venv").mkdir(exist_ok=True)
+    monkeypatch.setattr(
+        Bootstrapper, "_setup_venv", _fast, raising=True,
+    )
 
 
 # ---------------------------------------------------------------
@@ -56,12 +73,28 @@ pytestmark = pytest.mark.xfail(
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Invoke git in ``repo``; raise on non-zero exit."""
+    """Invoke git in ``repo``; raise on non-zero exit.
+
+    Strips ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE``
+    from the child env so that, when pytest runs inside a
+    pre-commit hook that has those vars set for the outer
+    commit, the ``-C`` flag here still determines which repo
+    gets operated on. Without this scrub, tests pass when run
+    standalone but fail inside the hook — the test's tmp
+    ``minimal_repo`` gets ignored in favor of the enclosing
+    commit's repo."""
+    env = os.environ.copy()
+    for var in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+    ):
+        env.pop(var, None)
     return subprocess.run(
         ["git", "-C", str(repo), *args],
         check=True,
         capture_output=True,
         text=True,
+        env=env,
     )
 
 
@@ -122,7 +155,9 @@ def _make_bootstrapper(
 def _load_dag(repo: Path) -> dict[str, Any]:
     """Read the DAG JSON from the test repo."""
     data = json.loads(
-        (repo / "tooling" / "qemu-harness.json").read_text()
+        (repo / "tooling" / "qemu-harness.json").read_text(
+            encoding="utf-8",
+        )
     )
     assert isinstance(data, dict), "DAG fixture must be a JSON object"
     return data
@@ -139,13 +174,19 @@ def _tasks_from_flat_nodes(dag: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _tasks_from_snapshots(dag: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract SideSessionTask candidates from
-    ``snapshots[...].ontology.side_session_tasks`` nesting."""
+    """Extract SideSessionTask candidates from the ontology
+    nested inside each DAG node / snapshot. Accepts both
+    ``{nodes: [{ontology: ...}]}`` (the actual ``OntologyDAG``
+    shape) and the legacy ``{snapshots: [{ontology: ...}]}``
+    layout so fixtures in either form work."""
     result: list[dict[str, Any]] = []
-    for snap in dag.get("snapshots", []):
-        if not isinstance(snap, dict):
+    containers = (
+        list(dag.get("nodes", [])) + list(dag.get("snapshots", []))
+    )
+    for container in containers:
+        if not isinstance(container, dict):
             continue
-        onto = snap.get("ontology", {})
+        onto = container.get("ontology", {})
         for task in onto.get("side_session_tasks", []):
             if isinstance(task, dict):
                 result.append(task)
@@ -304,14 +345,25 @@ def test_bootstrap_refuses_existing_worktree_path(
 def test_bootstrap_refuses_existing_branch(
     minimal_repo: Path,
 ) -> None:
-    """If the target branch already exists, dispatch must abort."""
+    """If the target branch already exists, dispatch must abort.
+    Post-assertion skips ``_assert_no_side_effects``'s
+    branch-absence check — the pre-seeded branch is expected to
+    remain; we verify no NEW state (sibling worktree, DAG task)
+    was created."""
     _git(minimal_repo, "branch", "side/2026-04-20_demo_task")
 
     bs = _make_bootstrapper(minimal_repo)
     with pytest.raises(BootstrapError, match=r"(?i)branch"):
         bs.run()
 
-    _assert_no_side_effects(minimal_repo, "demo_task", "2026-04-20")
+    sibling = minimal_repo.parent / "primary-demo_task"
+    assert not sibling.exists(), (
+        "refusal must not leave a partial worktree"
+    )
+    dag = _load_dag(minimal_repo)
+    assert _find_side_session_task(
+        dag, "demo_task", "2026-04-20"
+    ) is None
 
 
 def test_bootstrap_refuses_duplicate_slug_same_date(
@@ -319,17 +371,19 @@ def test_bootstrap_refuses_duplicate_slug_same_date(
 ) -> None:
     """If the DAG already has a SideSessionTask with the same
     slug + date, dispatch must abort — the (slug, date) pair is
-    the uniqueness key."""
-    # Seed the DAG with a pre-existing task matching the fixture.
-    dag_path = minimal_repo / "tooling" / "qemu-harness.json"
-    dag = json.loads(dag_path.read_text())
-    dag.setdefault("nodes", []).append({
-        "kind": "SideSessionTask",
-        "slug": "demo_task",
-        "date": "2026-04-20",
-        "status": "dispatched",
-    })
-    dag_path.write_text(json.dumps(dag, indent=2))
+    the uniqueness key enforced at the ontology layer."""
+    # Seed via the real OntologyDAG API so the fixture matches
+    # the shape the bootstrap tool writes and reads.
+    dag_path = str(minimal_repo / "tooling" / "qemu-harness.json")
+    dag = load_dag(dag_path, "test-project")
+    save_snapshot(dag, Ontology(side_session_tasks=[
+        SideSessionTask(
+            slug="demo_task",
+            date="2026-04-20",
+            deliverables="pre-existing",
+        ),
+    ]), label="seed")
+    save_dag(dag, dag_path)
     _git(minimal_repo, "add", "tooling/qemu-harness.json")
     _git(minimal_repo, "commit", "-m", "seed duplicate task")
 
@@ -337,7 +391,10 @@ def test_bootstrap_refuses_duplicate_slug_same_date(
     with pytest.raises(BootstrapError, match=r"(?i)duplicate|exists"):
         bs.run()
 
-    _assert_no_side_effects(minimal_repo, "demo_task", "2026-04-20")
+    sibling = minimal_repo.parent / "primary-demo_task"
+    assert not sibling.exists()
+    branches = _git(minimal_repo, "branch", "--list").stdout
+    assert "side/2026-04-20_demo_task" not in branches
 
 
 # ---------------------------------------------------------------
@@ -440,7 +497,7 @@ def test_briefing_renders_canonical_sections_in_order(
     bs = _make_bootstrapper(minimal_repo)
     result = bs.run()
 
-    text = result.briefing_path.read_text()
+    text = result.briefing_path.read_text(encoding="utf-8")
 
     last_pos = -1
     for header in CANONICAL_SECTION_HEADERS:
@@ -476,7 +533,7 @@ def test_briefing_includes_caller_supplied_required_reading(
         required_reading=["docs/l2/DESIGN.md", "D040"],
     )
     result = bs.run()
-    text = result.briefing_path.read_text()
+    text = result.briefing_path.read_text(encoding="utf-8")
 
     assert "docs/l2/DESIGN.md" in text
     assert "D040" in text
@@ -492,6 +549,9 @@ def test_briefing_includes_caller_supplied_required_reading(
 # ---------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True, reason="RED until C6 (CLI argparse + exit codes)",
+)
 def test_cli_success_returns_zero_and_prints_launch_prompt(
     minimal_repo: Path,
     capsys: pytest.CaptureFixture[str],
@@ -513,6 +573,9 @@ def test_cli_success_returns_zero_and_prints_launch_prompt(
     assert "side/2026-04-20_demo_task" in out
 
 
+@pytest.mark.xfail(
+    strict=True, reason="RED until C6 (CLI argparse + exit codes)",
+)
 def test_cli_refusal_returns_nonzero_and_prints_to_stderr(
     minimal_repo: Path,
     capsys: pytest.CaptureFixture[str],
@@ -539,6 +602,9 @@ def test_cli_refusal_returns_nonzero_and_prints_to_stderr(
     assert captured.out == ""
 
 
+@pytest.mark.xfail(
+    strict=True, reason="RED until C6 (CLI argparse + exit codes)",
+)
 def test_cli_rejects_slug_with_path_traversal_or_special_chars(
     minimal_repo: Path,
     capsys: pytest.CaptureFixture[str],
