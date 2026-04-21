@@ -45,7 +45,6 @@ def write_dispatch_node(repo_root: Path, task: SideSessionTask) -> str:
     and the on-disk DAG is unchanged.
     """
     dag_path = str(repo_root / _DAG_RELATIVE_PATH)
-    new_node_id_holder: list[str] = []
     try:
         with dag_transaction(dag_path, _PROJECT_NAME) as dag:
             current = dag.get_current_node()
@@ -56,33 +55,31 @@ def write_dispatch_node(repo_root: Path, task: SideSessionTask) -> str:
                 base_ontology, task,
             )
             label = f"dispatch:{task.slug}@{task.date}"
-            new_node_id_holder.append(
-                save_snapshot(dag, new_ontology, label=label),
-            )
+            return save_snapshot(dag, new_ontology, label=label)
     except Exception as exc:
         raise OntologyWriteError(
             f"failed to write SideSessionTask "
             f"{(task.slug, task.date)!r} to DAG at {dag_path}: {exc}"
         ) from exc
-    return new_node_id_holder[0]
 
 
 def _ontology_with_appended_task(
     base: Ontology, task: SideSessionTask,
 ) -> Ontology:
     """Construct a new Ontology containing ``base``'s contents
-    plus ``task`` appended to ``side_session_tasks``. Constructing
-    via ``Ontology(...)`` re-runs every model_validator — so the
-    uniqueness, RI, and cross-field checks all fire on the new
-    composite, not on a pre-validated dict that bypasses them."""
-    return Ontology(
-        entities=list(base.entities),
-        relationships=list(base.relationships),
-        domain_constraints=list(base.domain_constraints),
-        performance_constraints=list(base.performance_constraints),
-        modules=list(base.modules),
-        data_models=list(base.data_models),
-        external_dependencies=list(base.external_dependencies),
-        open_questions=list(base.open_questions),
-        side_session_tasks=[*base.side_session_tasks, task],
-    )
+    plus ``task`` appended to ``side_session_tasks``.
+
+    Two-step pattern: ``model_copy(update=...)`` to get a new
+    instance with the single field updated (preserving every
+    other field of ``base`` automatically, so new Ontology
+    fields added in future schema revisions can't silently be
+    dropped by this writer), followed by
+    ``Ontology.model_validate(new.model_dump())`` to force every
+    model_validator to re-fire — catching uniqueness, RI, and
+    cross-field violations on the composite. ``model_copy``
+    alone doesn't re-validate; an explicit re-validate step is
+    required for correctness."""
+    updated = base.model_copy(update={
+        "side_session_tasks": [*base.side_session_tasks, task],
+    })
+    return Ontology.model_validate(updated.model_dump())

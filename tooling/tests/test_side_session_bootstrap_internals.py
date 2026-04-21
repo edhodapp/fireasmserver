@@ -176,6 +176,39 @@ class TestRenderBriefingShape:
         # bullet list.
         assert "none declared" in text
 
+    def test_caller_tag_with_backtick_escapes_safely(self) -> None:
+        """A caller-supplied tag containing a backtick must not
+        break the surrounding markdown — the renderer wraps with
+        a longer backtick fence so the embedded backtick renders
+        verbatim rather than terminating the code span."""
+        text = render_briefing(_task(required_reading=[
+            "has`backtick",
+        ]))
+        # The naive wrap ``has`backtick`` would close the first
+        # code span after "has". The safe wrap pads with double
+        # backticks and spaces.
+        assert "`` has`backtick ``" in text
+
+    def test_caller_tag_with_double_backticks_escapes_safely(
+        self,
+    ) -> None:
+        """A tag with a double-backtick run requires a triple-
+        backtick fence."""
+        text = render_briefing(_task(required_reading=[
+            "has``pair",
+        ]))
+        assert "``` has``pair ```" in text
+
+    def test_caller_tag_without_backtick_uses_simple_wrap(
+        self,
+    ) -> None:
+        """The common case — no backticks — still renders with
+        the compact single-backtick form."""
+        text = render_briefing(_task(required_reading=[
+            "DECISIONS.md:D049",
+        ]))
+        assert "`DECISIONS.md:D049`" in text
+
 
 # ---------------------------------------------------------------
 # Ontology writer tests

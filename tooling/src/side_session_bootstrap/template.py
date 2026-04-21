@@ -121,8 +121,37 @@ def _render_required_reading(task: SideSessionTask) -> str:
         lines.append("### Caller-supplied additions")
         lines.append("")
         for tag in task.required_reading:
-            lines.append(f"- `{tag}`")
+            lines.append(f"- {_md_inline_code(tag)}")
     return "\n".join(lines)
+
+
+def _md_inline_code(value: str) -> str:
+    """Wrap ``value`` as a CommonMark inline-code span, safe
+    against embedded backticks. If the value has no backticks,
+    simple single-backtick wrapping. Otherwise, wrap with a run
+    of backticks longer than the longest run inside the value,
+    padding with spaces (CommonMark strips a single leading /
+    trailing space inside code spans when the content starts /
+    ends with a backtick, which is what we need here)."""
+    if "`" not in value:
+        return f"`{value}`"
+    longest = _longest_backtick_run(value)
+    fence = "`" * (longest + 1)
+    return f"{fence} {value} {fence}"
+
+
+def _longest_backtick_run(value: str) -> int:
+    """Return the longest consecutive run of backticks in
+    ``value``. Used to size the fence in ``_md_inline_code``."""
+    longest = 0
+    current = 0
+    for char in value:
+        if char == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
 
 
 _FIRM_RULES_BLOCK = """\
