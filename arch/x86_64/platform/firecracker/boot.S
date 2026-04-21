@@ -58,7 +58,36 @@ VIRTIO_MMIO_DRIVER_FEATURES     equ 0x020
 VIRTIO_MMIO_DRIVER_FEATURES_SEL equ 0x024
 VIRTIO_MMIO_QUEUE_SEL           equ 0x030
 VIRTIO_MMIO_QUEUE_NUM_MAX       equ 0x034
+VIRTIO_MMIO_QUEUE_NUM           equ 0x038
+VIRTIO_MMIO_QUEUE_READY         equ 0x044
 VIRTIO_MMIO_STATUS              equ 0x070
+VIRTIO_MMIO_QUEUE_DESC_LOW      equ 0x080
+VIRTIO_MMIO_QUEUE_DESC_HIGH     equ 0x084
+VIRTIO_MMIO_QUEUE_DRIVER_LOW    equ 0x090
+VIRTIO_MMIO_QUEUE_DRIVER_HIGH   equ 0x094
+VIRTIO_MMIO_QUEUE_DEVICE_LOW    equ 0x0A0
+VIRTIO_MMIO_QUEUE_DEVICE_HIGH   equ 0x0A4
+
+; Virtqueue memory region. 12 KiB per queue — page-aligned slots
+; for descriptor table (4 KiB), available ring (4 KiB), used ring
+; (4 KiB). Actual spec-required sizes at queue_size=256 are
+; ~4 KiB / ~518 B / ~2054 B; page alignment costs ~5 KiB per
+; queue against 128 MiB of guest RAM (negligible) and simplifies
+; every address computation to a base + page-offset.
+;
+; Location: 4 MiB, well above the stack at 2 MiB and the .text
+; segment (loaded at 1 MiB, runs out long before 2 MiB).
+; Firecracker zero-initializes guest RAM, so ``idx = 0``,
+; ``flags = 0`` across every ring at boot — which is exactly
+; the "uninhabited queue" state the spec requires at QueueReady
+; time.
+VIRTQ_BASE          equ 0x400000
+VIRTQ_STRIDE        equ 0x3000   ; 12 KiB per queue
+VIRTQ_OFF_DESC      equ 0x0000
+VIRTQ_OFF_AVAIL     equ 0x1000
+VIRTQ_OFF_USED      equ 0x2000
+RX_QUEUE_BASE       equ VIRTQ_BASE + 0 * VIRTQ_STRIDE
+TX_QUEUE_BASE       equ VIRTQ_BASE + 1 * VIRTQ_STRIDE
 
 ; Device Status bit values (Virtio 1.2 §2.1, "Device Status Field").
 ; Bit-position numbering in the REQUIREMENTS.md VIO table is the
@@ -90,6 +119,61 @@ section .note.Xen note alloc align=4
 
 section .text
 [bits 32]
+
+; Per-queue programming macro used by VIO-007 Slice 2. Selects
+; the queue, reads QueueNumMax and writes it back as QueueNum,
+; programs physical addresses for descriptor / available / used
+; rings, toggles QueueReady to 1, and read-backs to confirm it
+; stuck. On read-back mismatch, jumps to ``.queue_ready_fail``
+; (which halts through .set_failed per VIO-009).
+;
+; Barrier envelope: lfence around loads, mfence around stores —
+; the pattern already set by VIO-001..006 up-file.
+;
+; Scope constraint: the ``jne .queue_ready_fail`` uses a local
+; label that's resolved against the most-recent non-local label
+; at the expansion site. Today both expansions and the
+; ``.queue_ready_fail`` target are inside ``_start:``'s scope,
+; so the label resolves. Future refactors that insert a new
+; non-local label between the expansions and the target would
+; fail at assembly time — loud, not silent, but worth noting.
+;
+; Parameters:
+;   %1 = queue index (0 = RX, 1 = TX) — written to QueueSel
+;   %2 = descriptor table physical address (u32)
+;   %3 = available ring physical address (u32)
+;   %4 = used ring physical address (u32)
+; Clobbers: eax, flags. Preserves: everything else.
+%macro program_queue 4
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], %1
+    mfence
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
+    lfence
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM], eax
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DESC_LOW], %2
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DESC_HIGH], 0
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DRIVER_LOW], %3
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DRIVER_HIGH], 0
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DEVICE_LOW], %4
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DEVICE_HIGH], 0
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_READY], 1
+    mfence
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_READY]
+    lfence
+    cmp eax, 1
+    jne .queue_ready_fail
+%endmacro
 
 global _start
 _start:
@@ -311,7 +395,42 @@ _start:
     lea esi, [newline]
     mov ecx, 1
     call emit_bytes
+
+    ; --- VIO-007 Slice 2: initialize virtqueues ---
+    ; Program QueueNum, descriptor/avail/used physical addresses,
+    ; and QueueReady for each queue. Per Virtio 1.2 §2.1.2 step 7
+    ; + §4.2.2 register semantics. Memory bases are compile-time
+    ; constants anchored at ``VIRTQ_BASE`` with page-aligned
+    ; slots per queue (desc / avail / used). No descriptor
+    ; population yet — that's L2 RX/TX plumbing in a later
+    ; commit. Slice 2 proves the plumbing and flips VIO-007 to
+    ; ``implemented``.
+    program_queue 0, \
+        RX_QUEUE_BASE + VIRTQ_OFF_DESC, \
+        RX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
+        RX_QUEUE_BASE + VIRTQ_OFF_USED
+    program_queue 1, \
+        TX_QUEUE_BASE + VIRTQ_OFF_DESC, \
+        TX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
+        TX_QUEUE_BASE + VIRTQ_OFF_USED
+
+    lea esi, [queues_ready_msg]
+    mov ecx, queues_ready_len
+    call emit_bytes
     jmp .halt
+
+.queue_ready_fail:
+    ; QueueReady didn't read back as 1 after we wrote it — the
+    ; device rejected the programming for some reason (bad
+    ; address alignment, unsupported queue size, ...). Dump and
+    ; halt through the VIO-009 FAILED path.
+    lea esi, [queues_ready_fail_msg]
+    mov ecx, queues_ready_fail_len
+    call emit_bytes
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
 
 .queue_fail_rx:
     ; QueueSel=0 returned QueueNumMax=0 — device does not support
@@ -540,5 +659,11 @@ queues_fail_rx_len     equ $ - queues_fail_rx_msg
 
 queues_fail_tx_msg:    db 'QUEUES:FAIL no-queue q=1 (max=0)'
 queues_fail_tx_len     equ $ - queues_fail_tx_msg
+
+queues_ready_msg:      db 'QUEUES:READY', 10
+queues_ready_len       equ $ - queues_ready_msg
+
+queues_ready_fail_msg: db 'QUEUES:FAIL queue-not-ready'
+queues_ready_fail_len  equ $ - queues_ready_fail_msg
 
 newline:         db 10

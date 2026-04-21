@@ -238,6 +238,25 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "${queues_line} observed — VIO-007 discovery verified"
+
+    # Virtqueue init (VIO-007 part 2). boot.S programs QueueNum,
+    # QueueDesc / QueueDriver / QueueDevice physical addresses
+    # for both queues, then toggles QueueReady and confirms it
+    # stuck. Success → QUEUES:READY. Failure →
+    # QUEUES:FAIL queue-not-ready + VIO-009 halt.
+    if ! grep -qE '^QUEUES:READY$' "$SERIAL"; then
+        fail_line=$(grep -E '^QUEUES:FAIL queue-not-ready' \
+            "$SERIAL" | head -1 || true)
+        if [[ -n "$fail_line" ]]; then
+            echo "FAIL: virtqueue init — $fail_line"
+        else
+            echo "FAIL: QUEUES:READY not observed (guest did not reach VIO-007 init)"
+        fi
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "QUEUES:READY observed — VIO-007 init verified"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —
