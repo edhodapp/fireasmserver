@@ -199,7 +199,11 @@ def _render_directory_scope(task: SideSessionTask) -> str:
     ]
     if task.scope_paths:
         for path in task.scope_paths:
-            lines.append(f"- `{path}`")
+            # scope_paths is unconstrained list[str] — use the
+            # backtick-safe inline-code helper in case a path
+            # contains backticks (rare in practice, but harmless
+            # to handle).
+            lines.append(f"- {_md_inline_code(path)}")
     else:
         lines.append("- (none declared — confirm with main session "
                      "before touching any file)")

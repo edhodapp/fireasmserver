@@ -209,6 +209,15 @@ class TestRenderBriefingShape:
         ]))
         assert "`DECISIONS.md:D049`" in text
 
+    def test_scope_path_with_backtick_escapes_safely(self) -> None:
+        """scope_paths is unconstrained list[str] — a path
+        containing a backtick must not terminate the code span
+        early. Same ``_md_inline_code`` path as caller tags."""
+        text = render_briefing(_task(scope_paths=[
+            "tooling/has`backtick/",
+        ]))
+        assert "`` tooling/has`backtick/ ``" in text
+
 
 # ---------------------------------------------------------------
 # Ontology writer tests
