@@ -86,6 +86,17 @@ VIRTQ_STRIDE        equ 0x3000   ; 12 KiB per queue
 VIRTQ_OFF_DESC      equ 0x0000
 VIRTQ_OFF_AVAIL     equ 0x1000
 VIRTQ_OFF_USED      equ 0x2000
+
+; Largest queue size this layout supports: 256 descriptors at
+; 16 B each = 4096 B exactly, filling the descriptor-table page.
+; A device reporting ``QueueNumMax > 256`` is spec-allowed to
+; offer that size; the driver clamps to the size it can back
+; with allocated memory (Virtio 1.2 §4.1.4.3 permits any queue
+; size that is a power of 2 ≤ QueueNumMax). Today Firecracker
+; reports exactly 256; the clamp protects a future device or
+; VMM change from silently overflowing into the available-ring
+; page.
+VIRTQ_MAX_SIZE      equ 0x100    ; 256 descriptors
 RX_QUEUE_BASE       equ VIRTQ_BASE + 0 * VIRTQ_STRIDE
 TX_QUEUE_BASE       equ VIRTQ_BASE + 1 * VIRTQ_STRIDE
 
@@ -151,6 +162,14 @@ section .text
     lfence
     mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
     lfence
+    ; Clamp to VIRTQ_MAX_SIZE — the allocated 4 KiB descriptor-
+    ; table page holds at most 256 entries. A larger QueueNumMax
+    ; would overflow into the available-ring page on the device
+    ; side.
+    cmp eax, VIRTQ_MAX_SIZE
+    jbe %%size_ok
+    mov eax, VIRTQ_MAX_SIZE
+%%size_ok:
     mfence
     mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM], eax
     mfence
