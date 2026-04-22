@@ -656,9 +656,10 @@ constraints = [
             "it back via DriverFeaturesSel / DriverFeatures "
             "(Virtio 1.2 §2.1.2 step 4). MVP subset is "
             "VIRTIO_F_VERSION_1 only; VIO-F-001 governs it, "
-            "VIO-F-002 and VIO-F-006 are declared deviations, "
-            "and VIO-F-003..005/007 remain in REQUIREMENTS.md "
-            "pending formalisation into the ontology."
+            "VIO-F-002 / VIO-F-004 / VIO-F-006 are declared "
+            "deviations (VIO-F-004 cites D053), and "
+            "VIO-F-003 / VIO-F-005 / VIO-F-007 are declared "
+            "spec-only until their consuming L2 code lands."
         ),
         entity_ids=["virtio-net-device"],
         rationale="Virtio 1.2 §2.1.2 step 4.",
