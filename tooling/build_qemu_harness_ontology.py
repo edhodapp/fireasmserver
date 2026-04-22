@@ -287,6 +287,47 @@ virtio_net_device = Entity(
     ],
 )
 
+# The SHA-256 primitive routine (FIPS PUB 180-4). Anchor for
+# SHA256-* constraints. Host-callable leaf routine with per-arch
+# implementations and a scalar fallback on x86_64; the long-term
+# consumer is TLS 1.3 transcript hashing + HKDF key derivation,
+# but the primitive stands alone in the ontology until the TLS
+# layer's Entities land.
+sha256_routine = Entity(
+    id="sha256-routine",
+    name="SHA256Routine",
+    description=(
+        "The host-callable SHA-256 one-shot digest routine. "
+        "Reads len bytes from input, writes a 32-byte digest in "
+        "big-endian byte order as FIPS PUB 180-4 prescribes. "
+        "Anchor for the TLS 1.3 transcript hash, HKDF, and any "
+        "future SHA-256-dependent primitive that lands on top "
+        "of it."
+    ),
+    properties=[
+        Property(
+            name="input_length_domain",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "Legal input length range in bytes. FIPS 180-4 "
+                "defines the function up to 2^64 - 1 bits "
+                "(≈ 2^61 - 1 bytes / 2 EiB); no realistic caller "
+                "approaches the bound, so no runtime check is "
+                "required per D032 crypto-math strategy."
+            ),
+        ),
+        Property(
+            name="output_length",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Digest length in bytes. Always 32 (SHA-256 "
+                "produces a 256-bit hash per FIPS PUB 180-4)."
+            ),
+        ),
+    ],
+)
+
+
 # The ARP packet format (RFC 826). Anchor for ARP-001..011 in
 # L2 requirements. ARP runs over Ethernet but its packet shape
 # is a distinct object from the frame that carries it, so
@@ -1617,6 +1658,44 @@ constraints = [
         status="spec",
     ),
 
+    # -- Crypto-layer primitives: SHA-256 --
+    DomainConstraint(
+        name="SHA256-001",
+        description=(
+            "SHA-256 one-shot digest conforms to FIPS PUB 180-4 "
+            "§5–6, with byte-level equivalence against the "
+            "canonical RFC 6234 §8.2 test vectors on both "
+            "arches. x86_64 must agree byte-for-byte between "
+            "the SHA-NI (Intel SHA extensions) and the scalar "
+            "64-round paths over every length in [0, 256]. "
+            "aarch64 uses FEAT_SHA256 with no scalar fallback "
+            "— D034 requires SHA-2 on every production AArch64 "
+            "profile."
+        ),
+        entity_ids=["sha256-routine"],
+        rationale=(
+            "FIPS PUB 180-4 §5.3.3 (initial hash values), "
+            "§6.2.2 (round function). RFC 6234 §8.2 (test "
+            "vectors). D032 crypto-math strategy (ISA-"
+            "idiomatic, macros-first, constant-time). D034 "
+            "SHA-2 feature requirements. D054 fork-qemu "
+            "sandbox (SHA-NI runtime exercise under "
+            "-cpu Denverton / -cpu max)."
+        ),
+        implementation_refs=[
+            "arch/x86_64/crypto/sha256.S:sha256",
+            "arch/x86_64/crypto/sha256.S:sha256_shani",
+            "arch/x86_64/crypto/sha256.S:sha256_scalar",
+            "arch/x86_64/crypto/sha256.S:sha256_has_shani",
+            "arch/aarch64/crypto/sha256.S:sha256",
+        ],
+        verification_refs=[
+            "tooling/tests/test_sha256.py",
+            "tooling/crypto_tests/sha256_test.c",
+        ],
+        status="implemented",
+    ),
+
     # -- L2 product constraints: Ethernet-layer primitives --
     DomainConstraint(
         name="ETH-005",
@@ -2388,6 +2467,33 @@ verification_cases = [
         ),
     ),
     VerificationCase(
+        name="sha256-primitive",
+        covers=["SHA256-001"],
+        tier="A",
+        status="passing",
+        implementation_refs=[
+            "tooling/tests/test_sha256.py",
+            "tooling/crypto_tests/sha256_test.c",
+        ],
+        rationale=(
+            "Unit-level verification of the SHA-256 primitive "
+            "on both arches against FIPS 180-4 / RFC 6234 "
+            "canonical vectors (empty, 'abc', 448-bit, "
+            "896-bit, 1M×'a') plus two boundary vectors "
+            "(64×0x00, 64×0xff) and a pseudo-random sweep over "
+            "257 lengths in [0, 256]. x86_64 additionally "
+            "cross-checks SHA-NI ↔ scalar byte-for-byte over "
+            "the same sweep. The cross-check caught a "
+            "callee-saved-register-preservation bug during "
+            "SHA-NI path development — the bug was masked on "
+            "stock Ubuntu Noble qemu 8.2.2 by a SIGILL on "
+            "sha256rnds2, surfaced once the D054 fork-qemu "
+            "sandbox (qemu 11.0.0, -cpu Denverton / -cpu max) "
+            "let the instruction actually execute, and was "
+            "fixed before the primitive landed."
+        ),
+    ),
+    VerificationCase(
         name="virtio-init-sequence",
         covers=[
             "VIO-001", "VIO-002", "VIO-003", "VIO-004",
@@ -2430,7 +2536,7 @@ ontology = Ontology(
     entities=[
         guest_image, vm_instance, test_case, test_result,
         fsa_transition, ethernet_frame, virtio_net_device,
-        arp_packet, observability_event_site,
+        sha256_routine, arp_packet, observability_event_site,
     ],
     relationships=[boots_rel, runs_against_rel, produces_rel],
     domain_constraints=constraints,
