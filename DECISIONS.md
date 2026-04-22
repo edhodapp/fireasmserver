@@ -2046,6 +2046,98 @@ workloads. Until then, MQ stays deferred.
 L2 requirements-formalization pass (ontology commit bundles this
 D-entry with the 70 stub constraint rows it authors).
 
+### D054: QEMU fork as the crypto-runtime sandbox for ISA-extension testing
+
+**Decision (2026-04-22):** the canonical QEMU used to exercise
+ISA-extension-dependent code paths (SHA-NI, AES-NI, PCLMULQDQ,
+and future additions) on non-host silicon is a build from
+`github.com/edhodapp/qemu` installed into `$HOME/opt/qemu-fork/`
+via `tooling/qemu_build/build_qemu_fork.sh`. System-installed
+qemu on the dev laptop (Ubuntu Noble `qemu 8.2.2`) stays
+untouched and is NOT used for these tests.
+
+**Why:** the SHA-256 side session's SHA-NI path (`sha256_shani`
+under `arch/x86_64/crypto/sha256.S`) cannot be exercised on
+Intel silicon older than Goldmont / Ice Lake-SP / Gracemont.
+The dev laptop lacks SHA-NI silicon; CI runners are not
+guaranteed to either. Stock Ubuntu `qemu 8.2.2` (Noble) is the
+obvious escape hatch but SIGILLs on `sha256rnds2` under
+`-cpu Icelake-Server` and SIGSEGVs mid-block under `-cpu max`
+— the decoder was not complete in that upstream version.
+Upstream qemu 9.x resolved it and qemu 11.0.0-rc fully
+supports the Intel SHA Extensions decode + semantics.
+
+Two paths were on the table to get a modern qemu on this
+laptop:
+
+1. Build stock `upstream/qemu` 9.x or 11.x into a sandbox.
+2. Build the project's own fork at `edhodapp/qemu` into a
+   sandbox.
+
+Fork was chosen because it is the long-term VMM vehicle for
+the project (cf. `~/.claude/CLAUDE.md`, the fork is listed as
+the shared machine-model source across ws_pi5, usphone, and
+fireasmserver). Building upstream today would be throw-away
+work the day the fork starts diverging meaningfully. The
+current fork state is downstream of recent master; SHA-NI
+comes "for free" from upstream and we're positioned to accept
+whatever fork-local patches land later without rebuilding
+against a different base.
+
+**How to apply:**
+
+- Local dev: run `tooling/qemu_build/build_qemu_fork.sh` once
+  per machine; idempotent. `source tooling/qemu_build/env.sh`
+  when you want the sandbox qemu on `PATH`.
+- Crypto test harnesses (`tooling/crypto_tests/*_test.c` and
+  future siblings) invoke the sandbox binary explicitly via
+  absolute path, NOT via `PATH` discovery — keeps the test
+  suite independent of whether the shell happens to have the
+  sandbox sourced.
+- CPU model selection matters. Use `-cpu Denverton` or
+  `-cpu max` — these advertise `CPUID.(EAX=7,ECX=0).EBX[bit 29]`
+  (Intel SHA Extensions) in the fork's CPU models.
+  `-cpu Icelake-Server` does NOT advertise it in QEMU's CPU
+  model even though real Ice Lake-SP silicon has it. Bug-for-
+  feature compatibility with upstream; not our problem to
+  fix in this project.
+
+**CI wiring (pending, not part of this D-entry):** the build
+script is idempotent enough that a CI cell could invoke it
+on a cold runner and cache the resulting `$HOME/opt/qemu-fork`
+tree. A full build is roughly an hour on CI-grade hardware;
+cache-hit path is seconds. Wire when the first ISA-extension
+test cell lands in `cd-matrix.yml`.
+
+**When to revisit:**
+
+- Upstream qemu ships an Ubuntu package recent enough that
+  running stock would work for every ISA extension the
+  project needs. Migration cost at that point is "drop the
+  fork build, change the path in the test harness." But we
+  keep the fork anyway for machine-model reasons, so this
+  trigger is unlikely to fire.
+- The fork diverges far enough from upstream that building
+  it becomes prohibitively slow or fails intermittently.
+  Migration path: switch `QEMU_REMOTE` in the build script
+  to a tagged-stable upstream qemu release.
+
+**Cross-refs:**
+
+- `D003` — 100% assembly; the crypto primitives built against
+  SHA-NI live there.
+- `D032` — crypto-math strategy (ISA-idiomatic, macros-first).
+- `D034` — hardware platform profiles carrying ISA feature flags
+  including `sha_ni`.
+- `D038` — L2 methodology; SHA-NI paths must be exercised before
+  shipping.
+- `docs/side_sessions/2026-04-21_sha256.md` — the first
+  consumer; the briefing that triggered this decision.
+
+**Attribution:** main-session build + implementation,
+2026-04-22. Fork-not-upstream pivot contributed by the side
+session during the SHA-256 dispatch.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
