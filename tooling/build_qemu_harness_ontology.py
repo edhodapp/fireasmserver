@@ -1242,8 +1242,8 @@ vm_launcher_mod = ModuleSpec(
     ],
     internal_module_refs=[],
     external_imports=[
-        "subprocess", "pathlib", "time",
-        "threading", "logging", "os",
+        "json", "logging", "os", "pathlib", "pydantic",
+        "subprocess", "threading", "time", "typing",
     ],
     test_strategy=(
         "Unit test with mock subprocess. Autouse fixture "
@@ -1273,6 +1273,17 @@ guest_builder_mod = ModuleSpec(
         "(ELF32), x86_64 firecracker uses PVH (ELF64). "
         "Returns the path to the built binary."
     ),
+    classes=[
+        ClassSpec(
+            name="Toolchain",
+            description=(
+                "Assembler path, linker path, and arch-specific "
+                "as/ld flag lists. Plain Python class (not "
+                "pydantic) — constructed directly by "
+                "toolchain_for."
+            ),
+        ),
+    ],
     functions=[
         FunctionSpec(
             name="build_guest",
@@ -1332,6 +1343,22 @@ test_runner_mod = ModuleSpec(
         "point for both pre-commit and CI."
     ),
     classes=[
+        ClassSpec(
+            name="TestCase",
+            description=(
+                "Pydantic model implementing the `test-case` "
+                "problem-domain Entity."
+            ),
+            bases=["pydantic.BaseModel"],
+        ),
+        ClassSpec(
+            name="TestResult",
+            description=(
+                "Pydantic model implementing the `test-result` "
+                "problem-domain Entity."
+            ),
+            bases=["pydantic.BaseModel"],
+        ),
         ClassSpec(
             name="TestSuite",
             description="Collection of test cases for a target",
@@ -1431,7 +1458,10 @@ test_runner_mod = ModuleSpec(
         ),
     ],
     internal_module_refs=["vm_launcher", "guest_builder"],
-    external_imports=["urllib.request"],
+    external_imports=[
+        "pathlib", "pydantic", "subprocess",
+        "urllib.error", "urllib.request",
+    ],
     test_strategy=(
         "Unit test check_serial and check_http with "
         "fixtures. Integration test run_suite with mocked "
