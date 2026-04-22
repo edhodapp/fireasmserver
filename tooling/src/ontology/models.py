@@ -274,59 +274,55 @@ class ExternalDependency(BaseModel):
 class ModuleSpec(BaseModel):
     """Specification for a Python module.
 
-    ``dependencies`` is a mixed-domain list: entries may be
-    internal module names (resolving to another ``ModuleSpec.name``
-    in the same ontology), Python stdlib module names
-    (``subprocess``, ``pathlib``), or third-party import paths
-    (``urllib.request``). The ``_dependencies_hygiene`` validator
-    catches obvious data problems — empty strings, leading /
-    trailing whitespace, duplicates within a single module — but
-    does NOT resolve references against the ontology, because
-    there is no consistent type-tag distinguishing internal from
-    external today. Splitting into a structured
-    ``internal_module_refs`` field (validated against this
-    ontology's module names) + a free-form ``external_imports``
-    field is an open structural question — tracked in
-    ``project_ontology_hygiene_gaps.md`` for a future refactor
-    when the downstream tooling actually needs the distinction.
+    Dependencies are split into two typed fields:
+
+    - ``internal_module_refs: list[SafeId]`` — names of other
+      ``ModuleSpec`` rows in the SAME ontology. Validated
+      structurally (SafeId regex) here and then
+      reference-checked by the ``Ontology`` RI layer: a
+      dangling internal ref is a load-time error, matching
+      the discipline the other cross-ref fields carry.
+
+    - ``external_imports: list[str]`` — free-form strings for
+      Python stdlib / third-party imports (``subprocess``,
+      ``urllib.request``, ``pydantic.BaseModel``). Kept free-
+      form because classifying stdlib-vs-third-party-vs-
+      external-package is a deep rabbit hole that adds no
+      audit value. The ``_external_imports_hygiene`` validator
+      catches obvious data problems — empty entries,
+      whitespace anywhere, duplicates within the same module.
+
+    The split is the outcome of ``project_ontology_hygiene_gaps.md``
+    gap #3: the old flat ``dependencies: list[str]`` couldn't
+    distinguish the two kinds at load time, which kept the
+    audit tool from catching typos in internal refs. With the
+    split, any undeclared-but-claimed internal module fails the
+    ontology RI check alongside the other dangling-ref errors.
     """
 
     name: str
     responsibility: str
     classes: list[ClassSpec] = []
     functions: list[FunctionSpec] = []
-    dependencies: list[str] = []
+    internal_module_refs: list[SafeId] = []
+    external_imports: list[str] = []
     test_strategy: str = ""
     status: ModuleStatus = "not_started"
 
     @model_validator(mode="after")
     def _dependencies_hygiene(self) -> "ModuleSpec":
-        """String hygiene on ``dependencies`` entries — empty,
-        whitespace-containing, or duplicate entries are schema
-        mistakes regardless of whether the entry is internal or
-        external. No valid Python import path contains whitespace
-        in any position, so the check is "any whitespace" rather
-        than "leading/trailing" — simpler rule, same coverage of
-        the leading/trailing case, catches interior-whitespace
-        typos too."""
-        seen: set[str] = set()
-        for dep in self.dependencies:
-            if not dep:
-                raise ValueError(
-                    f"ModuleSpec {self.name!r} has empty string in "
-                    "dependencies"
-                )
-            if any(c.isspace() for c in dep):
-                raise ValueError(
-                    f"ModuleSpec {self.name!r} dependency "
-                    f"{dep!r} contains whitespace"
-                )
-            if dep in seen:
-                raise ValueError(
-                    f"ModuleSpec {self.name!r} has duplicate "
-                    f"dependency {dep!r}"
-                )
-            seen.add(dep)
+        """Dispatch to per-field hygiene checks. Extracted
+        helpers keep this method under the project's cyclomatic
+        cap. ``external_imports`` gets full string-hygiene
+        (empty / whitespace / duplicates); ``internal_module_refs``
+        gets dedup only (SafeId's type layer already covers the
+        rest)."""
+        _validate_external_imports(
+            self.name, self.external_imports,
+        )
+        _validate_internal_ref_dedup(
+            self.name, self.internal_module_refs,
+        )
         return self
 
 
@@ -531,6 +527,7 @@ class Ontology(BaseModel):
             self.performance_constraints,
         ))
         errors.extend(_check_module_name_uniqueness(self.modules))
+        errors.extend(_check_module_internal_refs(self.modules))
         errors.extend(
             _check_side_session_task_uniqueness(self.side_session_tasks)
         )
@@ -801,6 +798,72 @@ def _check_entity_id_uniqueness(entities: list[Entity]) -> list[str]:
         f"Entity id {eid!r} is not unique (appears {n} times)"
         for eid, n in sorted(counts.items()) if n > 1
     ]
+
+
+def _validate_external_imports(
+    module_name: str, entries: list[str],
+) -> None:
+    """String-hygiene on one module's ``external_imports`` —
+    no empty strings, no whitespace anywhere in any entry
+    (valid Python import paths never have spaces), no
+    duplicates. Raises ``ValueError`` on the first offender;
+    the ``_dependencies_hygiene`` caller converts this into a
+    Pydantic ValidationError at construction time."""
+    seen: set[str] = set()
+    for imp in entries:
+        if not imp:
+            raise ValueError(
+                f"ModuleSpec {module_name!r} has empty string "
+                "in external_imports"
+            )
+        if any(c.isspace() for c in imp):
+            raise ValueError(
+                f"ModuleSpec {module_name!r} external_imports "
+                f"entry {imp!r} contains whitespace"
+            )
+        if imp in seen:
+            raise ValueError(
+                f"ModuleSpec {module_name!r} has duplicate "
+                f"external_imports entry {imp!r}"
+            )
+        seen.add(imp)
+
+
+def _validate_internal_ref_dedup(
+    module_name: str, refs: list[str],
+) -> None:
+    """Dedup check on ``internal_module_refs`` — SafeId already
+    blocks malformed entries; this catches the "same ref listed
+    twice" case which otherwise slips past the type layer."""
+    seen: set[str] = set()
+    for ref in refs:
+        if ref in seen:
+            raise ValueError(
+                f"ModuleSpec {module_name!r} has duplicate "
+                f"internal_module_refs entry {ref!r}"
+            )
+        seen.add(ref)
+
+
+def _check_module_internal_refs(
+    modules: list[ModuleSpec],
+) -> list[str]:
+    """Every entry in a module's ``internal_module_refs`` must
+    resolve to another ``ModuleSpec.name`` in this ontology. A
+    dangling internal ref is a typo, a module-rename that didn't
+    propagate, or a ref to a module that hasn't been added
+    yet — all are traceability breaks the audit tool should
+    flag at load time."""
+    known = {m.name for m in modules}
+    errors: list[str] = []
+    for mod in modules:
+        for ref in mod.internal_module_refs:
+            if ref not in known:
+                errors.append(
+                    f"ModuleSpec '{mod.name}' internal_module_refs "
+                    f"'{ref}' not in modules"
+                )
+    return errors
 
 
 def _check_module_name_uniqueness(modules: list[ModuleSpec]) -> list[str]:

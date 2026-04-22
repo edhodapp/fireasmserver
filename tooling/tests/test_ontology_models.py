@@ -403,27 +403,31 @@ class TestPropertyEntityRefReferentialIntegrity:
 # ---------------------------------------------------------------
 
 
-class TestModuleSpecDependenciesHygiene:
-    """String-level hygiene: no empty entries, no
-    leading/trailing whitespace, no duplicates."""
+class TestModuleSpecDependencySplit:
+    """2026-04-21 split: ``internal_module_refs`` is
+    ``list[SafeId]`` (cross-ref checked at Ontology level);
+    ``external_imports`` is free-form with string hygiene."""
 
-    def test_accepts_clean_list(self) -> None:
+    def test_accepts_clean_split(self) -> None:
         mod = ModuleSpec(
             name="m",
             responsibility="r",
-            dependencies=["subprocess", "pathlib", "vm_launcher"],
+            internal_module_refs=["vm_launcher"],
+            external_imports=["subprocess", "pathlib"],
         )
-        assert len(mod.dependencies) == 3
+        assert mod.internal_module_refs == ["vm_launcher"]
+        assert len(mod.external_imports) == 2
 
-    def test_accepts_empty_list(self) -> None:
+    def test_accepts_empty_lists(self) -> None:
         mod = ModuleSpec(name="m", responsibility="r")
-        assert not mod.dependencies
+        assert not mod.internal_module_refs
+        assert not mod.external_imports
 
-    def test_rejects_empty_string_entry(self) -> None:
+    def test_rejects_empty_external_import(self) -> None:
         with pytest.raises(ValidationError) as exc:
             ModuleSpec(
                 name="m", responsibility="r",
-                dependencies=["pathlib", ""],
+                external_imports=["pathlib", ""],
             )
         assert "empty string" in str(exc.value)
 
@@ -435,22 +439,99 @@ class TestModuleSpecDependenciesHygiene:
         "path lib",         # interior space — never a valid import
         "url\tlib",         # interior tab
     ])
-    def test_rejects_any_whitespace(self, bad: str) -> None:
+    def test_external_imports_reject_whitespace(
+        self, bad: str,
+    ) -> None:
         with pytest.raises(ValidationError) as exc:
             ModuleSpec(
                 name="m", responsibility="r",
-                dependencies=[bad],
+                external_imports=[bad],
             )
         assert "whitespace" in str(exc.value)
 
-    def test_rejects_duplicates(self) -> None:
+    def test_rejects_duplicate_external_imports(self) -> None:
         with pytest.raises(ValidationError) as exc:
             ModuleSpec(
                 name="m", responsibility="r",
-                dependencies=["pathlib", "subprocess", "pathlib"],
+                external_imports=["pathlib", "subprocess", "pathlib"],
             )
         assert "duplicate" in str(exc.value)
         assert "'pathlib'" in str(exc.value)
+
+    def test_rejects_duplicate_internal_refs(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            ModuleSpec(
+                name="m", responsibility="r",
+                internal_module_refs=["vm_launcher", "vm_launcher"],
+            )
+        assert "duplicate" in str(exc.value)
+        assert "'vm_launcher'" in str(exc.value)
+
+    def test_internal_refs_enforce_safeid_shape(self) -> None:
+        """SafeId blocks malformed refs at the type layer — a
+        leading-dash or whitespace-containing ref is rejected
+        before it can reach the sibling-resolution check."""
+        with pytest.raises(ValidationError):
+            ModuleSpec(
+                name="m", responsibility="r",
+                internal_module_refs=["-leading-dash"],
+            )
+        with pytest.raises(ValidationError):
+            ModuleSpec(
+                name="m", responsibility="r",
+                internal_module_refs=["has space"],
+            )
+
+
+class TestOntologyInternalModuleRefRI:
+    """Every ``internal_module_refs`` entry must resolve to
+    another declared ``ModuleSpec.name`` — the reverse arrow the
+    split was introduced to make checkable."""
+
+    def test_resolved_ref_accepted(self) -> None:
+        Ontology(modules=[
+            ModuleSpec(name="vm_launcher", responsibility="r"),
+            ModuleSpec(
+                name="test_runner", responsibility="r",
+                internal_module_refs=["vm_launcher"],
+            ),
+        ])
+
+    def test_dangling_ref_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(modules=[
+                ModuleSpec(
+                    name="test_runner", responsibility="r",
+                    internal_module_refs=["ghost_module"],
+                ),
+            ])
+        message = str(exc.value)
+        assert "test_runner" in message
+        assert "'ghost_module'" in message
+        assert "not in modules" in message
+
+    def test_dangling_internal_ref_joins_other_ri_errors(
+        self,
+    ) -> None:
+        """Dangling module refs surface alongside other RI
+        errors in one validation pass, per the established
+        all-errors-together pattern."""
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[_entity("a")],
+                modules=[ModuleSpec(
+                    name="m", responsibility="r",
+                    internal_module_refs=["ghost_module"],
+                )],
+                relationships=[Relationship(
+                    source_entity_id="ghost_entity",
+                    target_entity_id="a",
+                    name="r", cardinality="one_to_one",
+                )],
+            )
+        message = str(exc.value)
+        assert "'ghost_module'" in message
+        assert "'ghost_entity'" in message
 
 
 # ---------------------------------------------------------------

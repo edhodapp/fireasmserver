@@ -921,7 +921,8 @@ vm_launcher_mod = ModuleSpec(
             docstring="Check if /dev/kvm is available.",
         ),
     ],
-    dependencies=[
+    internal_module_refs=[],
+    external_imports=[
         "subprocess", "pathlib", "time",
         "threading", "logging", "os",
     ],
@@ -990,7 +991,8 @@ guest_builder_mod = ModuleSpec(
             ),
         ),
     ],
-    dependencies=["subprocess", "pathlib"],
+    internal_module_refs=[],
+    external_imports=["subprocess", "pathlib"],
     test_strategy=(
         "Unit test toolchain_for with all supported (arch, "
         "platform) combos plus rejection cases. Functional "
@@ -1109,9 +1111,8 @@ test_runner_mod = ModuleSpec(
             ),
         ),
     ],
-    dependencies=[
-        "vm_launcher", "guest_builder", "urllib.request",
-    ],
+    internal_module_refs=["vm_launcher", "guest_builder"],
+    external_imports=["urllib.request"],
     test_strategy=(
         "Unit test check_serial and check_http with "
         "fixtures. Integration test run_suite with mocked "
@@ -1158,7 +1159,8 @@ cli_mod = ModuleSpec(
             docstring="Print test results for one suite.",
         ),
     ],
-    dependencies=["argparse", "json", "test_runner"],
+    internal_module_refs=["test_runner"],
+    external_imports=["argparse", "json"],
     test_strategy=(
         "Test argument parsing. Test exit codes for "
         "all-pass and any-failure scenarios with mocked "
