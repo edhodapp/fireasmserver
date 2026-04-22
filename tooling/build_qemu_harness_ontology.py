@@ -21,6 +21,7 @@ from ontology import (
     Property,
     PropertyType,
     Relationship,
+    VerificationCase,
 )
 from ontology.dag import (
     dag_transaction,
@@ -243,6 +244,44 @@ ethernet_frame = Entity(
                 "Big-endian 16-bit EtherType (≥ 0x0600) or "
                 "802.3 length (< 0x0600; out of scope per "
                 "ETH-002)."
+            ),
+        ),
+    ],
+)
+
+# -- Problem Domain: virtio-net device -----------------------------
+#
+# The MMIO-addressable virtio-net endpoint exposed by Firecracker.
+# Anchor for VIO-* / VIO-F-* / VIO-Q-* / VIO-R-* / VIO-T-*
+# constraints in the L2 requirements.
+virtio_net_device = Entity(
+    id="virtio-net-device",
+    name="VirtioNetDevice",
+    description=(
+        "The virtio-net device exposed by Firecracker at MMIO "
+        "0xC0001000 (MEM_32BIT_DEVICES per the VMM layout). The "
+        "L2 driver owns the full Virtio 1.2 §2.1.2 init sequence "
+        "(reset → ACKNOWLEDGE → DRIVER → feature negotiation → "
+        "FEATURES_OK → virtqueue init → DRIVER_OK) plus the "
+        "split-virtqueue descriptor / available / used rings "
+        "that upper layers consume for RX and TX."
+    ),
+    properties=[
+        Property(
+            name="mmio_base",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Physical MMIO base address. 0xC0001000 on "
+                "Firecracker x86_64 per MEM_32BIT_DEVICES."
+            ),
+        ),
+        Property(
+            name="queue_size",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Driver-negotiated virtqueue size, "
+                "min(QueueNumMax, VIRTQ_MAX_SIZE=256). Both "
+                "RX and TX queues share this value in MVP."
             ),
         ),
     ],
@@ -485,6 +524,286 @@ constraints = [
         ],
         verification_refs=[
             "tooling/tests/test_vm_launcher.py",
+        ],
+        status="implemented",
+    ),
+    # -- L2 product constraints (2026-04-22 authoring pass) --
+    # Virtio 1.2 §2.1.2 init sequence, implemented on
+    # x86_64/firecracker. Each row carries impl_refs into
+    # boot.S's fail-path labels (the diagnostic endpoints that
+    # prove the happy path reached THAT step) and verify_refs
+    # into the tracer-bullet marker-check it produces.
+    DomainConstraint(
+        name="VIO-001",
+        description=(
+            "On init, reset the device by writing 0 to the "
+            "Device Status MMIO register (Virtio 1.2 §2.1.2 "
+            "step 1). Post-reset state verified via the "
+            "shared .status_fail endpoint (VIO-003)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="D038 L2 methodology; Virtio 1.2 §2.1.2 step 1.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:.status_fail",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-002",
+        description=(
+            "Set ACKNOWLEDGE (bit 0) in Status after reset "
+            "(Virtio 1.2 §2.1.2 step 2). Post-ACK state "
+            "verified via the shared .status_fail endpoint "
+            "(VIO-003)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 step 2.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:.status_fail",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-003",
+        description=(
+            "Set DRIVER (bit 1) in Status after ACKNOWLEDGE "
+            "(Virtio 1.2 §2.1.2 step 3). Full expected state "
+            "after steps 1-3 cross-checked via equality compare "
+            "against ACK|DRIVER (0x03); mismatch routes through "
+            ".status_fail and VIO-009."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 step 3.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:.status_fail",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-004",
+        description=(
+            "Read device feature bits via DeviceFeaturesSel / "
+            "DeviceFeatures, select the driver's subset, write "
+            "it back via DriverFeaturesSel / DriverFeatures "
+            "(Virtio 1.2 §2.1.2 step 4). MVP subset is "
+            "VIRTIO_F_VERSION_1 only; VIO-F-001 governs it, "
+            "VIO-F-002 and VIO-F-006 are declared deviations, "
+            "and VIO-F-003..005/007 remain in REQUIREMENTS.md "
+            "pending formalisation into the ontology."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 step 4.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:"
+            ".features_fail_no_v1",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-005",
+        description=(
+            "Set FEATURES_OK (bit 3) in Status after driver-"
+            "features write (Virtio 1.2 §2.1.2 step 5)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 step 5.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:"
+            ".features_fail_rejected",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-006",
+        description=(
+            "Re-read Status; MUST abort init if FEATURES_OK is "
+            "not still set (Virtio 1.2 §2.1.2 step 6). Equality "
+            "compare against ACK|DRIVER|FEATURES_OK catches both "
+            "FEATURES_OK-cleared and unexpected stray bits."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 step 6.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:"
+            ".features_fail_rejected",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-007",
+        description=(
+            "Read device-specific config, discover + initialize "
+            "virtqueues (Virtio 1.2 §2.1.2 step 7). Slice 1: "
+            "QueueSel + QueueNumMax discovery emits "
+            "QUEUES:RX=<hex> TX=<hex>. Slice 2: QueueNum "
+            "(clamped to VIRTQ_MAX_SIZE=256), QueueDesc / "
+            "QueueDriver / QueueDevice physical addresses "
+            "programmed, QueueReady toggled with read-back "
+            "verify. Emits QUEUES:READY on success."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale=(
+            "Virtio 1.2 §2.1.2 step 7 + §4.2.2 register "
+            "semantics. Memory allocation per D043 (static "
+            "pools)."
+        ),
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:"
+            ".queue_ready_fail",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-008",
+        description=(
+            "Set DRIVER_OK (bit 2) in Status; device is now "
+            "live (Virtio 1.2 §2.1.2 step 8). Read-back equality-"
+            "compares against ACK|DRIVER|FEATURES_OK|DRIVER_OK "
+            "(0x0F); mismatch routes through .driver_ok_fail + "
+            "VIO-009."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 step 8.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:"
+            ".driver_ok_fail",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-009",
+        description=(
+            "On any fatal driver error, set FAILED (bit 7) in "
+            "Status (Virtio 1.2 §2.1.2). Shared .set_failed "
+            "helper is the single halt endpoint for every "
+            "post-MagicValue failure path — .status_fail, "
+            ".features_fail_no_v1, .features_fail_rejected, "
+            ".queue_fail_rx, .queue_fail_tx, .queue_ready_fail, "
+            ".driver_ok_fail all route through it. "
+            ".virtio_fail bypasses it: on a MagicValue "
+            "mismatch the device's register layout is "
+            "unverified and a Status write would be blind."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.1.2 error-handling requirement.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:.set_failed",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-F-001",
+        description=(
+            "MUST negotiate VIRTIO_F_VERSION_1 (bit 32) — we "
+            "are a modern driver (Virtio 1.2 §6). MVP driver-"
+            "features subset is VERSION_1 only; everything else "
+            "(MAC / STATUS / MQ / CSUM / GSO / EVENT_IDX) stays "
+            "off until the code path that consumes it lands."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §6. Legacy / transitional not supported.",
+        implementation_refs=[
+            "arch/x86_64/platform/firecracker/boot.S:"
+            ".features_fail_no_v1",
+        ],
+        verification_refs=[
+            "tooling/tracer_bullet/run_local.sh",
+        ],
+        status="implemented",
+    ),
+    DomainConstraint(
+        name="VIO-F-002",
+        description=(
+            "MUST negotiate VIRTIO_NET_F_MAC (bit 5) if the "
+            "device offers it, and read MAC from config space "
+            "(Virtio 1.2 §5.1.3)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale=(
+            "DEVIATION: MVP feature-negotiation commit "
+            "(2026-04-19) accepts no device-specific features. "
+            "MAC read is deferred to the VIO-007 device-config "
+            "follow-up. Until that lands, the driver acts as "
+            "if the device did not offer MAC — a locally-"
+            "administered random MAC would be generated if "
+            "this shipped. Tracked so it doesn't silently "
+            "become a latent bug."
+        ),
+        implementation_refs=[],
+        verification_refs=[],
+        status="deviation",
+    ),
+    DomainConstraint(
+        name="VIO-F-006",
+        description=(
+            "SHOULD NOT negotiate VIRTIO_NET_F_CSUM / "
+            "VIRTIO_NET_F_GUEST_CSUM unless our TCP/UDP stack "
+            "handles partial checksums (Virtio 1.2 §5.1.3)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale=(
+            "DEVIATION by spec intent: L4 checksum handling is "
+            "a future layer. Leaving CSUM unnegotiated means "
+            "the device computes full checksums and the driver "
+            "presents checksummed frames — simpler MVP posture. "
+            "Revisit when L4 TCP/UDP layer lands."
+        ),
+        implementation_refs=[],
+        verification_refs=[],
+        status="deviation",
+    ),
+    # -- L2 product constraints: Ethernet-layer primitives --
+    DomainConstraint(
+        name="ETH-005",
+        description=(
+            "FCS = CRC-32 over DA..payload, polynomial "
+            "0xedb88320 reflected (IEEE 802.3-2018 §3.2.9). "
+            "x86_64 uses PCLMULQDQ fold-by-1 when available, "
+            "slicing-by-8 fallback. AArch64 uses FEAT_CRC32 "
+            "native. Both arches verified against IEEE 802.3 / "
+            "zlib vectors. TX-path bswap32+complement conversion "
+            "for on-the-wire FCS still pending; virtio-net "
+            "typically offloads FCS."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale=(
+            "IEEE 802.3-2018 §3.2.9. D032 crypto-math strategy "
+            "(ISA-idiomatic, macros-first, constant-time)."
+        ),
+        implementation_refs=[
+            "arch/x86_64/crypto/crc32_ieee.S",
+            "arch/aarch64/crypto/crc32_ieee.S",
+        ],
+        verification_refs=[
+            "tooling/tests/test_crc32_ieee.py",
+            "tooling/crypto_tests/crc32_test.c",
         ],
         status="implemented",
     ),
@@ -1168,6 +1487,60 @@ cli_mod = ModuleSpec(
     ),
 )
 
+# -- Verification Domain: Test-plan traceability --
+#
+# One VerificationCase per TEST_PLAN.md §9 row whose `covers`
+# list fully resolves against constraints declared above.
+# Partial-coverage and ontology-missing rows are deferred to a
+# follow-up pass that formalises the remaining L2 requirements
+# (ETH-001..018 minus 005, MAC-*, VLAN-*, ARP-*, VIO-Q/R/T/C/F-*
+# 003..007) as first-class DomainConstraints. Listing them as
+# stubs here without their requirements would hide the gap the
+# audit tool exists to surface.
+#
+# `eth-fcs-primitive` is `passing` — CRC-32 IEEE unit tests
+# already pass on both arches (Slice D047 + crypto_tests/
+# test_crc32_ieee.c). All others start `planned`.
+
+verification_cases = [
+    VerificationCase(
+        name="eth-fcs-primitive",
+        covers=["ETH-005"],
+        tier="A",
+        status="passing",
+        implementation_refs=[
+            "tooling/tests/test_crc32_ieee.py",
+            "tooling/crypto_tests/crc32_test.c",
+        ],
+        rationale=(
+            "Unit-level verification of the CRC-32 IEEE 802.3 "
+            "primitive on both arches against zlib vectors. "
+            "Virtio-net frame-level FCS behaviour (eth-fcs-virtio) "
+            "is separate."
+        ),
+    ),
+    VerificationCase(
+        name="virtio-init-sequence",
+        covers=[
+            "VIO-001", "VIO-002", "VIO-003", "VIO-004",
+            "VIO-005", "VIO-006", "VIO-007", "VIO-008",
+            "VIO-009",
+        ],
+        tier="B",
+        status="planned",
+        implementation_refs=[],
+        rationale=(
+            "Integration verification of the full Virtio 1.2 "
+            "§2.1.2 device init handshake. Current tracer-bullet "
+            "marker checks in run_local.sh are the de-facto "
+            "cover, but a dedicated integration test that "
+            "asserts on both happy-path markers and each "
+            ".*_fail endpoint hasn't been written yet."
+        ),
+    ),
+]
+
+
 # -- Solution Domain: External Dependencies --
 
 ext_deps = [
@@ -1188,11 +1561,13 @@ ext_deps = [
 ontology = Ontology(
     entities=[
         guest_image, vm_instance, test_case, test_result,
-        fsa_transition, ethernet_frame, observability_event_site,
+        fsa_transition, ethernet_frame, virtio_net_device,
+        observability_event_site,
     ],
     relationships=[boots_rel, runs_against_rel, produces_rel],
     domain_constraints=constraints,
     performance_constraints=performance_constraints,
+    verification_cases=verification_cases,
     modules=[
         vm_launcher_mod, guest_builder_mod,
         test_runner_mod, cli_mod,
@@ -1217,6 +1592,10 @@ print(f"  Constraints: {len(ontology.domain_constraints)}")
 print(
     f"  Performance constraints: "
     f"{len(ontology.performance_constraints)}"
+)
+print(
+    f"  Verification cases: "
+    f"{len(ontology.verification_cases)}"
 )
 print(f"  Modules: {len(ontology.modules)}")
 print(
