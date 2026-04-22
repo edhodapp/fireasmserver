@@ -168,6 +168,15 @@ sha256_pad_tail:
 .one_block:
     ; Length field lives in the last 8 bytes of the last block.
     ; 1-block tail ⇒ offset 56; 2-block tail ⇒ offset 120.
+    ;
+    ; Input-length domain: ≤ 2^61 - 1 bytes. `size_t` on x86_64
+    ; admits values up to 2^64 - 1, so in principle an input at or
+    ; past 2^61 bytes (≈ 2 EiB) would silently drop high bits in
+    ; the shl below; FIPS 180-4 itself is only defined up to
+    ; 2^64 - 1 bits (≈ 2^61 - 1 bytes), so callers above that bound
+    ; are already outside the standard. No runtime check here — no
+    ; realistic caller (TLS transcripts, HKDF, guest-local objects)
+    ; lands anywhere near the bound.
     mov     r10, rdx
     shl     r10, 3                      ; bytes → bits
     bswap   r10

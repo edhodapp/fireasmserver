@@ -148,6 +148,15 @@ sha256:
     mov     w7, #2
 .Lone_block:
     // Write big-endian total-bit-length at offset (64*w7 - 8).
+    // Input-length domain: ≤ 2^61 - 1 bytes. A `size_t` on AArch64
+    // admits values up to 2^64 - 1, so in principle an input at or
+    // past 2^61 bytes (≈ 2 EiB) would silently drop high bits here;
+    // FIPS 180-4 itself is only defined up to 2^64 - 1 bits
+    // (≈ 2^61 - 1 bytes), so callers above that bound are already
+    // outside the standard and the spec has no answer. We do not
+    // add a runtime check: any realistic call (one-shot TLS
+    // transcripts, HKDF blocks, filesystem objects in a Firecracker
+    // guest) lands many orders of magnitude below the bound.
     lsl     x5, x3, #3                          // bytes → bits
     rev     x5, x5                              // big-endian
     lsl     x8, x7, #6                          // 64 * block_count
