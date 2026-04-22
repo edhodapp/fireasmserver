@@ -1991,6 +1991,61 @@ follow-up tool but not in scope for the first cut.
 **Attribution:** main-session design + implementation,
 2026-04-20.
 
+### D053: MVP ships single-queue; virtio multi-queue (`VIRTIO_NET_F_MQ`) deferred beyond first release
+
+**Decision (2026-04-21):** the first-release L2 driver negotiates
+a single RX queue (queue 0) + single TX queue (queue 1) and does
+NOT negotiate `VIRTIO_NET_F_MQ` (bit 22). Multi-queue support is
+an explicit deviation, not a bug or an oversight; it lands in a
+subsequent release if and when measured single-queue throughput
+stops meeting the frame-rate targets under realistic workloads.
+
+**Why:** MQ is a tail-latency / scale-out optimization, not a
+correctness requirement. Adding it costs real scope — per-queue
+dispatch, interrupt steering, queue-pair management over the
+control queue (`VIRTIO_F_CTRL_VQ` + `VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET`),
+and a receive side that hashes frames into the right queue. For
+a single-core consumer-throughput workload on a Firecracker
+microVM endpoint, single-queue is sufficient and preserves the
+"one path, one set of tests" discipline of the MVP.
+
+The receiving side of the decision is that the `VIO-F-004`
+ontology row moves from the non-canonical `deviation-candidate`
+status used in `docs/l2/REQUIREMENTS.md` to the canonical
+`deviation` status the schema supports (`RequirementStatus` has
+no `deviation-candidate` member). This D-entry is the citation
+required by the ontology legend's rule that every `deviation` row
+MUST point at a `DECISIONS.md` entry.
+
+**How to apply:**
+- `VIO-F-004` stays at `status="deviation"` citing `D053` until a
+  later design-doc entry in `docs/l2/DESIGN.md` changes the MVP
+  scope. Promotion to `spec` (or `implemented`) requires a new
+  D-entry that supersedes this one.
+- RX path code (`VIO-R-001`) stays hard-coded to queue 0; TX
+  (`VIO-T-001`) to queue 1. No runtime-selectable queue plumbing.
+- `VIO-F-005` (`VIRTIO_NET_F_CTRL_VQ`) remains `spec` — the
+  control queue is independent of MQ; it's needed for MAC-filter
+  and (eventually) VLAN-filter management even in single-queue.
+
+**When to revisit:** if L2 frame-rate measurements against the
+`l2-frame-rate-target` (10 Gbps, `D040` perf ratchet) show
+single-queue saturation below target under representative
+workloads. Until then, MQ stays deferred.
+
+**Cross-refs:**
+- `D038` — L2 methodology.
+- `D040` — perf-regression ratchet; the eventual re-evaluation
+  trigger for this decision.
+- `D049` — ontology-as-formal-requirements; this D-entry is the
+  citation mechanism the schema's `deviation` rule requires.
+- `docs/l2/REQUIREMENTS.md` VIO-F-004 — the row pointing at this
+  D-entry once the same commit lands.
+
+**Attribution:** main-session decision, 2026-04-21, during the
+L2 requirements-formalization pass (ontology commit bundles this
+D-entry with the 70 stub constraint rows it authors).
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation

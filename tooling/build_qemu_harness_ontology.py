@@ -287,6 +287,66 @@ virtio_net_device = Entity(
     ],
 )
 
+# The ARP packet format (RFC 826). Anchor for ARP-001..011 in
+# L2 requirements. ARP runs over Ethernet but its packet shape
+# is a distinct object from the frame that carries it, so
+# ARP-002 ("HTYPE=1, PTYPE=0x0800, HLEN=6, PLEN=4") and peers
+# get their own entity rather than being shoehorned into
+# ``ethernet-frame``.
+arp_packet = Entity(
+    id="arp-packet",
+    name="ARPPacket",
+    description=(
+        "A single ARP packet per RFC 826, carried inside an "
+        "Ethernet frame with EtherType 0x0806. Fixed-layout "
+        "header (HTYPE, PTYPE, HLEN, PLEN, OP) followed by "
+        "Sender HW / Sender Protocol / Target HW / Target "
+        "Protocol addresses."
+    ),
+    properties=[
+        Property(
+            name="operation",
+            property_type=PropertyType(
+                kind="enum", reference=["request", "reply"],
+            ),
+            description=(
+                "OP field: 1=REQUEST, 2=REPLY (RFC 826)."
+            ),
+        ),
+        Property(
+            name="sender_hw_addr",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "6-byte Sender Hardware Address (MAC)."
+            ),
+        ),
+        Property(
+            name="sender_protocol_addr",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "4-byte Sender Protocol Address (IPv4)."
+            ),
+        ),
+        Property(
+            name="target_hw_addr",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "6-byte Target Hardware Address (MAC). "
+                "Zero-filled on REQUEST, populated on REPLY."
+            ),
+        ),
+        Property(
+            name="target_protocol_addr",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "4-byte Target Protocol Address (IPv4). "
+                "Anchor for ARP-004 / ARP-011 local-IP checks."
+            ),
+        ),
+    ],
+)
+
+
 observability_event_site = Entity(
     id="observability-event-site",
     name="ObservabilityEventSite",
@@ -779,6 +839,783 @@ constraints = [
         verification_refs=[],
         status="deviation",
     ),
+    # -- L2 formalization pass (2026-04-21): stubs for every L2
+    # requirement in docs/l2/REQUIREMENTS.md that did not already
+    # have a first-class DomainConstraint row. All carry the
+    # REQUIREMENTS.md-declared status. Empty impl/verify refs are
+    # intentional — these requirements are not yet implemented;
+    # when they are, the committer's L2 work flips status + adds
+    # refs. Lets TEST_PLAN.md §9's partial-coverage
+    # VerificationCases start citing them.
+
+    # -- Section 1: IEEE 802.3 Ethernet framing (except ETH-005
+    # which already has a first-class row below at status=
+    # implemented) --
+    DomainConstraint(
+        name="ETH-001",
+        description=(
+            "Frame layout: 6-byte DA, 6-byte SA, 2-byte "
+            "EtherType/Length, payload, 4-byte FCS."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §3.1.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-002",
+        description=(
+            "EtherType ≥ 0x0600 identifies Ethernet II; smaller "
+            "values are 802.3 Length + LLC header. We support "
+            "Ethernet II only (LLC/SNAP out of scope)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §3.2.6; RFC 894.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-003",
+        description=(
+            "Minimum frame size: 64 bytes including FCS "
+            "(512 bit-times). Relaxed to 60 if driver strips FCS."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §3.2.7.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-004",
+        description=(
+            "Maximum frame size: 1518 bytes untagged, 1522 with "
+            "one VLAN tag. Jumbo-frame rules tracked separately."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §3.2.7.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-006",
+        description=(
+            "MUST accept broadcast DA FF:FF:FF:FF:FF:FF."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.2.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-007",
+        description=(
+            "MUST accept multicast DA (group-bit-set) matching "
+            "configured filter set (virtio-net multicast MAC "
+            "filter list)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.2.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-008",
+        description=(
+            "MUST accept unicast DA equal to the device's "
+            "assigned MAC."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.2.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-009",
+        description=(
+            "MUST discard frames with incorrect FCS. Typically "
+            "signaled by virtio host."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.2.4.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-010",
+        description=(
+            "MUST discard runt frames (<64 bytes incl. FCS). "
+            "Guard against runt-length L2 attacks."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §3.2.7.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-011",
+        description=(
+            "MUST discard oversized frames (>1518 untagged, "
+            ">1522 tagged, >jumbo cap if negotiated)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §3.2.7.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-012",
+        description=(
+            "MUST pad short outgoing frames to the 64-byte "
+            "minimum. Pad byte value unspecified; convention is "
+            "zero."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.2.3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-013",
+        description=(
+            "SHOULD zero-fill padding bytes. Conservative "
+            "choice; avoids info leaks."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="Convention; no formal IEEE requirement.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-014",
+        description=(
+            "Inter-frame gap: 96 bit-times at the negotiated "
+            "link speed."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale=(
+            "IEEE 802.3-2018 §4.2.3.3. N/A — virtio abstracts "
+            "PHY; host handles IFG."
+        ),
+        status="n_a",
+    ),
+    DomainConstraint(
+        name="ETH-015",
+        description=(
+            "Source MAC MUST have unicast bit clear (LSb of "
+            "first byte = 0)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.1.2.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-016",
+        description=(
+            "MUST NOT emit a frame with source MAC = broadcast "
+            "or multicast. Sanity check at TX."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3-2018 §4.1.2.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-017",
+        description=(
+            "MAC address locally-administered bit (2nd LSb of "
+            "first byte) is informational only; we don't treat "
+            "L/A MACs differently."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802c.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ETH-018",
+        description=(
+            "MUST silently discard Ethernet PAUSE frames "
+            "(EtherType 0x8808, MAC control opcode 0x0001) and "
+            "increment a rx_pause_dropped counter. Acting on "
+            "received pause is a separate flow-control module, "
+            "explicitly deferred per D045's 'stays deferred' "
+            "list."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.3x-1997 §31B.1.",
+        status="spec",
+    ),
+
+    # -- Section 2: IEEE 802.1Q VLAN tagging --
+    DomainConstraint(
+        name="VLAN-001",
+        description=(
+            "4-byte tag inserted after SA: TPID=0x8100, TCI = "
+            "3-bit PCP + 1-bit DEI + 12-bit VID. RX parses "
+            "unconditionally; TX inserts when "
+            "tx_request_t.vid != 0."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.1Q-2022 §9.6; D045.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VLAN-002",
+        description=(
+            "Tagged-frame EtherType field is at byte offset 16 "
+            "(not 12). RX re-reads EtherType at offset 16 after "
+            "tag detection."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.1Q-2022 §9.5.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VLAN-003",
+        description=(
+            "VID 0x000 = priority-tagged (no VLAN membership); "
+            "0xFFF reserved. VID extracted into per-frame "
+            "metadata regardless."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.1Q-2022 §9.6.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VLAN-004",
+        description=(
+            "PCP field maps to 802.1p priority classes 0–7. "
+            "Propagated into per-frame metadata; QoS routing is "
+            "upper-layer."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.1Q-2022 §6.9.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VLAN-005",
+        description=(
+            "MUST silently discard tagged frames on a port that "
+            "is not VLAN-capable."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale=(
+            "IEEE 802.1Q-2022 §8. DEVIATION: D045 reverses this "
+            "behavior — we parse tagged frames rather than "
+            "discard. Kept for historical reference; obsoleted "
+            "by the D045 design."
+        ),
+        status="deviation",
+    ),
+    DomainConstraint(
+        name="VLAN-006",
+        description=(
+            "802.1ad Q-in-Q (outer TPID 0x88A8). RX recognizes "
+            "outer + inner tag; extracts both VIDs to metadata. "
+            "TX can emit Q-in-Q when two vid fields are "
+            "non-zero (MVP default: one-level tagging)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802.1ad-2005.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VLAN-007",
+        description=(
+            "802.1Qbb Priority Flow Control (PFC)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale=(
+            "IEEE 802.1Qbb. DEVIATION: D045 keeps PFC deferred "
+            "— additive feature, doesn't reshape parser."
+        ),
+        status="deviation",
+    ),
+    DomainConstraint(
+        name="VLAN-008",
+        description=(
+            "VLAN filter management via control queue "
+            "(VIRTIO_NET_CTRL_VLAN_ADD / _DEL)."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale=(
+            "Virtio 1.2 §5.1.6.5.3. DEVIATION: D045 keeps "
+            "filter management deferred — additive on already-"
+            "designed control-queue interface. MVP accepts "
+            "all VIDs."
+        ),
+        status="deviation",
+    ),
+
+    # -- Section 3: ARP (RFC 826 / 5227) --
+    DomainConstraint(
+        name="ARP-001",
+        description="ARP frame EtherType = 0x0806.",
+        entity_ids=["arp-packet", "ethernet-frame"],
+        rationale="RFC 826.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-002",
+        description=(
+            "ARP packet: HTYPE=1 (Ethernet), PTYPE=0x0800 "
+            "(IPv4), HLEN=6, PLEN=4."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-003",
+        description="OP=1 is REQUEST, OP=2 is REPLY.",
+        entity_ids=["arp-packet"],
+        rationale="RFC 826.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-004",
+        description=(
+            "MUST answer an ARP REQUEST whose Target Protocol "
+            "Address equals a local IP."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826 §3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-005",
+        description=(
+            "MUST update cache entry on REPLY from an address "
+            "we have a pending REQUEST for."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826 §3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-006",
+        description=(
+            "SHOULD also update cache on any ARP packet whose "
+            "Sender HW/Protocol Addresses are in the cache "
+            "(opportunistic)."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826 §3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-007",
+        description=(
+            "MUST NOT add a cache entry solely on observed "
+            "traffic — only on ARP packets."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826 §3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-008",
+        description=(
+            "Cache entries MUST age out after an "
+            "implementation-defined TTL. Convention: 20 min for "
+            "complete, 3 min for incomplete."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826 §3 (implicit).",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-009",
+        description=(
+            "SHOULD emit gratuitous ARP on interface-up / "
+            "IP-assignment (ACD per RFC 5227)."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 5227 §2.1.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-010",
+        description=(
+            "SHOULD defend local IP against conflicting claim."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 5227 §2.4.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="ARP-011",
+        description=(
+            "MUST NOT respond to REQUEST whose Target Protocol "
+            "Address is not a local IP."
+        ),
+        entity_ids=["arp-packet"],
+        rationale="RFC 826 §3.",
+        status="spec",
+    ),
+
+    # -- Section 4.2: Feature negotiation (VIO-F-001/002/006
+    # already above; adding the remaining four) --
+    DomainConstraint(
+        name="VIO-F-003",
+        description=(
+            "MAY negotiate VIRTIO_NET_F_STATUS (bit 16) to "
+            "observe link state."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-F-004",
+        description=(
+            "MAY negotiate VIRTIO_NET_F_MQ (bit 22) for "
+            "multi-queue."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale=(
+            "Virtio 1.2 §5.1.3. DEVIATION per D053: MVP ships "
+            "single-queue (RX queue 0 + TX queue 1). MQ is a "
+            "scale-out optimization, not a correctness "
+            "requirement; deferred until measured single-queue "
+            "throughput stops meeting the D040 frame-rate "
+            "targets."
+        ),
+        status="deviation",
+    ),
+    DomainConstraint(
+        name="VIO-F-005",
+        description=(
+            "MAY negotiate VIRTIO_NET_F_CTRL_VQ (bit 17) to "
+            "expose the control queue. Needed for MAC-filter / "
+            "MQ / VLAN config."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-F-007",
+        description=(
+            "MUST NOT negotiate VIRTIO_F_EVENT_IDX (bit 29) "
+            "unless we implement the event-suppression protocol "
+            "correctly. Optimization; may skip for MVP."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.6.7.",
+        status="spec",
+    ),
+
+    # -- Section 4.3: Virtqueue layout (split virtqueue) --
+    DomainConstraint(
+        name="VIO-Q-001",
+        description=(
+            "Split virtqueue has three areas: Descriptor "
+            "Table, Available Ring, Used Ring. Packed queues "
+            "out of MVP scope."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-002",
+        description=(
+            "Descriptor Table: array of 16-byte descriptors "
+            "(addr, len, flags, next)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.5.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-003",
+        description=(
+            "Descriptor flags: NEXT=1, WRITE=2, INDIRECT=4."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.5.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-004",
+        description=(
+            "Available Ring: idx + ring[] of descriptor-table "
+            "indices; updated by driver."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.6.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-005",
+        description=(
+            "Used Ring: idx + ring[] of used-descriptor + "
+            "length; updated by device."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.8.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-006",
+        description=(
+            "Queue size MUST be power-of-2, ≤ queue_size "
+            "(from device), queried from Common config."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §4.1.4.3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-007",
+        description=(
+            "Descriptor Table alignment: 16 bytes; Available "
+            "Ring: 2 bytes; Used Ring: 4 bytes. Modern device "
+            "uses queue_desc / queue_driver / queue_device "
+            "registers."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-Q-008",
+        description=(
+            "Proper memory barriers around ring-index updates."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale=(
+            "Virtio 1.2 §2.7.11. Cross-references D039 §2 "
+            "(DMA/cache coherence); bugs here are of the "
+            "'silently corrupts data at high throughput' class, "
+            "not the 'returns an error' class."
+        ),
+        status="spec",
+    ),
+
+    # -- Section 4.4: Receive path --
+    DomainConstraint(
+        name="VIO-R-001",
+        description=(
+            "Receive queue index = 0 (single-queue) or "
+            "0,2,4,... (MQ)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-R-002",
+        description=(
+            "Pre-populate RX queue with buffers marked WRITE."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.3.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-R-003",
+        description=(
+            "Each incoming packet is prefixed with a "
+            "virtio_net_hdr (length depends on negotiated "
+            "features)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-R-004",
+        description=(
+            "virtio_net_hdr.flags, .gso_type, .hdr_len, "
+            ".gso_size, .csum_start, .csum_offset, "
+            ".num_buffers — our handler MUST at minimum read "
+            "num_buffers."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-R-005",
+        description=(
+            "MUST handle multi-descriptor RX when "
+            "num_buffers > 1 (VIRTIO_NET_F_MRG_RXBUF)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.3.1.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-R-006",
+        description=(
+            "After consuming a descriptor, return it to the "
+            "Available Ring."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.13.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-R-007",
+        description=(
+            "Notify the device of returned buffers via Queue "
+            "Notify register (unless EVENT_IDX suppresses it)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.12.",
+        status="spec",
+    ),
+
+    # -- Section 4.5: Transmit path --
+    DomainConstraint(
+        name="VIO-T-001",
+        description=(
+            "Transmit queue index = 1 (single-queue) or "
+            "1,3,5,... (MQ)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-T-002",
+        description=(
+            "Each outgoing packet MUST be preceded by a "
+            "virtio_net_hdr."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-T-003",
+        description=(
+            "If VIRTIO_NET_F_CSUM not negotiated, "
+            "virtio_net_hdr.flags.NEEDS_CSUM MUST be 0. "
+            "Consistent with VIO-F-006 deviation."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-T-004",
+        description=(
+            "If GSO features not negotiated, "
+            "virtio_net_hdr.gso_type MUST be GSO_NONE. "
+            "MVP: no GSO."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-T-005",
+        description=(
+            "Submit descriptor chain: (hdr, payload_0, "
+            "payload_1, …) with only the first writable flag "
+            "clear (RX flag doesn't apply at TX)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.5.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-T-006",
+        description=(
+            "Wait for Used Ring index advancement, then "
+            "reclaim buffers."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §2.7.8.",
+        status="spec",
+    ),
+
+    # -- Section 4.6: Control path (only in scope if VIO-F-005
+    # is negotiated; MAC filter / VLAN filter / MQ config /
+    # announce) --
+    DomainConstraint(
+        name="VIO-C-001",
+        description=(
+            "Control queue index = MAX_QUEUE_PAIRS * 2 "
+            "(or 2 for single-queue)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-C-002",
+        description=(
+            "Command format: class + cmd + data + ack; device "
+            "writes ack byte at end."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.5.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-C-003",
+        description=(
+            "SHOULD support VIRTIO_NET_CTRL_MAC_TABLE_SET to "
+            "populate the multicast filter (paired with "
+            "VIO-F-005 + VIRTIO_NET_F_CTRL_RX)."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.5.2.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="VIO-C-004",
+        description=(
+            "If VLAN in scope, SHOULD support "
+            "VIRTIO_NET_CTRL_VLAN_ADD / _DEL."
+        ),
+        entity_ids=["virtio-net-device"],
+        rationale="Virtio 1.2 §5.1.6.5.3.",
+        status="spec",
+    ),
+
+    # -- Section 5: Cross-cutting (MAC address semantics) --
+    DomainConstraint(
+        name="MAC-001",
+        description=(
+            "MAC address format: 6 bytes, big-endian on the "
+            "wire."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802-2014.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="MAC-002",
+        description=(
+            "OUI (first 3 bytes) assigned by IEEE. Locally "
+            "administered MACs have bit 1 of first byte set."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802-2014.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="MAC-003",
+        description=(
+            "Multicast MACs: first byte LSb = 1. Broadcast = "
+            "FF:FF:FF:FF:FF:FF."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="IEEE 802-2014.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="MAC-004",
+        description=(
+            "Multicast IPv4 mapping: "
+            "01:00:5E:<lower-23-of-IP>. For L3-side, but L2 "
+            "filter must accept."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="RFC 1112.",
+        status="spec",
+    ),
+    DomainConstraint(
+        name="MAC-005",
+        description=(
+            "Multicast IPv6 mapping: 33:33:<lower-32-of-IPv6>."
+        ),
+        entity_ids=["ethernet-frame"],
+        rationale="RFC 2464.",
+        status="spec",
+    ),
+
     # -- L2 product constraints: Ethernet-layer primitives --
     DomainConstraint(
         name="ETH-005",
@@ -1592,7 +2429,7 @@ ontology = Ontology(
     entities=[
         guest_image, vm_instance, test_case, test_result,
         fsa_transition, ethernet_frame, virtio_net_device,
-        observability_event_site,
+        arp_packet, observability_event_site,
     ],
     relationships=[boots_rel, runs_against_rel, produces_rel],
     domain_constraints=constraints,
