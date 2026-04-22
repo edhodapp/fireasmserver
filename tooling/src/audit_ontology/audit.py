@@ -18,7 +18,11 @@ from pydantic import BaseModel
 from audit_ontology.consistency import check_constraint
 from audit_ontology.parser import parse_ref
 from audit_ontology.resolver import ResolvedRef, resolve_ref
-from ontology import DomainConstraint, PerformanceConstraint
+from ontology import (
+    DomainConstraint,
+    PerformanceConstraint,
+    VerificationCase,
+)
 from ontology.dag import load_dag
 
 _ConstraintLike = DomainConstraint | PerformanceConstraint
@@ -36,12 +40,36 @@ class ConstraintReport(BaseModel):
     gaps: list[str]
 
 
+class VerificationCaseReport(BaseModel):
+    """Audit output for a single ``VerificationCase`` — the SysE
+    test record that points at ``implementation_refs`` (the test
+    code itself) and declares which constraints it ``covers``.
+
+    The model-level validators already enforce status-vs-refs
+    consistency (``written``/``passing`` require non-empty
+    ``implementation_refs``; ``superseded`` requires a
+    ``rationale``). This report layer adds the
+    resolve-in-working-tree check that D051 needs: a test that
+    claims ``status='passing'`` but whose file no longer exists
+    becomes a broken traceability link the pre-push gate can
+    catch.
+    """
+
+    name: str
+    tier: str
+    status: str
+    covers: list[str]
+    implementation_refs: list[ResolvedRef]
+    gaps: list[str]
+
+
 class Summary(BaseModel):
-    """Rolled-up counts across all audited constraints."""
+    """Rolled-up counts across constraints + verification cases."""
 
     total_constraints: int
     with_impl_refs: int
     with_verify_refs: int
+    total_verification_cases: int
     gap_count: int
     resolved_ref_count: int
     broken_ref_count: int
@@ -53,6 +81,7 @@ class AuditReport(BaseModel):
     dag_path: str
     ontology_node_id: str
     constraints: list[ConstraintReport]
+    verification_cases: list[VerificationCaseReport]
     summary: Summary
 
 
@@ -72,11 +101,15 @@ def run_audit(dag_path: Path, repo_root: Path) -> AuditReport:
             f"DAG at {dag_path} has no current node to audit",
         )
     reports = _audit_constraints(node.ontology, repo_root)
+    case_reports = _audit_verification_cases(
+        node.ontology, repo_root,
+    )
     return AuditReport(
         dag_path=str(dag_path),
         ontology_node_id=node.id,
         constraints=reports,
-        summary=_summarize(reports),
+        verification_cases=case_reports,
+        summary=_summarize(reports, case_reports),
     )
 
 
@@ -123,6 +156,40 @@ def _audit_one(
     )
 
 
+def _audit_verification_cases(
+    ontology: object, repo_root: Path,
+) -> list[VerificationCaseReport]:
+    """Walk verification_cases, resolving each test's
+    ``implementation_refs`` against the working tree. The
+    model layer already enforced that ``written`` / ``passing``
+    cases have non-empty refs; this layer adds the
+    do-they-actually-exist check."""
+    cases = getattr(ontology, "verification_cases", [])
+    reports: list[VerificationCaseReport] = []
+    for case in cases:
+        reports.append(_audit_one_case(case, repo_root))
+    return reports
+
+
+def _audit_one_case(
+    case: VerificationCase, repo_root: Path,
+) -> VerificationCaseReport:
+    """Resolve ``implementation_refs`` and record any gaps."""
+    impl = [
+        resolve_ref(parse_ref(raw), repo_root)
+        for raw in case.implementation_refs
+    ]
+    gaps = _ref_resolution_gaps(impl, "implementation_refs")
+    return VerificationCaseReport(
+        name=case.name,
+        tier=case.tier,
+        status=case.status,
+        covers=list(case.covers),
+        implementation_refs=impl,
+        gaps=gaps,
+    )
+
+
 def _ref_resolution_gaps(
     refs: list[ResolvedRef], label: str,
 ) -> list[str]:
@@ -139,25 +206,57 @@ def _ref_resolution_gaps(
     return gaps
 
 
-def _summarize(reports: list[ConstraintReport]) -> Summary:
-    """Aggregate per-constraint stats into the report summary."""
+def _summarize(
+    reports: list[ConstraintReport],
+    case_reports: list[VerificationCaseReport],
+) -> Summary:
+    """Aggregate per-constraint + per-verification-case stats."""
     total = len(reports)
     with_impl = sum(1 for r in reports if r.implementation_refs)
     with_verify = sum(1 for r in reports if r.verification_refs)
-    gap_count = sum(len(r.gaps) for r in reports)
-    resolved = sum(
-        _count_resolution(r, "resolved") for r in reports
+    gap_count = (
+        sum(len(r.gaps) for r in reports)
+        + sum(len(c.gaps) for c in case_reports)
     )
-    broken = sum(
-        _count_broken(r) for r in reports
+    resolved = (
+        sum(_count_resolution(r, "resolved") for r in reports)
+        + sum(
+            _count_case_resolution(c, "resolved")
+            for c in case_reports
+        )
+    )
+    broken = (
+        sum(_count_broken(r) for r in reports)
+        + sum(_count_case_broken(c) for c in case_reports)
     )
     return Summary(
         total_constraints=total,
         with_impl_refs=with_impl,
         with_verify_refs=with_verify,
+        total_verification_cases=len(case_reports),
         gap_count=gap_count,
         resolved_ref_count=resolved,
         broken_ref_count=broken,
+    )
+
+
+def _count_case_resolution(
+    report: VerificationCaseReport, target: str,
+) -> int:
+    """Count refs on one verification case whose resolution
+    equals ``target``."""
+    return sum(
+        1 for ref in report.implementation_refs
+        if ref.resolution == target
+    )
+
+
+def _count_case_broken(report: VerificationCaseReport) -> int:
+    """Count refs on one verification case that failed to
+    resolve (any non-``resolved`` status)."""
+    return sum(
+        1 for ref in report.implementation_refs
+        if ref.resolution != "resolved"
     )
 
 

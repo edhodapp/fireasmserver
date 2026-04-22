@@ -17,6 +17,7 @@ from audit_ontology.audit import (
     AuditReport,
     ConstraintReport,
     Summary,
+    VerificationCaseReport,
 )
 from audit_ontology.resolver import ResolvedRef
 
@@ -35,15 +36,26 @@ def format_text(report: AuditReport) -> str:
     )
     for row in report.constraints:
         lines.extend(_format_constraint(row))
+    if report.verification_cases:
+        lines.append("")
+        lines.append(
+            "=== Verification cases (tests → requirements) ===",
+        )
+        for case in report.verification_cases:
+            lines.extend(_format_verification_case(case))
     lines.append("")
-    lines.extend(_format_gaps(report.constraints))
+    lines.extend(_format_gaps(
+        report.constraints, report.verification_cases,
+    ))
     lines.append("")
     lines.extend(_format_summary(report.summary))
     return "\n".join(lines) + "\n"
 
 
 def format_json(report: AuditReport) -> str:
-    """Render the report as the schema pinned in the briefing.
+    """Render the report as the schema pinned in the briefing,
+    extended with the verification-cases section added in the
+    VerificationCase work.
 
     ``ResolvedRef`` serializes into the ``{raw, resolved, kind}``
     triple the briefing's appendix specifies; all other fields
@@ -54,6 +66,9 @@ def format_json(report: AuditReport) -> str:
         "ontology_node_id": report.ontology_node_id,
         "constraints": [
             _constraint_to_dict(row) for row in report.constraints
+        ],
+        "verification_cases": [
+            _case_to_dict(case) for case in report.verification_cases
         ],
         "summary": report.summary.model_dump(),
     }
@@ -93,18 +108,67 @@ def _ref_display(ref: ResolvedRef) -> str:
     return f"{ref.parsed.raw}!{ref.resolution}"
 
 
-def _format_gaps(reports: list[ConstraintReport]) -> list[str]:
-    """Flat list of every gap across every constraint, prefixed
-    by constraint name so the reader can locate the row."""
-    total = sum(len(r.gaps) for r in reports)
+def _format_verification_case(
+    case: VerificationCaseReport,
+) -> list[str]:
+    """Lines for one verification case — name, tier, status,
+    covers list, impl refs, any gaps. Markers match the
+    constraint format so the reader's eye moves cleanly between
+    sections."""
+    marker = "[✓]" if not case.gaps else "[!]"
+    header = (
+        f"{marker} {case.name:<35} "
+        f"(tier={case.tier}, {case.status})"
+    )
+    if case.gaps:
+        header += " ← gaps present"
+    lines = [header]
+    if case.covers:
+        lines.append(f"    covers: {', '.join(case.covers)}")
+    else:
+        lines.append("    covers: — (none declared)")
+    lines.append(_ref_line("impl", case.implementation_refs))
+    return lines
+
+
+def _format_gaps(
+    reports: list[ConstraintReport],
+    case_reports: list[VerificationCaseReport],
+) -> list[str]:
+    """Flat list of every gap across every constraint and
+    verification case, prefixed by name so the reader can
+    locate the row."""
+    total = (
+        sum(len(r.gaps) for r in reports)
+        + sum(len(c.gaps) for c in case_reports)
+    )
     header = f"=== Gaps ({total} total) ==="
     if total == 0:
         return [header, "  (none)"]
     lines = [header]
+    lines.extend(_render_constraint_gaps(reports))
+    lines.extend(_render_case_gaps(case_reports))
+    return lines
+
+
+def _render_constraint_gaps(
+    reports: list[ConstraintReport],
+) -> list[str]:
+    out: list[str] = []
     for row in reports:
         for gap in row.gaps:
-            lines.append(f"  - {row.name}: {gap}")
-    return lines
+            out.append(f"  - {row.name}: {gap}")
+    return out
+
+
+def _render_case_gaps(
+    case_reports: list[VerificationCaseReport],
+) -> list[str]:
+    out: list[str] = []
+    for case in case_reports:
+        for gap in case.gaps:
+            out.append(f"  - {case.name} (test): {gap}")
+    return out
 
 
 def _format_summary(summary: Summary) -> list[str]:
@@ -113,23 +177,27 @@ def _format_summary(summary: Summary) -> list[str]:
     total = summary.total_constraints
     impl_pct = _percent(summary.with_impl_refs, total)
     verify_pct = _percent(summary.with_verify_refs, total)
-    lines.append(f"  Total constraints:     {total}")
+    lines.append(f"  Total constraints:       {total}")
     lines.append(
-        f"  With impl refs:        {summary.with_impl_refs}"
+        f"  With impl refs:          {summary.with_impl_refs}"
         f" ({impl_pct}%)",
     )
     lines.append(
-        f"  With verify refs:      {summary.with_verify_refs}"
+        f"  With verify refs:        {summary.with_verify_refs}"
         f" ({verify_pct}%)",
     )
     lines.append(
-        f"  Gaps / inconsistencies: {summary.gap_count}",
+        f"  Verification cases:      "
+        f"{summary.total_verification_cases}",
     )
     lines.append(
-        f"  Resolved refs:         {summary.resolved_ref_count}",
+        f"  Gaps / inconsistencies:  {summary.gap_count}",
     )
     lines.append(
-        f"  Broken refs:           {summary.broken_ref_count}",
+        f"  Resolved refs:           {summary.resolved_ref_count}",
+    )
+    lines.append(
+        f"  Broken refs:             {summary.broken_ref_count}",
     )
     return lines
 
@@ -140,6 +208,21 @@ def _percent(numerator: int, denominator: int) -> int:
     if denominator == 0:
         return 0
     return round(100 * numerator / denominator)
+
+
+def _case_to_dict(case: VerificationCaseReport) -> dict[str, Any]:
+    """JSON-shape dict for one verification case, parallel to
+    the constraint dict."""
+    return {
+        "name": case.name,
+        "tier": case.tier,
+        "status": case.status,
+        "covers": list(case.covers),
+        "implementation_refs": [
+            _ref_to_dict(ref) for ref in case.implementation_refs
+        ],
+        "gaps": list(case.gaps),
+    }
 
 
 def _constraint_to_dict(row: ConstraintReport) -> dict[str, Any]:

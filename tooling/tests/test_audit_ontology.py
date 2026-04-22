@@ -41,8 +41,9 @@ from ontology import (
     Ontology,
     OntologyDAG,
     PerformanceConstraint,
+    VerificationCase,
 )
-from ontology.dag import save_dag
+from ontology.dag import save_dag, save_snapshot
 
 
 # ---------- parser ------------------------------------------------
@@ -903,13 +904,17 @@ def _fake_report(with_gaps: bool = False) -> AuditReport:
     )
     summary = Summary(
         total_constraints=1, with_impl_refs=1,
-        with_verify_refs=0, gap_count=len(gaps),
+        with_verify_refs=0,
+        total_verification_cases=0,
+        gap_count=len(gaps),
         resolved_ref_count=0 if with_gaps else 1,
         broken_ref_count=1 if with_gaps else 0,
     )
     return AuditReport(
         dag_path="x.json", ontology_node_id="n",
-        constraints=[row], summary=summary,
+        constraints=[row],
+        verification_cases=[],
+        summary=summary,
     )
 
 
@@ -937,14 +942,17 @@ class TestFormatText:
         empty = AuditReport(
             dag_path="x.json", ontology_node_id="n",
             constraints=[],
+            verification_cases=[],
             summary=Summary(
                 total_constraints=0, with_impl_refs=0,
-                with_verify_refs=0, gap_count=0,
+                with_verify_refs=0,
+                total_verification_cases=0,
+                gap_count=0,
                 resolved_ref_count=0, broken_ref_count=0,
             ),
         )
         out = format_text(empty)
-        assert "Total constraints:     0" in out
+        assert "Total constraints:       0" in out
         assert "(0%)" in out
 
 
@@ -965,9 +973,14 @@ class TestFormatJSON:
         assert ref["raw"] == "src/m.py:hello"
         assert ref["resolved"] is True
         assert ref["kind"] == "symbol"
+        # verification_cases section present (empty in this
+        # fixture) — pinned so downstream JSON consumers can
+        # count on the key existing.
+        assert payload["verification_cases"] == []
         assert set(payload["summary"]) == {
             "total_constraints", "with_impl_refs",
-            "with_verify_refs", "gap_count",
+            "with_verify_refs", "total_verification_cases",
+            "gap_count",
             "resolved_ref_count", "broken_ref_count",
         }
 
@@ -1094,3 +1107,94 @@ class TestCLIDashM:
         )
         assert result.returncode == 0
         assert "audit-ontology" in result.stdout
+
+
+# ---------- VerificationCase audit path -------------------------
+
+
+class TestVerificationCaseAudit:
+    """End-to-end: a DAG carrying VerificationCases produces a
+    ``verification_cases`` section in the audit report, and
+    unresolved ``implementation_refs`` surface as gaps."""
+
+    def _write_dag_with_cases(
+        self, tmp_path: Path, test_file: Path | None,
+    ) -> Path:
+        """Build a DAG at tmp_path that has one DomainConstraint
+        and one VerificationCase covering it. If ``test_file``
+        is non-None, the case points at that path with a passing
+        status; if None, the case is ``planned`` with no refs."""
+        repo = tmp_path / "repo"
+        (repo / "tooling").mkdir(parents=True)
+        status = "passing" if test_file is not None else "planned"
+        refs = [f"{test_file.relative_to(repo)}"] if test_file else []
+        dag = OntologyDAG(project_name="t")
+        save_snapshot(
+            dag,
+            Ontology(
+                entities=[Entity(id="ent", name="ent")],
+                domain_constraints=[DomainConstraint(
+                    name="covered-req", description="",
+                    entity_ids=["ent"],
+                )],
+                verification_cases=[VerificationCase(
+                    name="test-one", covers=["covered-req"],
+                    tier="A", status=status,  # type: ignore[arg-type]
+                    implementation_refs=refs,
+                )],
+            ),
+            label="seed",
+        )
+        save_dag(dag, str(repo / "tooling" / "qemu-harness.json"))
+        return repo
+
+    def test_case_with_resolved_refs_has_no_gap(
+        self, tmp_path: Path,
+    ) -> None:
+        test_file = tmp_path / "repo" / "test_one.py"
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text("def test_x(): pass\n")
+        repo = self._write_dag_with_cases(tmp_path, test_file)
+        report = run_audit(
+            repo / "tooling" / "qemu-harness.json", repo,
+        )
+        assert len(report.verification_cases) == 1
+        case = report.verification_cases[0]
+        assert case.name == "test-one"
+        assert case.tier == "A"
+        assert case.status == "passing"
+        assert case.covers == ["covered-req"]
+        assert not case.gaps
+        assert report.summary.total_verification_cases == 1
+
+    def test_case_with_unresolved_refs_surfaces_gap(
+        self, tmp_path: Path,
+    ) -> None:
+        """A passing-status case whose file doesn't exist is the
+        exact breakage D051 should catch — a test claimed to be
+        passing, but its code has been renamed or deleted."""
+        ghost_file = tmp_path / "repo" / "tests" / "ghost_test.py"
+        repo = self._write_dag_with_cases(tmp_path, ghost_file)
+        report = run_audit(
+            repo / "tooling" / "qemu-harness.json", repo,
+        )
+        case = report.verification_cases[0]
+        assert case.gaps
+        assert any("file_missing" in g for g in case.gaps)
+        assert report.summary.gap_count >= 1
+        assert report.summary.broken_ref_count >= 1
+
+    def test_planned_case_has_no_refs_no_gap(
+        self, tmp_path: Path,
+    ) -> None:
+        """A ``planned`` test with no refs is spec-only — the
+        audit tool must not flag it. That'd make the pre-push
+        gate fail on every ontology that declares a test before
+        writing it."""
+        repo = self._write_dag_with_cases(tmp_path, None)
+        report = run_audit(
+            repo / "tooling" / "qemu-harness.json", repo,
+        )
+        case = report.verification_cases[0]
+        assert case.status == "planned"
+        assert not case.gaps
