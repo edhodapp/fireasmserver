@@ -105,6 +105,7 @@ TX_QUEUE_BASE       equ VIRTQ_BASE + 1 * VIRTQ_STRIDE
 ; bit index; the MMIO Status register is written with OR-ed values.
 VIRTIO_STATUS_ACKNOWLEDGE equ 1    ; bit 0 — driver found the device
 VIRTIO_STATUS_DRIVER      equ 2    ; bit 1 — driver knows how to use it
+VIRTIO_STATUS_DRIVER_OK   equ 4    ; bit 2 — device is live (VIO-008)
 VIRTIO_STATUS_FEATURES_OK equ 8    ; bit 3 — feature subset accepted
 VIRTIO_STATUS_FAILED      equ 0x80 ; bit 7 — driver has given up (VIO-009)
 
@@ -436,7 +437,54 @@ _start:
     lea esi, [queues_ready_msg]
     mov ecx, queues_ready_len
     call emit_bytes
+
+    ; --- VIO-008: set DRIVER_OK (bit 2) in Status ---
+    ; Virtio 1.2 §2.1.2 step 8 — final bit in the init sequence.
+    ; After this write, the device is "live": the virtqueues
+    ; programmed above become consumable, the device can start
+    ; filling the RX used-ring from any buffers the driver later
+    ; posts, and interrupts (if enabled) start firing. Slice 2
+    ; didn't post any buffers yet, so the ring stays idle until
+    ; L2 RX/TX plumbing lands in a later commit — the live
+    ; transition here is still the right step to complete init
+    ; cleanly.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    or  eax, VIRTIO_STATUS_DRIVER_OK
+    mfence
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mfence
+
+    ; Read-back: full expected state is
+    ;   ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK = 0x0F.
+    ; Equality compare catches both DRIVER_OK-didn't-stick and any
+    ; stray bit (including FAILED) that crept in during init,
+    ; consistent with the VIO-003 / VIO-006 cross-checks above.
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    cmp eax, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK
+    jne .driver_ok_fail
+
+    lea esi, [driver_ok_msg]
+    mov ecx, driver_ok_len
+    call emit_bytes
     jmp .halt
+
+.driver_ok_fail:
+    ; eax holds the observed status. Dump it for diagnostics
+    ; and halt via the VIO-009 FAILED-bit path.
+    push eax
+    lea esi, [driver_ok_fail_msg]
+    mov ecx, driver_ok_fail_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
 
 .queue_ready_fail:
     ; QueueReady didn't read back as 1 after we wrote it — the
@@ -684,5 +732,11 @@ queues_ready_len       equ $ - queues_ready_msg
 
 queues_ready_fail_msg: db 'QUEUES:FAIL queue-not-ready'
 queues_ready_fail_len  equ $ - queues_ready_fail_msg
+
+driver_ok_msg:         db 'DRIVER_OK', 10
+driver_ok_len          equ $ - driver_ok_msg
+
+driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
+driver_ok_fail_len     equ $ - driver_ok_fail_msg
 
 newline:         db 10

@@ -257,6 +257,24 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "QUEUES:READY observed — VIO-007 init verified"
+
+    # DRIVER_OK (VIO-008). Final §2.1.2 step. boot.S RMWs bit 2
+    # into Status, read-backs the full ACK|DRIVER|FEATURES_OK|
+    # DRIVER_OK=0x0F expected value. Success → DRIVER_OK.
+    # Failure → DRIVER_OK:FAIL status=<hex> + VIO-009 halt.
+    if ! grep -qE '^DRIVER_OK$' "$SERIAL"; then
+        fail_line=$(grep -E '^DRIVER_OK:FAIL ' "$SERIAL" | head -1 \
+            || true)
+        if [[ -n "$fail_line" ]]; then
+            echo "FAIL: DRIVER_OK transition — $fail_line"
+        else
+            echo "FAIL: DRIVER_OK not observed (guest did not reach VIO-008)"
+        fi
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "DRIVER_OK observed — VIO-008 live-device transition verified"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —
