@@ -68,6 +68,7 @@ class Bootstrapper:
         rationale: str,
         date: str,
         repo_root: Path,
+        briefing_source: Path | None = None,
     ) -> None:
         self.slug = slug
         self.scope_paths = list(scope_paths)
@@ -76,6 +77,11 @@ class Bootstrapper:
         self.rationale = rationale
         self.date = date
         self.repo_root = Path(repo_root)
+        self.briefing_source = (
+            Path(briefing_source) if briefing_source is not None
+            else None
+        )
+        self._briefing_source_content: str | None = None
 
     # -- Public entry --
 
@@ -83,8 +89,10 @@ class Bootstrapper:
         """Perform the D052 dispatch steps with full rollback on
         any mid-run failure."""
         # Read-only validation first — dirty tree, correct branch
-        # (D052 requires "main"), capture main's tip sha.
+        # (D052 requires "main"), briefing source (if given) is a
+        # readable file, capture main's tip sha.
         self._check_clean_main()
+        self._check_briefing_source_readable()
         saved_head = worktree_ops.current_head_sha(self.repo_root)
 
         # Build the task WITH parent_commit_sha baked in. Runs
@@ -171,6 +179,25 @@ class Bootstrapper:
                 f"(D052); currently on {head_branch!r}",
             )
 
+    def _check_briefing_source_readable(self) -> None:
+        """When ``--briefing-from-file`` is in play, read the source
+        now and cache the bytes. Validated pre-mutation — a typo,
+        permission issue, encoding error, or directory-as-source
+        surfaces before any worktree / branch / DAG state is
+        created. Caching also closes the TOCTOU window between
+        validation and the later copy in ``_render_briefing``."""
+        if self.briefing_source is None:
+            return
+        try:
+            self._briefing_source_content = (
+                self.briefing_source.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError) as exc:
+            raise BootstrapError(
+                f"briefing source {self.briefing_source} is not a "
+                f"readable UTF-8 file: {exc}",
+            ) from exc
+
     def _check_no_preexisting_paths(
         self, worktree_path: Path, branch: str,
     ) -> None:
@@ -254,13 +281,22 @@ class Bootstrapper:
         Takes the pre-built ``task`` to avoid re-running
         SideSessionTask's Pydantic validators a second time.
 
+        When ``briefing_source`` is set the file's bytes are
+        copied verbatim into the worktree path — lets an
+        operator hand-author a rich briefing (vector tables,
+        ISA-instruction references) that the
+        ``render_briefing(task)`` template couldn't otherwise
+        carry. Templated rendering is still the default.
+
         Defined as a method so behavioral rollback tests can
         monkeypatch it with raising=True."""
         briefing_path = self._briefing_path(worktree_path)
         briefing_path.parent.mkdir(parents=True, exist_ok=True)
-        briefing_path.write_text(
-            render_briefing(task), encoding="utf-8",
-        )
+        if self._briefing_source_content is not None:
+            content = self._briefing_source_content
+        else:
+            content = render_briefing(task)
+        briefing_path.write_text(content, encoding="utf-8")
 
     def _cleanup_worktree_and_branch(
         self, worktree_path: Path, branch: str,

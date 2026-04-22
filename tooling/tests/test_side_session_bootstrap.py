@@ -532,6 +532,181 @@ def test_briefing_includes_caller_supplied_required_reading(
 
 
 # ---------------------------------------------------------------
+# --briefing-from-file flag — lets an operator ship a rich
+# hand-authored briefing into the worktree instead of the
+# template's skeletal render. Added after the SHA-256 dispatch
+# exposed the template's content cap.
+# ---------------------------------------------------------------
+
+
+def test_bootstrap_uses_briefing_source_verbatim_when_provided(
+    minimal_repo: Path, tmp_path: Path,
+) -> None:
+    """When ``briefing_source`` names a readable file, its bytes
+    land in the worktree's briefing path unchanged — no template
+    render, no post-processing."""
+    source = tmp_path / "rich_briefing.md"
+    source.write_text(
+        "# SHA-256 briefing\n\n"
+        "| vector | digest |\n| `abc` | ba7816bf... |\n",
+        encoding="utf-8",
+    )
+    bs = _make_bootstrapper(minimal_repo)
+    bs.briefing_source = source
+
+    result = bs.run()
+    rendered = result.briefing_path.read_text(encoding="utf-8")
+    assert rendered == source.read_text(encoding="utf-8")
+
+
+def test_bootstrap_refuses_missing_briefing_source(
+    minimal_repo: Path, tmp_path: Path,
+) -> None:
+    """A non-existent ``briefing_source`` is a user error that
+    must fail fast — before any worktree / branch / DAG mutation
+    — so a typo can't leave a half-dispatched state."""
+    bs = _make_bootstrapper(minimal_repo)
+    bs.briefing_source = tmp_path / "nope.md"
+
+    with pytest.raises(
+        BootstrapError,
+        match=r"(?i)briefing.*not a readable utf-8 file",
+    ):
+        bs.run()
+
+    _assert_no_side_effects(minimal_repo, "demo_task", "2026-04-20")
+
+
+def test_bootstrap_refuses_unreadable_briefing_source(
+    minimal_repo: Path, tmp_path: Path,
+) -> None:
+    """A file that exists but can't be read (mode 000, or a
+    directory masquerading as a path) must fail at validation —
+    reading happens pre-mutation so a half-dispatched worktree
+    is impossible."""
+    bad = tmp_path / "unreadable_dir.md"
+    bad.mkdir()
+    bs = _make_bootstrapper(minimal_repo)
+    bs.briefing_source = bad
+
+    with pytest.raises(
+        BootstrapError,
+        match=r"(?i)briefing.*not a readable utf-8 file",
+    ):
+        bs.run()
+
+    _assert_no_side_effects(minimal_repo, "demo_task", "2026-04-20")
+
+
+def test_bootstrap_refuses_non_utf8_briefing_source(
+    minimal_repo: Path, tmp_path: Path,
+) -> None:
+    """A source file whose bytes aren't valid UTF-8 must fail at
+    validation — the decode branch of the except arm. Guards
+    against a future refactor that swaps ``read_text`` for
+    ``read_bytes`` and silently admits garbage."""
+    bad = tmp_path / "not_utf8.md"
+    bad.write_bytes(b"\xff\xfe\x00not-utf8")
+    bs = _make_bootstrapper(minimal_repo)
+    bs.briefing_source = bad
+
+    with pytest.raises(
+        BootstrapError,
+        match=r"(?i)briefing.*not a readable utf-8 file",
+    ):
+        bs.run()
+
+    _assert_no_side_effects(minimal_repo, "demo_task", "2026-04-20")
+
+
+def test_bootstrap_accepts_empty_briefing_source(
+    minimal_repo: Path, tmp_path: Path,
+) -> None:
+    """Zero-byte source is a legitimate (if odd) operator
+    choice — copied verbatim, not silently replaced with the
+    template. Pins the ``is not None`` branch against a future
+    truthiness regression."""
+    empty = tmp_path / "empty.md"
+    empty.write_text("", encoding="utf-8")
+    bs = _make_bootstrapper(minimal_repo)
+    bs.briefing_source = empty
+
+    result = bs.run()
+    assert result.briefing_path.read_text(encoding="utf-8") == ""
+
+
+def test_bootstrap_falls_back_to_template_when_no_briefing_source(
+    minimal_repo: Path,
+) -> None:
+    """Default behavior (no ``briefing_source``) is preserved:
+    the templated render runs and the core anchor still lands in
+    the briefing. Guards against a regression where the new code
+    path accidentally became the default."""
+    bs = _make_bootstrapper(minimal_repo)
+    assert bs.briefing_source is None
+
+    result = bs.run()
+    text = result.briefing_path.read_text(encoding="utf-8")
+    assert "D052" in text
+
+
+def test_cli_briefing_from_file_flag_copies_source_into_worktree(
+    minimal_repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI plumbs ``--briefing-from-file`` through to the
+    Bootstrapper, and the worktree's briefing matches the
+    provided file byte-for-byte."""
+    source = tmp_path / "hand_authored.md"
+    source.write_text("custom content\n", encoding="utf-8")
+    monkeypatch.chdir(minimal_repo)
+
+    exit_code = cli_module.main([
+        "--slug", "demo_task",
+        "--scope", "tooling/src/demo/",
+        "--required-reading", "DECISIONS.md:D049",
+        "--deliverables", "demo deliverables",
+        "--date", "2026-04-20",
+        "--briefing-from-file", str(source),
+    ])
+    assert exit_code == 0
+    capsys.readouterr()  # discard launch-prompt stdout
+
+    sibling = minimal_repo.parent / "primary-demo_task"
+    briefing = (
+        sibling / "docs" / "side_sessions"
+        / "2026-04-20_demo_task.md"
+    )
+    assert briefing.read_text(encoding="utf-8") == "custom content\n"
+
+
+def test_cli_briefing_from_file_missing_path_exits_nonzero(
+    minimal_repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``--briefing-from-file`` pointing at a non-existent path
+    surfaces as exit 1 with the validation message on stderr."""
+    monkeypatch.chdir(minimal_repo)
+
+    exit_code = cli_module.main([
+        "--slug", "demo_task",
+        "--scope", "tooling/src/demo/",
+        "--required-reading", "DECISIONS.md:D049",
+        "--deliverables", "demo deliverables",
+        "--date", "2026-04-20",
+        "--briefing-from-file", str(tmp_path / "does_not_exist.md"),
+    ])
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "briefing" in captured.err.lower()
+
+
+# ---------------------------------------------------------------
 # CLI-layer tests — thin argparse + exit-code behavior. The
 # success path invokes ``Bootstrapper.run()`` in-process (no
 # subprocess here — the end-to-end console-script test lives in

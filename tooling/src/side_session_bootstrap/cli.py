@@ -35,6 +35,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         repo_root = _find_repo_root(Path.cwd())
+        briefing_source = (
+            Path(args.briefing_from_file).resolve()
+            if args.briefing_from_file else None
+        )
         bootstrapper = Bootstrapper(
             slug=args.slug,
             scope_paths=args.scope,
@@ -43,6 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             rationale=args.rationale or "",
             date=args.date or _date.today().isoformat(),
             repo_root=repo_root,
+            briefing_source=briefing_source,
         )
         result = bootstrapper.run()
     except BootstrapError as exc:
@@ -120,6 +125,17 @@ def _make_parser() -> argparse.ArgumentParser:
             "dispatch date in YYYY-MM-DD form. Defaults to "
             "today's UTC-ish local date. Combined with --slug "
             "as the (slug, date) uniqueness key."
+        ),
+    )
+    parser.add_argument(
+        "--briefing-from-file", default="",
+        dest="briefing_from_file",
+        help=(
+            "path to a pre-authored briefing markdown whose bytes "
+            "are copied into the worktree's "
+            "docs/side_sessions/<date>_<slug>.md unchanged. When "
+            "omitted, the canonical templated briefing is "
+            "rendered from the SideSessionTask fields."
         ),
     )
     return parser
