@@ -21,6 +21,7 @@ from ontology import (
     PropertyType,
     Relationship,
     SideSessionTask,
+    VerificationCase,
     validate_ontology_strict,
 )
 
@@ -901,3 +902,206 @@ class TestSideSessionTaskUniqueness:
         assert "'dup'" in str(exc.value)
         assert "2026-04-20" in str(exc.value)
         assert "not unique" in str(exc.value)
+
+
+# ---------------------------------------------------------------
+# VerificationCase — SysE-traceability test records
+# ---------------------------------------------------------------
+
+
+def _constraint(name: str) -> DomainConstraint:
+    """Helper — a minimal DomainConstraint to anchor
+    ``covers`` references in tests."""
+    return DomainConstraint(name=name, description="d", entity_ids=[])
+
+
+class TestVerificationCaseConstruction:
+    """Minimum required fields and defaults."""
+
+    def test_planned_accepts_no_refs(self) -> None:
+        vc = VerificationCase(
+            name="eth-layout-minimal",
+            covers=["eth-frame-layout"],
+            tier="A",
+        )
+        assert vc.status == "planned"
+        assert not vc.implementation_refs
+
+    @pytest.mark.parametrize("tier", ["A", "B", "C", "D"])
+    def test_all_tiers_accepted(self, tier: str) -> None:
+        vc = VerificationCase(
+            name=f"t-{tier.lower()}",
+            covers=["c"],
+            tier=tier,  # type: ignore[arg-type]
+        )
+        assert vc.tier == tier
+
+    @pytest.mark.parametrize("bad_tier", ["E", "a", "", "1"])
+    def test_bad_tier_rejected(self, bad_tier: str) -> None:
+        with pytest.raises(ValidationError):
+            VerificationCase(
+                name="x", covers=["c"],
+                tier=bad_tier,  # type: ignore[arg-type]
+            )
+
+
+class TestVerificationCaseStatusContract:
+    """Status-dependent rules: written/passing require
+    implementation_refs; superseded requires rationale."""
+
+    @pytest.mark.parametrize("status", ["written", "passing"])
+    def test_written_passing_without_refs_rejected(
+        self, status: str,
+    ) -> None:
+        with pytest.raises(ValidationError) as exc:
+            VerificationCase(
+                name="x", covers=["c"], tier="A",
+                status=status,  # type: ignore[arg-type]
+            )
+        assert "implementation_refs" in str(exc.value)
+
+    @pytest.mark.parametrize("status", ["written", "passing"])
+    def test_written_passing_with_refs_accepted(
+        self, status: str,
+    ) -> None:
+        vc = VerificationCase(
+            name="x", covers=["c"], tier="A",
+            status=status,  # type: ignore[arg-type]
+            implementation_refs=[
+                "tooling/tests/test_foo.py:test_x",
+            ],
+        )
+        assert vc.status == status
+
+    def test_superseded_without_rationale_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            VerificationCase(
+                name="x", covers=["c"], tier="A",
+                status="superseded",
+            )
+        assert "rationale" in str(exc.value)
+
+    def test_superseded_with_rationale_accepted(self) -> None:
+        vc = VerificationCase(
+            name="x", covers=["c"], tier="A",
+            status="superseded",
+            rationale="replaced by y after spec change",
+        )
+        assert vc.status == "superseded"
+
+    def test_planned_never_requires_refs_or_rationale(self) -> None:
+        """planned is the default; no status-dependent
+        obligations fire."""
+        VerificationCase(name="x", covers=["c"], tier="A")
+
+
+class TestVerificationCaseNameUniqueness:
+    """Each ``VerificationCase.name`` is the test's identifier
+    in TEST_PLAN.md; duplicates make RI error messages
+    ambiguous."""
+
+    def test_unique_names_accepted(self) -> None:
+        Ontology(
+            entities=[Entity(id="a", name="A")],
+            domain_constraints=[_constraint("c")],
+            verification_cases=[
+                VerificationCase(name="t1", covers=["c"], tier="A"),
+                VerificationCase(name="t2", covers=["c"], tier="A"),
+            ],
+        )
+
+    def test_duplicate_name_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[Entity(id="a", name="A")],
+                domain_constraints=[_constraint("c")],
+                verification_cases=[
+                    VerificationCase(
+                        name="dup", covers=["c"], tier="A",
+                    ),
+                    VerificationCase(
+                        name="dup", covers=["c"], tier="B",
+                    ),
+                ],
+            )
+        assert "'dup'" in str(exc.value)
+        assert "VerificationCase" in str(exc.value)
+
+
+class TestVerificationCaseCoversReferentialIntegrity:
+    """``covers`` entries must resolve to a declared
+    ``DomainConstraint.name`` or ``PerformanceConstraint.name``
+    in the same ontology."""
+
+    def test_covers_domain_constraint_accepted(self) -> None:
+        Ontology(
+            entities=[Entity(id="a", name="A")],
+            domain_constraints=[_constraint("my-dc")],
+            verification_cases=[
+                VerificationCase(
+                    name="v", covers=["my-dc"], tier="B",
+                ),
+            ],
+        )
+
+    def test_covers_performance_constraint_accepted(self) -> None:
+        Ontology(
+            entities=[Entity(id="a", name="A")],
+            performance_constraints=[PerformanceConstraint(
+                name="my-pc", description="", entity_ids=[],
+                metric="m", budget=1.0, unit="u", direction="min",
+            )],
+            verification_cases=[
+                VerificationCase(
+                    name="v", covers=["my-pc"], tier="B",
+                ),
+            ],
+        )
+
+    def test_covers_dangling_rejected(self) -> None:
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[Entity(id="a", name="A")],
+                domain_constraints=[_constraint("real-one")],
+                verification_cases=[VerificationCase(
+                    name="v",
+                    covers=["real-one", "ghost-one"],
+                    tier="B",
+                )],
+            )
+        message = str(exc.value)
+        assert "ghost-one" in message
+        tail = message.rsplit("ghost-one", maxsplit=1)[-1]
+        assert "real-one" not in tail
+
+    def test_covers_multi_constraint_case(self) -> None:
+        Ontology(
+            entities=[Entity(id="a", name="A")],
+            domain_constraints=[_constraint("c1"), _constraint("c2")],
+            performance_constraints=[PerformanceConstraint(
+                name="p1", description="", entity_ids=[],
+                metric="m", budget=1.0, unit="u", direction="min",
+            )],
+            verification_cases=[VerificationCase(
+                name="v", covers=["c1", "c2", "p1"], tier="B",
+            )],
+        )
+
+    def test_dangling_covers_joins_other_ri_errors(self) -> None:
+        """RI errors from multiple sources surface together in
+        one ValidationError per the established pattern."""
+        with pytest.raises(ValidationError) as exc:
+            Ontology(
+                entities=[Entity(id="a", name="A")],
+                verification_cases=[VerificationCase(
+                    name="v", covers=["ghost-covers"], tier="B",
+                )],
+                relationships=[Relationship(
+                    source_entity_id="ghost-source",
+                    target_entity_id="a",
+                    name="r", cardinality="one_to_one",
+                )],
+            )
+        message = str(exc.value)
+        assert "'ghost-covers'" in message
+        assert "'ghost-source'" in message

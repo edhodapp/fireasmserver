@@ -152,3 +152,30 @@ PerfDirection = Literal["max", "min", "equal"]
 SideSessionStatus = Literal[
     "dispatched", "in_progress", "merged", "reverted",
 ]
+
+# Tier classification for a ``VerificationCase`` — mirrors the
+# ``docs/l2/TEST_PLAN.md`` §0 four-tier harness architecture.
+# The tier determines WHERE in the CD flow the test runs:
+#   A — host-side unit tests (no VMM, no DMA, milliseconds)
+#   B — QEMU integration tests (full guest + tap-device frame
+#       injection)
+#   C — adversarial / fuzz tests (broad coverage over parser +
+#       virtqueue surfaces)
+#   D — interop tests (cross-platform regression against other
+#       stacks / switches)
+TestTier = Literal["A", "B", "C", "D"]
+
+# Lifecycle of a ``VerificationCase`` — a SysE-traceability
+# record for an individual named test. Status flips in the
+# same commit that transitions the test (same-commit
+# convention per TEST_PLAN.md §9, so the DAG snapshot and the
+# test-file state stay consistent).
+#   planned    — declared but not written
+#   written    — test code exists but is not yet green
+#   passing    — test code exists and currently passes in CI
+#   superseded — replaced by another test or by a structural
+#                change that made it irrelevant; kept for the
+#                audit trail, expected to carry a rationale
+TestCaseStatus = Literal[
+    "planned", "written", "passing", "superseded",
+]

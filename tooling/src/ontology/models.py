@@ -31,6 +31,8 @@ from ontology.types import (
     SafeId,
     ShortName,
     SideSessionStatus,
+    TestCaseStatus,
+    TestTier,
 )
 
 # Compiled form of the ``SafeId`` regex for the
@@ -391,6 +393,71 @@ class SideSessionTask(BaseModel):
     merge_commit_sha: str = ""
 
 
+class VerificationCase(BaseModel):
+    """A SysE-traceability record for a named test.
+
+    One ``VerificationCase`` per test ID in ``TEST_PLAN.md``
+    (e.g., ``eth-layout-minimal``, ``virtio-init-sequence``).
+    Each one declares which requirements it covers, which tier
+    it runs in, what status it's at in the planned → written →
+    passing lifecycle, and where its implementation lives.
+
+    Distinct from the harness-runtime ``TestCase`` Entity
+    already in the ontology (which describes the test-runner's
+    own data structure). This class is the SysE artifact —
+    planned tests before they exist, passing tests pinned to
+    a specific implementation file, and the
+    reverse-mapping from one test to the N requirements it
+    verifies.
+
+    The ``covers`` list is cross-checked at ontology
+    construction: every entry must resolve to a declared
+    ``DomainConstraint.name`` or ``PerformanceConstraint.name``
+    in the same ontology. A test that claims to verify a
+    requirement that doesn't exist is a schema bug, caught at
+    load time alongside the other RI checks.
+
+    ``implementation_refs`` follow the same ``file:symbol`` /
+    ``file:line`` / ``file`` shapes as the constraint fields —
+    the ``audit-ontology`` tool resolves them against the
+    working tree. ``planned``-status cases typically have an
+    empty list; ``written``/``passing`` cases MUST have at
+    least one entry (enforced at the Pydantic level below).
+    """
+
+    name: SafeId
+    covers: list[SafeId]
+    tier: TestTier
+    status: TestCaseStatus = "planned"
+    implementation_refs: list[str] = []
+    rationale: Description = ""
+
+    @model_validator(mode="after")
+    def _status_requires_refs(self) -> "VerificationCase":
+        """``written`` / ``passing`` status claims imply code
+        exists; enforce the presence of at least one
+        ``implementation_refs`` entry so the status flip can't
+        race ahead of the code it points at.
+
+        ``superseded`` MUST carry a rationale — the audit trail
+        requires a reason a test was dropped."""
+        if self.status in ("written", "passing"):
+            if not self.implementation_refs:
+                raise ValueError(
+                    f"VerificationCase {self.name!r} has "
+                    f"status={self.status!r} but no "
+                    f"implementation_refs; the status claims "
+                    f"code exists — the refs MUST name it"
+                )
+        if self.status == "superseded" and not self.rationale:
+            raise ValueError(
+                f"VerificationCase {self.name!r} with "
+                f"status='superseded' MUST carry a rationale "
+                f"explaining why the test was dropped"
+            )
+        return self
+
+
 def make_branch_name(slug: str, date: str) -> str:
     """Canonical branch name for a ``SideSessionTask``.
 
@@ -425,6 +492,7 @@ class Ontology(BaseModel):
     external_dependencies: list[ExternalDependency] = []
     open_questions: list[OpenQuestion] = []
     side_session_tasks: list[SideSessionTask] = []
+    verification_cases: list[VerificationCase] = []
 
     @model_validator(mode="after")
     def _check_referential_integrity(self) -> "Ontology":
@@ -466,6 +534,18 @@ class Ontology(BaseModel):
         errors.extend(
             _check_side_session_task_uniqueness(self.side_session_tasks)
         )
+        errors.extend(
+            _check_verification_case_name_uniqueness(
+                self.verification_cases,
+            )
+        )
+        known_constraints = (
+            {c.name for c in self.domain_constraints}
+            | {c.name for c in self.performance_constraints}
+        )
+        errors.extend(_check_verification_case_covers(
+            self.verification_cases, known_constraints,
+        ))
         if errors:
             raise ValueError(
                 "referential-integrity violations:\n  - "
@@ -753,6 +833,44 @@ def _check_side_session_task_uniqueness(
         f"(appears {n} times)"
         for (s, d), n in sorted(counts.items()) if n > 1
     ]
+
+
+def _check_verification_case_name_uniqueness(
+    cases: list["VerificationCase"],
+) -> list[str]:
+    """Each ``VerificationCase.name`` is the test's identifier in
+    TEST_PLAN.md and in RI error messages. Duplicate names
+    produce ambiguous diagnostics."""
+    counts: dict[str, int] = {}
+    for case in cases:
+        counts[case.name] = counts.get(case.name, 0) + 1
+    return [
+        f"VerificationCase name {name!r} is not unique (appears "
+        f"{n} times)"
+        for name, n in sorted(counts.items()) if n > 1
+    ]
+
+
+def _check_verification_case_covers(
+    cases: list["VerificationCase"],
+    known_constraint_names: set[str],
+) -> list[str]:
+    """Each entry in ``covers`` must name a declared
+    ``DomainConstraint.name`` or ``PerformanceConstraint.name`` in
+    this ontology. A test that claims to verify a requirement the
+    ontology doesn't declare is a traceability break — likely a
+    typo, a constraint-rename that didn't propagate, or a test
+    authored against a spec that never landed in the DAG."""
+    errors: list[str] = []
+    for case in cases:
+        for covered in case.covers:
+            if covered not in known_constraint_names:
+                errors.append(
+                    f"VerificationCase '{case.name}' covers "
+                    f"'{covered}' not in domain_constraints or "
+                    f"performance_constraints"
+                )
+    return errors
 
 
 def _check_constraint_name_uniqueness(
