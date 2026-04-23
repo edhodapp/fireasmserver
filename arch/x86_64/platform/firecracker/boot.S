@@ -766,6 +766,133 @@ _start:
     lea esi, [rx_returned_msg]
     mov ecx, rx_returned_len
     call emit_bytes
+
+    ; --- VIO-T-002/003/004/005: submit one canary Ethernet frame ---
+    ; Single-descriptor TX: hdr + payload concatenated in one
+    ; buffer, no chaining. Spec (§5.1.6.2) permits either a
+    ; chain (hdr, payload, ...) or a single descriptor covering
+    ; both. Single keeps the MVP-proof minimal.
+    ;
+    ; Frame layout at ``tx_test_pkt``:
+    ;   virtio_net_hdr (12 B, all zero):
+    ;     flags=0     — no NEEDS_CSUM (VIO-T-003 respects the
+    ;                   VIO-F-006 CSUM-not-negotiated posture).
+    ;     gso_type=0  — GSO_NONE (VIO-T-004).
+    ;     hdr_len/gso_size/csum_*/num_buffers — driver writes 0;
+    ;                   device ignores on TX (§5.1.6.2).
+    ;   Ethernet II frame (60 B — minimum-size untagged):
+    ;     dst = FF:FF:FF:FF:FF:FF (broadcast).
+    ;     src = 02:00:00:00:00:01 (locally administered unicast;
+    ;           satisfies ETH-015 + ETH-016).
+    ;     type = 0x88B5 (IEEE 802 local experimental, RFC 5342 —
+    ;           chosen to avoid collision with real traffic).
+    ;     payload = 46 × 0xAB (canary byte).
+
+    ; TX descriptor[0] = (addr=tx_test_pkt, len=72, flags=0, next=0).
+    ; flags=0 means NEITHER NEXT (no chain) NOR WRITE (device
+    ; reads, doesn't write — TX direction).
+    ;
+    ; addr_lo = tx_test_pkt — the linker's 32-bit address of the
+    ; symbol, used directly as a physical address. Safe while
+    ; PVH identity-maps guest VA == PA (today's regime); the
+    ; moment paging gets introduced with non-identity mappings,
+    ; this must convert to the physical frame the symbol backs.
+    ; Flagged here rather than hidden in an implicit assumption.
+    lea ebx, [TX_QUEUE_BASE + VIRTQ_OFF_DESC]
+    mov dword [ebx + 0],  tx_test_pkt                 ; addr low
+    mov dword [ebx + 4],  0                           ; addr high
+    mov dword [ebx + 8],  tx_test_pkt_len             ; len
+    mov word  [ebx + 12], 0                           ; flags
+    mov word  [ebx + 14], 0                           ; next
+
+    ; TX AvailRing.ring[0] = 0 (head descriptor of the chain).
+    mov word [TX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4], 0
+
+    ; Barrier before idx bump (§2.7.11).
+    mfence
+
+    ; Publish AvailRing.idx = 1.
+    mov word [TX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], 1
+
+    ; Barrier before notify.
+    mfence
+
+    ; Kick TX queue — queue index 1 (VIO-T-001).
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY], 1
+    mfence
+
+    lea esi, [tx_submitted_msg]
+    mov ecx, tx_submitted_len
+    call emit_bytes
+
+    ; --- VIO-T-006: poll TX Used Ring for completion ---
+    ; Device marks the descriptor USED once it has pulled the
+    ; buffer out for wire transmission — completion is typically
+    ; near-immediate (no wire-level ack-gated delay like
+    ; receive). A TIMEOUT here would indicate the device didn't
+    ; process our kick, which would be a device/VMM bug.
+    ;
+    ; FIRST-USE-ONLY check: `test ax, ax` detects "used.idx !=
+    ; 0", which works because Firecracker zero-inits the ring
+    ; AND program_queue explicitly zeroes it (defense-in-depth).
+    ; A real multi-TX path cannot use this pattern — by the
+    ; second submit, idx is already non-zero from the first
+    ; completion and the loop would fall through on stale state.
+    ; Future TX loop MUST maintain a driver-private last-seen-idx
+    ; shadow and compare against it.
+    mov ecx, 100000000
+.tx_wait_loop:
+    lfence
+    mov ax, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 2]
+    lfence
+    test ax, ax
+    jnz .tx_reclaimed
+    dec ecx
+    jnz .tx_wait_loop
+
+    lea esi, [tx_timeout_msg]
+    mov ecx, tx_timeout_len
+    call emit_bytes
+    jmp .halt
+
+.tx_reclaimed:
+    ; TX ring[0]: (id, len) — device writes the head descriptor
+    ; index and the total bytes consumed from the chain.
+    lfence
+    mov edi, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 4]     ; id
+    mov ebx, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 8]     ; len
+    lfence
+
+    ; Bounds-check the returned id as we did for RX (VIO-R defensive
+    ; discipline applied symmetrically). Only desc 0 should come
+    ; back from our single-submit, but a buggy device could return
+    ; anything; reject id >= VIRTQ_MAX_SIZE before we log it as
+    ; hex (the offset-into-descriptor-table doesn't apply on TX
+    ; since we don't dereference, but bounds-check preserves the
+    ; invariant for any future tx-specific buffer pool).
+    cmp edi, VIRTQ_MAX_SIZE
+    jae .tx_bad_id_fail
+
+    ; Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX\n
+    ; Push order: used_len first, id second — first pop yields id.
+    push ebx
+    push edi
+
+    lea esi, [tx_reclaimed_prefix_msg]
+    mov ecx, tx_reclaimed_prefix_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+
+    lea esi, [tx_used_len_msg]
+    mov ecx, tx_used_len_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
     jmp .halt
 
 .driver_ok_fail:
@@ -805,6 +932,21 @@ _start:
     push ebp
     lea esi, [rx_num_bufs_msg]
     mov ecx, rx_num_bufs_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
+.tx_bad_id_fail:
+    ; Device returned a TX used-ring id outside 0..255. edi holds
+    ; the bogus id. Emit TX:FAIL bad_id=<hex> and route through
+    ; VIO-009 FAILED.
+    push edi
+    lea esi, [tx_bad_id_msg]
+    mov ecx, tx_bad_id_len
     call emit_bytes
     pop eax
     call emit_hex32
@@ -1085,6 +1227,28 @@ rx_num_bufs_len        equ $ - rx_num_bufs_msg
 
 rx_returned_msg:       db 'RX:RETURNED', 10
 rx_returned_len        equ $ - rx_returned_msg
+
+tx_submitted_msg:      db 'TX:SUBMITTED', 10
+tx_submitted_len       equ $ - tx_submitted_msg
+tx_timeout_msg:        db 'TX:TIMEOUT', 10
+tx_timeout_len         equ $ - tx_timeout_msg
+tx_reclaimed_prefix_msg: db 'TX:RECLAIMED id='
+tx_reclaimed_prefix_len  equ $ - tx_reclaimed_prefix_msg
+tx_used_len_msg:       db ' used_len='
+tx_used_len_len        equ $ - tx_used_len_msg
+tx_bad_id_msg:         db 'TX:FAIL bad_id='
+tx_bad_id_len          equ $ - tx_bad_id_msg
+
+; TX canary-packet template. Linker places this in .text; the
+; virtio device reads from its absolute physical address via
+; DMA. 72 bytes total = 12 B virtio_net_hdr + 60 B Ethernet.
+tx_test_pkt:
+    times 12 db 0                                    ; virtio_net_hdr zero
+    db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF            ; dst MAC broadcast
+    db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; src MAC local-admin
+    db 0x88, 0xB5                                    ; EtherType 0x88B5
+    times 46 db 0xAB                                 ; 46-byte canary payload
+tx_test_pkt_len        equ $ - tx_test_pkt
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
