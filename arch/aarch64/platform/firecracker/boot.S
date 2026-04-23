@@ -74,6 +74,17 @@ _entry:
     and     x5, x5, #0xffffff
     cbnz    x5, .Ldone
 
+    // Linux arm64 boot protocol leaves sp undefined at EL1 entry,
+    // so initialize it before any function that pushes a frame.
+    // emit_hex32 does `stp x29, x30, [sp, #-32]!` on its VIRTIO-
+    // fail path; an uninitialized sp would fault before emitting
+    // the diagnostic — exactly when it matters most. Point sp
+    // 2 MiB above RAM_BASE (0x8020_0000), well above the image
+    // load point at 0x8008_0000 + image_size (stub is a few KiB).
+    // Mirrors the x86_64 stub's 2-MiB stack convention.
+    movz    x5, #0x8020, lsl #16     // x5 = 0x80200000
+    mov     sp, x5
+
     // UART base in x0, preserved across emit_bytes / emit_hex32 calls.
     movz    x0, #0x4000, lsl #16
     movk    x0, #0x2000              // x0 = UART_BASE
@@ -163,8 +174,10 @@ emit_bytes:
 //   In:      x0 = UART base (preserved)
 //            w5 = 32-bit value to render
 //   Uses 8 bytes of stack scratch. Calls emit_bytes; preserves
-//   x0 / x6 / w7 / x8 across the call. Clobbers w2, w3, w4, w5,
-//   x1, w10 (nibble scratch), x9 (buffer-start scratch).
+//   x0 / x6 / w7 / x8 across the call. Clobbers x1, w2, w3, w4,
+//   w5, x9 (buffer-start scratch), w10 (nibble scratch). Stack
+//   frame balanced: 32 bytes pushed in prologue, popped in
+//   epilogue. Caller MUST ensure sp is valid before `bl emit_hex32`.
 //
 // Nibble scratch is w10 (not w7) — _entry reserves w7 for the
 // observed-magic value across the VIRTIO probe / fail path, and
