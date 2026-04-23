@@ -13,7 +13,9 @@ AS := nasm
 ASFLAGS := -f elf64
 
 BUILD_DIR := build
-OBJECTS   := $(BUILD_DIR)/crc32_ieee.o $(BUILD_DIR)/sha256.o
+OBJECTS   := $(BUILD_DIR)/crc32_ieee.o \
+             $(BUILD_DIR)/sha256.o \
+             $(BUILD_DIR)/aes128.o
 
 .PHONY: all clean
 
