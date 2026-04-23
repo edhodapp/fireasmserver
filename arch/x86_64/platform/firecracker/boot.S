@@ -60,6 +60,7 @@ VIRTIO_MMIO_QUEUE_SEL           equ 0x030
 VIRTIO_MMIO_QUEUE_NUM_MAX       equ 0x034
 VIRTIO_MMIO_QUEUE_NUM           equ 0x038
 VIRTIO_MMIO_QUEUE_READY         equ 0x044
+VIRTIO_MMIO_QUEUE_NOTIFY        equ 0x050
 VIRTIO_MMIO_STATUS              equ 0x070
 VIRTIO_MMIO_QUEUE_DESC_LOW      equ 0x080
 VIRTIO_MMIO_QUEUE_DESC_HIGH     equ 0x084
@@ -99,6 +100,22 @@ VIRTQ_OFF_USED      equ 0x2000
 VIRTQ_MAX_SIZE      equ 0x100    ; 256 descriptors
 RX_QUEUE_BASE       equ VIRTQ_BASE + 0 * VIRTQ_STRIDE
 TX_QUEUE_BASE       equ VIRTQ_BASE + 1 * VIRTQ_STRIDE
+
+; Virtqueue descriptor flag bits (Virtio 1.2 §2.7.5.1).
+VIRTQ_DESC_F_NEXT     equ 1    ; buffer continues via next field
+VIRTQ_DESC_F_WRITE    equ 2    ; device may write to this buffer (RX)
+VIRTQ_DESC_F_INDIRECT equ 4    ; buffer contains a descriptor chain
+
+; RX buffer pool. 256 buffers × 2 KiB each = 512 KiB total, living
+; directly above the virtqueue pages (virtqueues end at
+; VIRTQ_BASE + 2*VIRTQ_STRIDE = 0x406000). 2 KiB per buffer
+; comfortably holds the 12-byte virtio_net_hdr + a max-size tagged
+; Ethernet frame (1522 B incl. VLAN, FCS stripped by host) with
+; slack. One buffer per descriptor — no descriptor chaining
+; (VIRTIO_NET_F_MRG_RXBUF wasn't negotiated under the VIO-F-001
+; MVP subset, so every RX completion fits in a single descriptor).
+RX_BUFFER_BASE      equ 0x500000
+RX_BUFFER_SIZE      equ 0x800    ; 2 KiB
 
 ; Device Status bit values (Virtio 1.2 §2.1, "Device Status Field").
 ; Bit-position numbering in the REQUIREMENTS.md VIO table is the
@@ -470,6 +487,84 @@ _start:
     lea esi, [driver_ok_msg]
     mov ecx, driver_ok_len
     call emit_bytes
+
+    ; --- VIO-R-002: pre-populate RX queue with WRITE-flagged buffers ---
+    ; Virtio 1.2 §5.1.6.3 — the driver populates the RX queue with
+    ; descriptors marked WRITE before the device has anything to
+    ; deposit. With DRIVER_OK already asserted above, the device is
+    ; live and will begin using these descriptors as soon as it sees
+    ; them on the Available Ring.
+    ;
+    ; All 256 RX descriptor slots get filled here. Each descriptor
+    ; points at a distinct 2 KiB buffer in the pool at
+    ; RX_BUFFER_BASE; each buffer fits the 12-byte virtio_net_hdr
+    ; plus a max-size tagged Ethernet frame. No descriptor chaining
+    ; (VIRTIO_NET_F_MRG_RXBUF not negotiated — see VIO-F-001 / the
+    ; VIRTIO_F_VERSION_1-only MVP subset).
+    ;
+    ; Order enforced by §2.7.13 / §2.7.11:
+    ;   1. Write descriptor table entries
+    ;   2. Write Available Ring slots 0..N-1 with descriptor indices
+    ;   3. mfence — descriptor/ring stores drain before idx bump
+    ;   4. Publish AvailRing.idx = N
+    ;   5. mfence — idx bump drains before QueueNotify write
+    ;   6. QueueNotify = 0 (kick the RX queue)
+    ; Register use in this block: edi = loop counter (0..255);
+    ; eax = per-iteration scratch (desc offset, then buffer addr);
+    ; ebx = current descriptor-entry pointer. All three are
+    ; clobber-safe — the block ends at emit_bytes (which preserves
+    ; ebx but clobbers eax/ecx/esi/edi), and no subsequent code
+    ; reads any of them before they're re-initialized.
+    xor edi, edi
+.rx_fill_loop:
+    ; Descriptor table entry at desc_base + i * 16.
+    mov eax, edi
+    shl eax, 4
+    lea ebx, [RX_QUEUE_BASE + VIRTQ_OFF_DESC + eax]
+
+    ; Buffer address: RX_BUFFER_BASE + i * 2 KiB. Low 32 bits go
+    ; into addr_lo; addr_hi stays 0 (pool is well under 4 GiB).
+    mov eax, edi
+    shl eax, 11
+    add eax, RX_BUFFER_BASE
+
+    mov dword [ebx + 0],  eax                   ; addr low
+    mov dword [ebx + 4],  0                     ; addr high
+    mov dword [ebx + 8],  RX_BUFFER_SIZE        ; len
+    mov word  [ebx + 12], VIRTQ_DESC_F_WRITE    ; flags (device may write)
+    mov word  [ebx + 14], 0                     ; next (unused, no chain)
+
+    ; Available Ring slot i holds descriptor index i. Ring slots
+    ; start at AvailRing offset 4 (after the u16 flags + u16 idx
+    ; header).
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + edi*2], di
+
+    inc edi
+    cmp edi, VIRTQ_MAX_SIZE
+    jl  .rx_fill_loop
+
+    ; Step 3: drain the descriptor/ring stores.
+    mfence
+
+    ; Step 4: publish idx = 256. Firecracker zero-inits guest RAM
+    ; so idx was 0 before this write; after it, the device sees all
+    ; 256 slots as available.
+    mov word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], VIRTQ_MAX_SIZE
+
+    ; Step 5: idx bump drains before the kick.
+    mfence
+
+    ; Step 6: QueueNotify(0) kicks the RX queue. The register is
+    ; write-only per spec; no read-back check is possible. If the
+    ; device doesn't see this write, RX stalls forever — but that
+    ; would also manifest as zero completions when we start reading
+    ; the Used Ring in a follow-up commit.
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY], 0
+    mfence
+
+    lea esi, [rx_populated_msg]
+    mov ecx, rx_populated_len
+    call emit_bytes
     jmp .halt
 
 .driver_ok_fail:
@@ -735,6 +830,9 @@ queues_ready_fail_len  equ $ - queues_ready_fail_msg
 
 driver_ok_msg:         db 'DRIVER_OK', 10
 driver_ok_len          equ $ - driver_ok_msg
+
+rx_populated_msg:      db 'RX:POPULATED', 10
+rx_populated_len       equ $ - rx_populated_msg
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg

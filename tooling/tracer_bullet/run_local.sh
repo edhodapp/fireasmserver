@@ -275,6 +275,21 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "DRIVER_OK observed — VIO-008 live-device transition verified"
+
+    # RX:POPULATED (VIO-R-002). After DRIVER_OK, boot.S pre-populates
+    # all 256 RX descriptor slots with distinct 2 KiB WRITE-flagged
+    # buffers, advances AvailRing.idx = 256, and kicks the device
+    # via QueueNotify(0). The marker confirms the driver-side
+    # population completed; whether the device actually consumed
+    # buffers is observable in a later commit once we poll the
+    # Used Ring.
+    if ! grep -qE '^RX:POPULATED$' "$SERIAL"; then
+        echo "FAIL: RX:POPULATED not observed (guest did not reach VIO-R-002)"
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "RX:POPULATED observed — VIO-R-002 descriptor fill + notify verified"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —
