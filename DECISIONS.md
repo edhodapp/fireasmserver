@@ -2138,6 +2138,142 @@ test cell lands in `cd-matrix.yml`.
 2026-04-22. Fork-not-upstream pivot contributed by the side
 session during the SHA-256 dispatch.
 
+### D055: External-input length clamp at the public crypto API boundary
+
+**Decision (2026-04-22):** every public crypto primitive in this
+project presents a trusted-`len` contract matching established
+C hash APIs (OpenSSL, libsodium, nettle, libgcrypt) — the
+primitive does NOT re-validate its `len` argument at runtime.
+Length validation lives in the CALLER, at the trust boundary
+where the length first crosses from external input (network,
+user, disk, untrusted guest memory) into the process. The
+project-wide upper bound for any hash invocation is
+`FIREASMSERVER_MAX_HASH_LEN = 1 << 40` (1 TiB).
+
+**Why:** the SHA-256 primitive landed on 2026-04-22 with a
+documented `len ≤ 2^61 - 1 bytes` domain (FIPS 180-4 defines
+the function up to 2^64 - 1 bits). Gemini flagged the 2 EiB
+overflow horizon as a MEDIUM, but every realistic caller
+(TLS 1.3 transcripts: 2^14 + 256 bytes per record; HKDF: one
+block; guest-local objects: sub-gigabyte) lands orders of
+magnitude below 1 TiB, which is itself orders of magnitude
+below the spec horizon. Adding a runtime check inside the
+primitive has real cost (a compare + branch in the hot path of
+every hash call) and real confusion (which layer owns the
+check?). The conventional C-callable hash APIs all resolve
+this by making the contract explicit: the caller has already
+clamped `len` before invocation. Mirror that convention.
+
+1 TiB is the chosen bound because:
+- It is far above any realistic single-call workload.
+- It is far below the 2^61 spec horizon, giving 20+ bits of
+  headroom against arithmetic overflow in length metadata.
+- It is a round `1 << 40` — cheap bitmask check in the
+  external-input boundary code (`if (len > (1ULL << 40)) …`).
+
+**How to apply:**
+- When the public crypto header lands
+  (`arch/<arch>/crypto/crypto.h` or equivalent), export the
+  `FIREASMSERVER_MAX_HASH_LEN` constant and document that
+  callers are responsible for the check.
+- TLS stack design doc (not yet written) MUST state the
+  invariant: hash calls take `(data, len)` where `len` has
+  ALREADY been clamped at the record-size gate. Not a
+  runtime check re-derived per call site.
+- HTTP stack, file ingestion, any network-reachable caller:
+  same posture. Check once at the trust boundary; trust the
+  length downstream.
+- The primitive's own documentation declares the trusted-
+  `len` contract explicitly. `sha256.S` already carries the
+  domain note; future primitives do likewise.
+
+**Cross-refs:**
+- `D032` — crypto-math strategy (ISA-idiomatic, macros-first,
+  constant-time).
+- `D056` — ISA overflow-detection as a project-wide discipline;
+  D055 is the policy, D056 is the ISA-level implementation.
+- `docs/side_sessions/2026-04-21_sha256.md` §"External-input
+  discipline" — the handoff note that surfaced this decision.
+
+**Attribution:** policy landed 2026-04-22 during the SHA-256
+merge follow-up, codifying the discussion from the side
+session's post-Gemini security walkthrough.
+
+
+### D056: Use the ISA's overflow-detection primitives on every external-input arithmetic step
+
+**Decision (2026-04-22):** because this project is 100% assembly
+(per D003), every arithmetic operation that crosses an
+external-input boundary — length math, offset computation,
+index multiplication, size accumulation from network or
+untrusted input — uses the ISA's native overflow-detection
+primitives rather than the silent-truncate default. One
+extra instruction per operation; the compile-tax for an
+equivalent discipline in C is strictly higher.
+
+**Why:** the 2026-04-22 SHA-256 Gemini review surfaced an
+arithmetic overflow (`len * 8` for bit-length) that is
+unreachable in practice but would have been silently truncated
+if reached. The pattern that keeps this class of bug contained
+is to make overflow visible at the instruction level — which
+is nearly free in assembly and disproportionately expensive
+in C (the compiler typically generates extra compare-with-
+maximum pre-checks). Not using the primitive is leaving
+compiler-tax-level safety on the floor.
+
+**How to apply:**
+
+- **x86_64 (SysV AMD64, NASM or GAS):**
+  - `jc` / `jo` after `add` / `sub` / `shl` / `shld` / `sar`
+    when the operands carry external input.
+  - `bsr` + compare before a shift whose count is external-
+    input-derived (avoids `shl n, cl` for `cl ≥ 64`).
+  - `mul` sets OF/CF on product ≥ 2^64; test after 64×64 →
+    128 multiplications for size math.
+  - CMPXCHG-class locked ops for concurrent length counters
+    (not currently applicable — D003 is single-threaded).
+
+- **AArch64 (AAPCS64, GNU as):**
+  - `adds` / `subs` set NZCV; `b.cs` (unsigned carry set) and
+    `b.vs` (signed overflow set) for unsigned / signed
+    overflow respectively.
+  - For shifts whose count is external-input-derived: do a
+    bit-count pre-check (`cmp` against the word width) before
+    `lsl`/`lsr`, since AArch64 shifts by `64+` are
+    architecturally defined to return 0 silently.
+  - For width-doubling multiplies: `umulh` / `smulh` produces
+    the high half of a 128-bit product; `cbnz` on the high
+    half catches ≥ 2^64 products.
+
+- **All arches:** the overflow-checked path routes to the
+  same fatal-error endpoint the rest of the system uses. In
+  practice today this means "emit a named diagnostic marker
+  on the debug UART and halt" — per D043 FSA-style handling
+  when it lands, the transition will be a first-class
+  automaton edge.
+
+**Scope:** project-wide, not sha256-specific. Every new
+primitive added under `arch/<arch>/crypto/`, every L2 offset
+computation from virtio headers, every TCP segment-length
+accumulator, every HTTP content-length parser inherits this
+discipline.
+
+**Cross-refs:**
+- `D003` — 100% assembly; the premise that makes this cheap.
+- `D032` — crypto-math strategy; this D-entry extends it to
+  all arithmetic that touches external input, not just crypto.
+- `D055` — external-input length clamp at the public API
+  boundary; D055 is the policy, D056 is the per-operation
+  implementation under that policy.
+- `docs/side_sessions/2026-04-21_sha256.md` §"External-input
+  discipline" item 3 — the handoff note that surfaced this
+  decision.
+
+**Attribution:** principle stated by Ed 2026-04-22 during the
+SHA-256 side-session security walkthrough; formalized
+2026-04-22 during the main-session merge follow-up.
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
