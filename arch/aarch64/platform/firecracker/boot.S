@@ -45,6 +45,15 @@
 .equ VIRTIO_MAGIC_LO,   0x6976          // "vi" little-endian
 .equ VIRTIO_MAGIC_HI,   0x7472          // "tr" little-endian
 
+// virtio-MMIO register offsets (Virtio 1.2 §4.2.2, Table 4.1) —
+// arch-neutral, identical to x86_64's equivalents.
+.equ VIRTIO_MMIO_STATUS,          0x070
+
+// Device Status bit values (Virtio 1.2 §2.1). Bit-position numbering
+// matches the REQUIREMENTS.md VIO table. Shared across arches.
+.equ VIRTIO_STATUS_ACKNOWLEDGE,   1    // bit 0 — driver found the device
+.equ VIRTIO_STATUS_DRIVER,        2    // bit 1 — driver knows how to use it
+
 .section .text, "ax"
 .globl _start
 
@@ -125,6 +134,77 @@ _entry:
     adr     x1, virtio_ok_msg
     mov     w2, #(virtio_ok_msg_end - virtio_ok_msg)
     bl      emit_bytes
+
+    // --- VIO-001..003: Device-status init prefix ---
+    // Virtio 1.2 §2.1.2 steps 1-3: reset (write 0 to Status),
+    // RMW ACKNOWLEDGE, RMW DRIVER. §2.1 forbids direct clearing
+    // of bits ("clearing can be done only by resetting the
+    // device") — so ACK/DRIVER are read-modify-write with OR,
+    // not blind stores. x6 still holds VIRTIO_MMIO_BASE from
+    // the probe above; emit_bytes preserves it.
+    //
+    // Barrier discipline mirrors the VIRTIO probe: dsb sy
+    // around each MMIO register access. Normal memory mode
+    // (no Device-memory MAIR configured in this stub) means
+    // we DO need the barriers explicitly; on a kernel that
+    // mapped MMIO as Device memory (nGnRE), most of these
+    // would be redundant.
+
+    // VIO-001: reset device — STATUS := 0.
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+
+    // VIO-002: RMW ACKNOWLEDGE.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    orr     w7, w7, #VIRTIO_STATUS_ACKNOWLEDGE
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+
+    // VIO-003: RMW DRIVER.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    orr     w7, w7, #VIRTIO_STATUS_DRIVER
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+
+    // Confirm both bits stuck and nothing else crept in. Direct
+    // equality compare (not a masked test) catches the FAILED
+    // bit and any stray bit the device set mid-RMW — matches
+    // the x86_64 discipline.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    cmp     w7, #(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER)
+    b.ne    .Lstatus_fail
+
+    adr     x1, status_driver_msg
+    mov     w2, #(status_driver_msg_end - status_driver_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lstatus_fail:
+    // Emit: STATUS:FAIL status=XXXXXXXX\n. w7 holds the observed
+    // Status. Copy to w5 BEFORE calling emit_bytes (emit_bytes
+    // preserves w7, but keep the "w5 = value-to-hex-render"
+    // invariant that emit_hex32 expects).
+    mov     w5, w7
+    adr     x1, status_fail_msg
+    mov     w2, #(status_fail_msg_end - status_fail_msg)
+    bl      emit_bytes
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #1
+    bl      emit_bytes
+    // Future VIO-009 set_failed helper will redirect here to
+    // set the FAILED bit before halting. For now, fall through
+    // to .Lflush + .Ldone so the guest halts cleanly with the
+    // diagnostic on the serial line.
     b       .Lflush
 
 .Lvirtio_fail:
@@ -226,6 +306,14 @@ virtio_ok_msg_end:
 virtio_fail_msg:
     .ascii  "VIRTIO:FAIL magic="
 virtio_fail_msg_end:
+
+status_driver_msg:
+    .ascii  "STATUS:DRIVER\n"
+status_driver_msg_end:
+
+status_fail_msg:
+    .ascii  "STATUS:FAIL status="
+status_fail_msg_end:
 
 newline_msg:
     .ascii  "\n"
