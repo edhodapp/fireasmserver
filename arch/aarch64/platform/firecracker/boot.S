@@ -356,10 +356,12 @@ emit_bytes:
     cbz     w2, .Lemit_done
 .Lemit_loop:
     yield
-    ldrb    w3, [x0, #0x05]
+    ldrb    w3, [x0, #0x05]             // LSR — THRE status
+    dsb     sy                           // LSR-read drains before THR-write
     tbz     w3, #5, .Lemit_loop
     ldrb    w4, [x1], #1
-    strb    w4, [x0]
+    strb    w4, [x0]                     // THR — byte out
+    dsb     sy                           // THR-write drains before next LSR-read
     subs    w2, w2, #1
     b.ne    .Lemit_loop
 .Lemit_done:
