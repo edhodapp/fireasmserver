@@ -159,21 +159,26 @@ section .text
 ; Barrier envelope: lfence around loads, mfence around stores —
 ; the pattern already set by VIO-001..006 up-file.
 ;
-; Scope constraint: the ``jne .queue_ready_fail`` uses a local
-; label that's resolved against the most-recent non-local label
-; at the expansion site. Today both expansions and the
-; ``.queue_ready_fail`` target are inside ``_start:``'s scope,
-; so the label resolves. Future refactors that insert a new
-; non-local label between the expansions and the target would
-; fail at assembly time — loud, not silent, but worth noting.
-;
 ; Parameters:
 ;   %1 = queue index (0 = RX, 1 = TX) — written to QueueSel
 ;   %2 = descriptor table physical address (u32)
 ;   %3 = available ring physical address (u32)
 ;   %4 = used ring physical address (u32)
+;   %5 = fail-path label — the caller passes the label (e.g.
+;        ``.queue_ready_fail``) that control flow should reach
+;        when QueueReady read-back fails. Threading it as a
+;        parameter, rather than having the macro body reference
+;        a file-scope label directly, removes the hidden coupling
+;        between the macro's expansion scope and where the fail
+;        label happens to be defined. The caller owns the label;
+;        the macro owns the body. Note: if the caller passes a
+;        local-style ``.label``, NASM still resolves it against
+;        the caller's most-recent non-local label at the
+;        expansion site — the macro argument is a text token,
+;        not a fully-resolved address. Pass a global label if
+;        the caller's scope might shift.
 ; Clobbers: eax, flags. Preserves: everything else.
-%macro program_queue 4
+%macro program_queue 5
     mfence
     mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], %1
     mfence
@@ -202,6 +207,15 @@ section .text
     mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DEVICE_LOW], %4
     mfence
     mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DEVICE_HIGH], 0
+    ; Explicitly zero the Avail + Used ring headers (u16 flags +
+    ; u16 idx, 4 bytes each) before QueueReady flips to 1. The
+    ; ring-population path (VIO-R-002 for RX; TX's future work
+    ; for TX) writes idx after filling slots, but the device
+    ; begins observing these headers the moment QueueReady = 1.
+    ; Firecracker zero-inits guest RAM today so this is belt-and-
+    ; suspenders; spec (§2.7.11) doesn't guarantee the VMM does.
+    mov dword [%3], 0                    ; avail: flags=0, idx=0
+    mov dword [%4], 0                    ; used:  flags=0, idx=0
     mfence
     mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_READY], 1
     mfence
@@ -209,7 +223,7 @@ section .text
     mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_READY]
     lfence
     cmp eax, 1
-    jne .queue_ready_fail
+    jne %5
 %endmacro
 
 global _start
@@ -445,11 +459,13 @@ _start:
     program_queue 0, \
         RX_QUEUE_BASE + VIRTQ_OFF_DESC, \
         RX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
-        RX_QUEUE_BASE + VIRTQ_OFF_USED
+        RX_QUEUE_BASE + VIRTQ_OFF_USED, \
+        .queue_ready_fail
     program_queue 1, \
         TX_QUEUE_BASE + VIRTQ_OFF_DESC, \
         TX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
-        TX_QUEUE_BASE + VIRTQ_OFF_USED
+        TX_QUEUE_BASE + VIRTQ_OFF_USED, \
+        .queue_ready_fail
 
     lea esi, [queues_ready_msg]
     mov ecx, queues_ready_len
@@ -605,6 +621,16 @@ _start:
     mov ebx, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 8]    ; len
     lfence
 
+    ; Bounds-check id before we dereference. Only ids 0..255 are
+    ; valid — the descriptor table has exactly VIRTQ_MAX_SIZE
+    ; slots, and the buffer pool has VIRTQ_MAX_SIZE * 2048 bytes
+    ; at RX_BUFFER_BASE. A device bug or malicious VMM returning
+    ; id >= 256 would, without this check, compute a read
+    ; address outside the pool (potentially into MMIO space or
+    ; wrapping the 32-bit address space). Fail hard.
+    cmp edi, VIRTQ_MAX_SIZE
+    jae .rx_bad_id_fail
+
     ; Compute buffer address from id: RX_BUFFER_BASE + id * 2048.
     mov eax, edi
     shl eax, 11
@@ -628,6 +654,17 @@ _start:
     movzx esi, word [eax + 2]                        ; hdr_len
     movzx ebp, word [eax + 10]                       ; num_buffers
     lfence
+
+    ; Validate num_buffers == 1. Under the VIO-F-001 MVP subset
+    ; (VIRTIO_F_VERSION_1 only, no VIRTIO_NET_F_MRG_RXBUF), the
+    ; device MUST pack every frame into a single descriptor; §5.1.6.3.1
+    ; explicitly forbids the device from setting num_buffers > 1
+    ; when MRG_RXBUF wasn't negotiated. A value other than 1 is a
+    ; device spec violation; silently processing only the first
+    ; buffer would corrupt any later driver assumption that the
+    ; whole frame is contiguous. Fail hard.
+    cmp ebp, 1
+    jne .rx_num_bufs_fail
 
     ; Emit: RX:FRAME id=XXXXXXXX hdr_len=XXXXXXXX num_bufs=XXXXXXXX used_len=XXXXXXXX\n
     ; Stash fields across emit_bytes calls (which preserve
@@ -673,6 +710,37 @@ _start:
     push eax
     lea esi, [driver_ok_fail_msg]
     mov ecx, driver_ok_fail_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
+.rx_bad_id_fail:
+    ; Device returned a used-ring id outside 0..255. edi holds
+    ; the bogus id. Emit RX:FAIL bad_id=<hex> and route through
+    ; VIO-009 FAILED.
+    push edi
+    lea esi, [rx_bad_id_msg]
+    mov ecx, rx_bad_id_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
+.rx_num_bufs_fail:
+    ; Device asserted num_buffers != 1 without VIRTIO_NET_F_MRG_RXBUF
+    ; negotiated — spec violation (§5.1.6.3.1). ebp holds the
+    ; observed num_buffers. Emit RX:FAIL num_bufs=<hex> and route
+    ; through VIO-009 FAILED.
+    push ebp
+    lea esi, [rx_num_bufs_msg]
+    mov ecx, rx_num_bufs_len
     call emit_bytes
     pop eax
     call emit_hex32
@@ -945,6 +1013,11 @@ rx_frame_num_bufs_msg: db ' num_bufs='
 rx_frame_num_bufs_len  equ $ - rx_frame_num_bufs_msg
 rx_frame_used_len_msg: db ' used_len='
 rx_frame_used_len_len  equ $ - rx_frame_used_len_msg
+
+rx_bad_id_msg:         db 'RX:FAIL bad_id='
+rx_bad_id_len          equ $ - rx_bad_id_msg
+rx_num_bufs_msg:       db 'RX:FAIL num_bufs='
+rx_num_bufs_len        equ $ - rx_num_bufs_msg
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
