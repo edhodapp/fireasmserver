@@ -51,7 +51,39 @@
 .equ VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0x014
 .equ VIRTIO_MMIO_DRIVER_FEATURES,     0x020
 .equ VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0x024
+.equ VIRTIO_MMIO_QUEUE_SEL,           0x030
+.equ VIRTIO_MMIO_QUEUE_NUM_MAX,       0x034
+.equ VIRTIO_MMIO_QUEUE_NUM,           0x038
+.equ VIRTIO_MMIO_QUEUE_READY,         0x044
 .equ VIRTIO_MMIO_STATUS,              0x070
+.equ VIRTIO_MMIO_QUEUE_DESC_LOW,      0x080
+.equ VIRTIO_MMIO_QUEUE_DESC_HIGH,     0x084
+.equ VIRTIO_MMIO_QUEUE_DRIVER_LOW,    0x090
+.equ VIRTIO_MMIO_QUEUE_DRIVER_HIGH,   0x094
+.equ VIRTIO_MMIO_QUEUE_DEVICE_LOW,    0x0A0
+.equ VIRTIO_MMIO_QUEUE_DEVICE_HIGH,   0x0A4
+
+// Virtqueue memory region (aarch64 RAM_BASE-relative; differs
+// from x86_64 which places virtqueues at a flat 4 MiB). RAM_BASE
+// = 0x80000000; image loads at 0x80080000; stack at 0x80200000;
+// virtqueues at 0x80400000 leaves ~2 MiB headroom. 12 KiB per
+// queue: page-aligned slots for descriptor table, available ring,
+// used ring. Firecracker zero-inits guest RAM, so idx=0 across
+// every ring at boot.
+.equ VIRTQ_BASE,        0x80400000
+.equ VIRTQ_STRIDE,      0x3000
+.equ VIRTQ_OFF_DESC,    0x0000
+.equ VIRTQ_OFF_AVAIL,   0x1000
+.equ VIRTQ_OFF_USED,    0x2000
+
+// Largest queue size this layout supports: 256 descriptors at
+// 16 B each = 4096 B, filling the descriptor-table page. Device
+// reporting QueueNumMax > 256 is spec-allowed; we clamp to what
+// our allocated memory can back (Virtio 1.2 §4.1.4.3 permits
+// any power-of-2 ≤ QueueNumMax).
+.equ VIRTQ_MAX_SIZE,    0x100
+.equ RX_QUEUE_BASE,     VIRTQ_BASE + 0 * VIRTQ_STRIDE
+.equ TX_QUEUE_BASE,     VIRTQ_BASE + 1 * VIRTQ_STRIDE
 
 // Device Status bit values (Virtio 1.2 §2.1). Bit-position numbering
 // matches the REQUIREMENTS.md VIO table. Shared across arches.
@@ -66,6 +98,105 @@
 // MVP policy: accept VERSION_1 only. MAC, STATUS, MQ, CSUM, GSO,
 // EVENT_IDX stay off until the code paths that consume them land.
 .equ VIRTIO_F_VERSION_1_HIBIT,    1    // bit 32 == 1 in the high page
+
+// Per-queue programming macro used by VIO-007 Slice 2. Selects
+// the queue, reads QueueNumMax and clamps, programs physical
+// addresses for descriptor / available / used rings, explicitly
+// zeroes the avail + used ring headers (belt-and-suspenders vs
+// non-zero RAM; Firecracker zero-inits but spec doesn't require
+// it), toggles QueueReady to 1, reads back to confirm.
+//
+// Cross-arch parity with x86_64's `program_queue` macro. Fail
+// label is a parameter per the macro-hygiene pattern adopted
+// 2026-04-22 (Gemini LOW on x86_64 program_queue's implicit
+// scope coupling).
+//
+// Parameters (GNU as macro args; addresses are constant
+// expressions evaluated at assembly time via `ldr w, =expr`):
+//   \index        queue index (0 = RX, 1 = TX)
+//   \desc_addr    descriptor table physical address (u32)
+//   \avail_addr   available ring physical address (u32)
+//   \used_addr    used ring physical address (u32)
+//   \fail_label   label to branch to on QueueReady read-back mismatch
+//
+// Clobbers: w5, w7, x10, flags. Preserves x0, x6, x8, x30.
+.macro program_queue index, desc_addr, avail_addr, used_addr, fail_label
+    // Select queue \index.
+    mov     w5, #\index
+    dsb     sy
+    str     w5, [x6, #VIRTIO_MMIO_QUEUE_SEL]
+    dsb     sy
+
+    // Read QueueNumMax, clamp to VIRTQ_MAX_SIZE.
+    ldr     w7, [x6, #VIRTIO_MMIO_QUEUE_NUM_MAX]
+    dsb     sy
+    cmp     w7, #VIRTQ_MAX_SIZE
+    b.ls    .Lpq_size_ok_\@
+    mov     w7, #VIRTQ_MAX_SIZE
+.Lpq_size_ok_\@:
+
+    // Write QueueNum (clamped size).
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_QUEUE_NUM]
+    dsb     sy
+
+    // Descriptor base (low / high). `ldr w, =expr` assembles to
+    // movz + movk for constant < 2^32; the addresses are all
+    // under 0x80580000 so this is always a movz+movk pair, no
+    // literal pool fetch.
+    ldr     w7, =\desc_addr
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_QUEUE_DESC_LOW]
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_QUEUE_DESC_HIGH]
+    dsb     sy
+
+    // Avail ring base.
+    ldr     w7, =\avail_addr
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_QUEUE_DRIVER_LOW]
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_QUEUE_DRIVER_HIGH]
+    dsb     sy
+
+    // Used ring base.
+    ldr     w7, =\used_addr
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_QUEUE_DEVICE_LOW]
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_QUEUE_DEVICE_HIGH]
+    dsb     sy
+
+    // Explicit ring-header zeroing before QueueReady = 1.
+    // Avail header is u16 flags + u16 idx; Used header is same.
+    // Firecracker zero-inits but spec (§2.7.11) doesn't mandate
+    // it; safer to write explicit zeros.
+    //
+    // Load into w10 (not x10): addresses are < 2^32 so `ldr w,
+    // =expr` assembles to movz + movk in-place (no literal-pool
+    // dependency). w10→x10 zero-extends, so `str wzr, [x10]`
+    // still hits the right byte. Keeps the 32-bit addressing
+    // guarantee consistent with the other `ldr w7, =` uses in
+    // the macro.
+    ldr     w10, =\avail_addr
+    str     wzr, [x10]
+    ldr     w10, =\used_addr
+    str     wzr, [x10]
+    dsb     sy
+
+    // Set QueueReady = 1.
+    mov     w7, #1
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_QUEUE_READY]
+    dsb     sy
+
+    // Read-back verify.
+    ldr     w7, [x6, #VIRTIO_MMIO_QUEUE_READY]
+    dsb     sy
+    cmp     w7, #1
+    b.ne    \fail_label
+.endm
+
 
 .section .text, "ax"
 .globl _start
@@ -268,6 +399,93 @@ _entry:
     adr     x1, features_ok_msg
     mov     w2, #(features_ok_msg_end - features_ok_msg)
     bl      emit_bytes
+
+    // --- Virtqueue discovery + init (VIO-007) ---
+    // Slice 1 (discovery): QueueSel + QueueNumMax for queues
+    // 0 (RX) and 1 (TX). Either queue reporting max = 0 means
+    // the device doesn't support it — fatal (MVP needs both).
+    // Emit QUEUES:RX=XXXXXXXX TX=XXXXXXXX once both values are
+    // read; values land in w7 / w8 which both helpers preserve.
+    //
+    // Slice 2 (init): program_queue macro twice, one per queue.
+    // Each sets QueueNum, QueueDesc / QueueDriver / QueueDevice
+    // physical addresses, zeroes ring headers, toggles
+    // QueueReady, reads back. On read-back mismatch the macro
+    // branches to .Lqueue_ready_fail.
+    //
+    // Emits QUEUES:READY on success.
+
+    // --- Discovery ---
+    // Select queue 0 (RX), read QueueNumMax → w7.
+    mov     w5, #0
+    dsb     sy
+    str     w5, [x6, #VIRTIO_MMIO_QUEUE_SEL]
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_QUEUE_NUM_MAX]
+    dsb     sy
+    cbz     w7, .Lqueue_fail_rx
+
+    // Select queue 1 (TX), read QueueNumMax → w8.
+    mov     w5, #1
+    dsb     sy
+    str     w5, [x6, #VIRTIO_MMIO_QUEUE_SEL]
+    dsb     sy
+    ldr     w8, [x6, #VIRTIO_MMIO_QUEUE_NUM_MAX]
+    dsb     sy
+    cbz     w8, .Lqueue_fail_tx
+
+    // Emit: QUEUES:RX=XXXXXXXX TX=XXXXXXXX\n
+    adr     x1, queues_rx_prefix_msg
+    mov     w2, #(queues_rx_prefix_msg_end - queues_rx_prefix_msg)
+    bl      emit_bytes
+    mov     w5, w7                       // RX max → hex
+    bl      emit_hex32
+    adr     x1, queues_tx_prefix_msg
+    mov     w2, #(queues_tx_prefix_msg_end - queues_tx_prefix_msg)
+    bl      emit_bytes
+    mov     w5, w8                       // TX max → hex
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+
+    // --- Init ---
+    // GNU as doesn't process backslash-newline continuation
+    // across macro invocations the way NASM does, so each
+    // program_queue call sits on a single line.
+    program_queue 0, (RX_QUEUE_BASE + VIRTQ_OFF_DESC), (RX_QUEUE_BASE + VIRTQ_OFF_AVAIL), (RX_QUEUE_BASE + VIRTQ_OFF_USED), .Lqueue_ready_fail
+    program_queue 1, (TX_QUEUE_BASE + VIRTQ_OFF_DESC), (TX_QUEUE_BASE + VIRTQ_OFF_AVAIL), (TX_QUEUE_BASE + VIRTQ_OFF_USED), .Lqueue_ready_fail
+
+    adr     x1, queues_ready_msg
+    mov     w2, #(queues_ready_msg_end - queues_ready_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lqueue_fail_rx:
+    adr     x1, queues_fail_rx_msg
+    mov     w2, #(queues_fail_rx_msg_end - queues_fail_rx_msg)
+    bl      emit_bytes
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lqueue_fail_tx:
+    adr     x1, queues_fail_tx_msg
+    mov     w2, #(queues_fail_tx_msg_end - queues_fail_tx_msg)
+    bl      emit_bytes
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lqueue_ready_fail:
+    adr     x1, queues_ready_fail_msg
+    mov     w2, #(queues_ready_fail_msg_end - queues_ready_fail_msg)
+    bl      emit_bytes
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
     b       .Lflush
 
 .Lfeatures_fail_no_v1:
@@ -447,6 +665,25 @@ features_hi_sep_msg_end:
 features_rejected_msg:
     .ascii  "FEATURES:FAIL rejected status="
 features_rejected_msg_end:
+
+queues_rx_prefix_msg:
+    .ascii  "QUEUES:RX="
+queues_rx_prefix_msg_end:
+queues_tx_prefix_msg:
+    .ascii  " TX="
+queues_tx_prefix_msg_end:
+queues_ready_msg:
+    .ascii  "QUEUES:READY\n"
+queues_ready_msg_end:
+queues_fail_rx_msg:
+    .ascii  "QUEUES:FAIL no-queue q=0 (max=0)"
+queues_fail_rx_msg_end:
+queues_fail_tx_msg:
+    .ascii  "QUEUES:FAIL no-queue q=1 (max=0)"
+queues_fail_tx_msg_end:
+queues_ready_fail_msg:
+    .ascii  "QUEUES:FAIL queue-not-ready"
+queues_ready_fail_msg_end:
 
 newline_msg:
     .ascii  "\n"
