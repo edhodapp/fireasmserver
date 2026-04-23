@@ -2274,6 +2274,89 @@ SHA-256 side-session security walkthrough; formalized
 2026-04-22 during the main-session merge follow-up.
 
 
+### D057: AES-NI required at runtime on x86_64; no scalar fallback
+
+**Decision (2026-04-23):** the x86_64 AES primitive requires
+Intel AES New Instructions (AES-NI) at runtime. If
+`aes128_has_aesni()` returns 0 — meaning the host CPU doesn't
+advertise `CPUID.(EAX=1):ECX[bit 25]` — the primitive refuses
+to run; it does NOT fall back to a table-driven scalar path.
+The production-silicon floor for x86_64 is Westmere (2010
+server) or Goldmont (2016 Atom); both ship AES-NI. AArch64
+has no analog because FEAT_AES is already required by D034's
+production profiles (Cortex-A76+, Neoverse N1/V1/V2, Apple
+cores).
+
+**Why:** a table-lookup scalar AES violates the constant-time
+discipline D032 enforces on every crypto primitive in the
+project. T-table implementations are the textbook source of
+cache-timing side channels (FLUSH+RELOAD, PRIME+PROBE, etc.)
+— the very class of attack we already paid to avoid on the
+aarch64 `aes128_expand_key` path (see the 2026-04-23
+cache-timing fix that replaced a 256-byte S-box lookup with
+an `aese`-with-zero-round-key construction). Shipping a
+scalar fallback on x86_64 would reintroduce the exact
+vulnerability class we just closed on the other arch.
+
+Bit-sliced constant-time scalar AES (Biham/Könighofer,
+Käsper/Schwabe) IS an option in principle, but adds ~800+ LOC
+of delicate SIMD-less code and an additional correctness
+surface. No production target for this project would benefit:
+all x86_64 deployment targets have AES-NI. The bit-sliced
+path stays unwritten until a concrete consumer demands it.
+
+**How to apply:**
+
+- `aes128_has_aesni()` is a public CPUID probe. Any caller
+  using `aes128_encrypt_block` / `aes128_decrypt_block` MUST
+  gate on it at first-invocation time. A 0 return is a
+  hard-fail condition; emit a diagnostic and halt (or abort
+  the TLS handshake / crypto operation), do not fall through.
+- The production-silicon floor (Westmere+ server / Goldmont+
+  Atom) is a platform-profile invariant, not an optional
+  feature gate. Document it in release notes. Pre-Westmere
+  x86_64 (Nehalem and earlier) is out of scope. Consumer
+  Core i3/i5/i7 silicon from Westmere onwards also has
+  AES-NI; we're not excluding desktops, just very old servers.
+- Future crypto primitives added under `arch/x86_64/crypto/`
+  that depend on ISA extensions (VPCLMULQDQ for wide GHASH,
+  AVX-512 for VAES, etc.) inherit the same required-at-runtime
+  posture under this decision. No scalar fallback by default;
+  bit-sliced only if a real consumer demands it.
+
+**When to revisit:**
+
+- A real consumer emerges that targets silicon without AES-NI.
+  Unlikely under the project's positioning (Firecracker
+  deployment, modern server floor), but not impossible for a
+  lab / embedded variant.
+- Bit-sliced AES ships in a dedicated commit that pays its
+  LOC and review cost up front; the CI matrix gains a
+  no-AES-NI cell (qemu-user with `-cpu pentium4` or similar)
+  to guard it.
+
+**Cross-refs:**
+
+- `D003` — 100% assembly.
+- `D032` — crypto-math strategy (ISA-idiomatic, macros-first,
+  constant-time). D057 is a direct application to the specific
+  question "what if the ISA extension is unavailable?".
+- `D034` — hardware platform profiles; D057 pins the x86_64
+  profile floor at AES-NI-bearing silicon.
+- `D054` — QEMU fork sandbox; the AES-NI runtime exercise
+  uses it (`-cpu Denverton` / `-cpu max`) the same way
+  SHA-NI does.
+- `D055` / `D056` — external-input discipline; unrelated
+  but named here because the side-session briefing
+  explicitly invoked them.
+- `docs/side_sessions/2026-04-22_aes128.md` §"Status" — the
+  handoff note that named this decision candidate.
+
+**Attribution:** policy landed 2026-04-23 during the round-II
+AES-128 merge follow-up, codifying the side session's
+deliberate no-fallback implementation choice.
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation

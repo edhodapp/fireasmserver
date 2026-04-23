@@ -328,6 +328,50 @@ sha256_routine = Entity(
 )
 
 
+# The AES-128 block primitive routine (FIPS PUB 197). Anchor for
+# AES128-* constraints. Raw-block-only primitive (encrypt_block +
+# decrypt_block + expand_key + has_aesni probe); ECB / CBC / CTR /
+# GCM modes compose over top of it. Long-term consumers are the
+# AES-128-GCM AEAD for TLS 1.3 and anywhere else the project
+# needs symmetric encryption.
+aes128_routine = Entity(
+    id="aes128-routine",
+    name="AES128Routine",
+    description=(
+        "The host-callable AES-128 block primitive — "
+        "`aes128_expand_key` produces 11 round keys, "
+        "`aes128_encrypt_block` and `aes128_decrypt_block` "
+        "transform one 16-byte block each under that schedule. "
+        "Anchor for TLS 1.3 AEAD and any future symmetric-"
+        "encryption consumer."
+    ),
+    properties=[
+        Property(
+            name="block_size",
+            property_type=PropertyType(kind="int"),
+            description="AES block size in bytes. Always 16.",
+        ),
+        Property(
+            name="key_size",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "AES-128 key size in bytes. Always 16. AES-192 "
+                "and AES-256 are separate primitives if ever "
+                "needed."
+            ),
+        ),
+        Property(
+            name="round_keys_size",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Expanded round-key buffer size. AES-128 has "
+                "11 round keys × 16 bytes = 176 bytes."
+            ),
+        ),
+    ],
+)
+
+
 # The ARP packet format (RFC 826). Anchor for ARP-001..011 in
 # L2 requirements. ARP runs over Ethernet but its packet shape
 # is a distinct object from the frame that carries it, so
@@ -1660,6 +1704,53 @@ constraints = [
         status="spec",
     ),
 
+    # -- Crypto-layer primitives: AES-128 --
+    DomainConstraint(
+        name="AES128-001",
+        description=(
+            "AES-128 block encrypt + decrypt + key schedule "
+            "conforms to FIPS PUB 197 §5.1-5.3 with byte-level "
+            "equivalence against the NIST KAT vectors on both "
+            "arches. x86_64 uses AES-NI (AESENC, AESENCLAST, "
+            "AESDEC, AESDECLAST, AESIMC, AESKEYGENASSIST); "
+            "aarch64 uses FEAT_AES (AESE, AESD, AESMC, AESIMC). "
+            "No scalar fallback per D057 — table-lookup AES "
+            "would violate the constant-time discipline D032 "
+            "enforces. The aarch64 key expansion closes the "
+            "S-box cache-timing channel via an `aese`-with-"
+            "zero-round-key construction (2026-04-23 hardening)."
+        ),
+        entity_ids=["aes128-routine"],
+        rationale=(
+            "FIPS PUB 197 §5.1 (cipher), §5.2 (key expansion), "
+            "§5.3 (inverse cipher / equivalent inverse cipher), "
+            "Appendix C.1 (AES-128 test vector). Intel "
+            "'Advanced Encryption Standard (AES) New "
+            "Instructions Set' whitepaper (Gueron rev 3.01, "
+            "2012) for the x86_64 key-schedule pattern. Arm "
+            "ARM §C7.2 for the FEAT_AES instruction "
+            "semantics. D032 (crypto-math strategy), D034 "
+            "(ISA feature profile including `aes`), D054 "
+            "(fork-qemu sandbox for AES-NI runtime exercise), "
+            "D057 (AES-NI required at runtime; no scalar "
+            "fallback)."
+        ),
+        implementation_refs=[
+            "arch/x86_64/crypto/aes128.S:aes128_expand_key",
+            "arch/x86_64/crypto/aes128.S:aes128_encrypt_block",
+            "arch/x86_64/crypto/aes128.S:aes128_decrypt_block",
+            "arch/x86_64/crypto/aes128.S:aes128_has_aesni",
+            "arch/aarch64/crypto/aes128.S:aes128_expand_key",
+            "arch/aarch64/crypto/aes128.S:aes128_encrypt_block",
+            "arch/aarch64/crypto/aes128.S:aes128_decrypt_block",
+        ],
+        verification_refs=[
+            "tooling/tests/test_aes128.py",
+            "tooling/crypto_tests/aes128_test.c",
+        ],
+        status="implemented",
+    ),
+
     # -- Crypto-layer primitives: SHA-256 --
     DomainConstraint(
         name="SHA256-001",
@@ -2469,6 +2560,32 @@ verification_cases = [
         ),
     ),
     VerificationCase(
+        name="aes128-primitive",
+        covers=["AES128-001"],
+        tier="A",
+        status="passing",
+        implementation_refs=[
+            "tooling/tests/test_aes128.py",
+            "tooling/crypto_tests/aes128_test.c",
+        ],
+        rationale=(
+            "Unit-level verification of the AES-128 block "
+            "primitive on both arches against 5 NIST KAT "
+            "vectors (FIPS 197 Appendix C.1 plus four NIST "
+            "CAVS entries) plus an 8-block encrypt-then-"
+            "decrypt round-trip sweep. An in-driver portable-C "
+            "AES-128 reference (FIPS 197 straight-inverse form, "
+            "structurally distinct from the asm's equivalent-"
+            "inverse form) cross-checks every vector and every "
+            "sweep block byte-for-byte — two independent "
+            "attempts at the same answer, no OpenSSL dependency. "
+            "Four cells: x86_64 native, fork-qemu under "
+            "-cpu Denverton and -cpu max (D054 sandbox "
+            "advertises AES-NI under both), aarch64 via "
+            "qemu-aarch64-static with FEAT_AES emulated."
+        ),
+    ),
+    VerificationCase(
         name="sha256-primitive",
         covers=["SHA256-001"],
         tier="A",
@@ -2538,7 +2655,8 @@ ontology = Ontology(
     entities=[
         guest_image, vm_instance, test_case, test_result,
         fsa_transition, ethernet_frame, virtio_net_device,
-        sha256_routine, arp_packet, observability_event_site,
+        sha256_routine, aes128_routine, arp_packet,
+        observability_event_site,
     ],
     relationships=[boots_rel, runs_against_rel, produces_rel],
     domain_constraints=constraints,
