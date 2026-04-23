@@ -565,6 +565,106 @@ _start:
     lea esi, [rx_populated_msg]
     mov ecx, rx_populated_len
     call emit_bytes
+
+    ; --- VIO-R-003/004: poll Used Ring for first RX completion ---
+    ; UsedRing layout (Virtio 1.2 §2.7.8):
+    ;   u16 flags                   offset 0
+    ;   u16 idx                     offset 2  (device-written)
+    ;   virtq_used_elem ring[N]     offset 4
+    ;     u32 id                    — descriptor index consumed
+    ;     u32 len                   — bytes device wrote
+    ;
+    ; Firecracker zero-inits guest RAM so idx starts at 0; the
+    ; device advances it on every completion. Poll until idx != 0,
+    ; then read ring[0] for the first consumed descriptor and its
+    ; byte-count. Timeout at ~1 s (~100M iterations) so a silent
+    ; test environment still halts cleanly rather than spinning
+    ; forever; a future commit wires deliberate traffic injection.
+    mov ecx, 100000000
+.rx_wait_loop:
+    lfence
+    mov ax, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 2]
+    lfence
+    test ax, ax
+    jnz .rx_received
+    dec ecx
+    jnz .rx_wait_loop
+
+    ; Timeout path — polling loop exhausted. Emit RX:TIMEOUT so
+    ; the tracer bullet can distinguish "polling code executed but
+    ; no frame arrived" from "polling code never started."
+    lea esi, [rx_timeout_msg]
+    mov ecx, rx_timeout_len
+    call emit_bytes
+    jmp .halt
+
+.rx_received:
+    ; Load ring[0]: (id, len). edi ← id, ebx ← len.
+    lfence
+    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]    ; id
+    mov ebx, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 8]    ; len
+    lfence
+
+    ; Compute buffer address from id: RX_BUFFER_BASE + id * 2048.
+    mov eax, edi
+    shl eax, 11
+    add eax, RX_BUFFER_BASE
+
+    ; virtio_net_hdr layout (Virtio 1.2 §5.1.6.1, VERSION_1 always
+    ; includes num_buffers → 12 bytes):
+    ;   u8  flags        offset 0
+    ;   u8  gso_type     offset 1
+    ;   u16 hdr_len      offset 2
+    ;   u16 gso_size     offset 4
+    ;   u16 csum_start   offset 6
+    ;   u16 csum_offset  offset 8
+    ;   u16 num_buffers  offset 10
+    ;
+    ; VIO-R-004 requires we read num_buffers at minimum. We also
+    ; dump hdr_len (the asserted-by-device header length) so
+    ; diagnostics surface if the host negotiated a different
+    ; hdr size than we expect.
+    lfence
+    movzx esi, word [eax + 2]                        ; hdr_len
+    movzx ebp, word [eax + 10]                       ; num_buffers
+    lfence
+
+    ; Emit: RX:FRAME id=XXXXXXXX hdr_len=XXXXXXXX num_bufs=XXXXXXXX used_len=XXXXXXXX\n
+    ; Stash fields across emit_bytes calls (which preserve
+    ; ebx/ebp/esp/dx but clobber eax/ecx/esi/edi). Push order:
+    ; used_len, num_bufs, hdr_len, id so the first pop yields id.
+    push ebx                                         ; used_len
+    push ebp                                         ; num_buffers
+    push esi                                         ; hdr_len
+    push edi                                         ; id
+
+    lea esi, [rx_frame_prefix_msg]
+    mov ecx, rx_frame_prefix_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+
+    lea esi, [rx_frame_hdr_len_msg]
+    mov ecx, rx_frame_hdr_len_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+
+    lea esi, [rx_frame_num_bufs_msg]
+    mov ecx, rx_frame_num_bufs_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+
+    lea esi, [rx_frame_used_len_msg]
+    mov ecx, rx_frame_used_len_len
+    call emit_bytes
+    pop eax
+    call emit_hex32
+
+    lea esi, [newline]
+    mov ecx, 1
+    call emit_bytes
     jmp .halt
 
 .driver_ok_fail:
@@ -833,6 +933,18 @@ driver_ok_len          equ $ - driver_ok_msg
 
 rx_populated_msg:      db 'RX:POPULATED', 10
 rx_populated_len       equ $ - rx_populated_msg
+
+rx_timeout_msg:        db 'RX:TIMEOUT', 10
+rx_timeout_len         equ $ - rx_timeout_msg
+
+rx_frame_prefix_msg:   db 'RX:FRAME id='
+rx_frame_prefix_len    equ $ - rx_frame_prefix_msg
+rx_frame_hdr_len_msg:  db ' hdr_len='
+rx_frame_hdr_len_len   equ $ - rx_frame_hdr_len_msg
+rx_frame_num_bufs_msg: db ' num_bufs='
+rx_frame_num_bufs_len  equ $ - rx_frame_num_bufs_msg
+rx_frame_used_len_msg: db ' used_len='
+rx_frame_used_len_len  equ $ - rx_frame_used_len_msg
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg

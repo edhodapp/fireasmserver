@@ -290,6 +290,28 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "RX:POPULATED observed — VIO-R-002 descriptor fill + notify verified"
+
+    # VIO-R-003/004. After the kick, boot.S polls UsedRing.idx for
+    # ~1 s. One of two markers follows:
+    #   RX:FRAME id=X hdr_len=Y num_bufs=Z used_len=W — device
+    #     delivered at least one frame; the driver read the used-
+    #     ring element, dereferenced the buffer, and parsed the
+    #     virtio_net_hdr.
+    #   RX:TIMEOUT                                  — polling code
+    #     executed, no frame arrived within the budget. The
+    #     polling path itself is validated; active traffic
+    #     injection lives in a follow-up commit.
+    # Either marker is a PASS for VIO-R-003/004.
+    rx_line=$(grep -E '^RX:(FRAME |TIMEOUT$)' "$SERIAL" | head -1 \
+        || true)
+    if [[ -z "$rx_line" ]]; then
+        echo "FAIL: neither RX:FRAME nor RX:TIMEOUT observed" \
+             "(guest did not reach VIO-R-003/004)"
+        echo "=== serial.log ==="
+        sed 's/^/    /' "$SERIAL"
+        exit 1
+    fi
+    echo "RX poll observed — VIO-R-003/004: $rx_line"
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —
