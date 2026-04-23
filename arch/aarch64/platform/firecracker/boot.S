@@ -89,7 +89,9 @@
 // matches the REQUIREMENTS.md VIO table. Shared across arches.
 .equ VIRTIO_STATUS_ACKNOWLEDGE,   1    // bit 0 — driver found the device
 .equ VIRTIO_STATUS_DRIVER,        2    // bit 1 — driver knows how to use it
+.equ VIRTIO_STATUS_DRIVER_OK,     4    // bit 2 — device is live (VIO-008)
 .equ VIRTIO_STATUS_FEATURES_OK,   8    // bit 3 — feature subset accepted
+.equ VIRTIO_STATUS_FAILED,        0x80 // bit 7 — driver has given up (VIO-009)
 
 // Feature bits (Virtio 1.2 §6 — transport + device-specific). Bits
 // are 64-wide; MMIO exposes them via two 32-bit pages selected by
@@ -459,7 +461,49 @@ _entry:
     adr     x1, queues_ready_msg
     mov     w2, #(queues_ready_msg_end - queues_ready_msg)
     bl      emit_bytes
+
+    // --- VIO-008: set DRIVER_OK ---
+    // Virtio 1.2 §2.1.2 step 8 — the device becomes "live"
+    // after this write. Virtqueues are consumable; the device
+    // can start filling the RX used-ring as soon as the driver
+    // posts buffers (VIO-R-002 in a later slice). The live
+    // transition here completes init cleanly.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    orr     w7, w7, #VIRTIO_STATUS_DRIVER_OK
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+
+    // Read-back: full expected state is
+    //   ACK | DRIVER | FEATURES_OK | DRIVER_OK = 0x0F.
+    // Equality compare catches DRIVER_OK-didn't-stick AND
+    // any stray bit (including FAILED) that crept in during
+    // init. Same discipline as VIO-003 / VIO-006.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    cmp     w7, #(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK)
+    b.ne    .Ldriver_ok_fail
+
+    adr     x1, driver_ok_msg
+    mov     w2, #(driver_ok_msg_end - driver_ok_msg)
+    bl      emit_bytes
     b       .Lflush
+
+.Ldriver_ok_fail:
+    // w7 holds the observed Status. Emit DRIVER_OK:FAIL
+    // status=<hex> and halt through the VIO-009 FAILED path.
+    adr     x1, driver_ok_fail_msg
+    mov     w2, #(driver_ok_fail_msg_end - driver_ok_fail_msg)
+    bl      emit_bytes
+    mov     w5, w7
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lset_failed
 
 .Lqueue_fail_rx:
     adr     x1, queues_fail_rx_msg
@@ -468,7 +512,7 @@ _entry:
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
-    b       .Lflush
+    b       .Lset_failed
 
 .Lqueue_fail_tx:
     adr     x1, queues_fail_tx_msg
@@ -477,7 +521,7 @@ _entry:
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
-    b       .Lflush
+    b       .Lset_failed
 
 .Lqueue_ready_fail:
     adr     x1, queues_ready_fail_msg
@@ -486,7 +530,7 @@ _entry:
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
-    b       .Lflush
+    b       .Lset_failed
 
 .Lfeatures_fail_no_v1:
     // Device did not offer VIRTIO_F_VERSION_1. Dump both feature
@@ -506,7 +550,7 @@ _entry:
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
-    b       .Lflush
+    b       .Lset_failed
 
 .Lfeatures_fail_rejected:
     // Device cleared FEATURES_OK after we set it, OR set an
@@ -519,26 +563,20 @@ _entry:
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
-    b       .Lflush
+    b       .Lset_failed
 
 .Lstatus_fail:
     // Emit: STATUS:FAIL status=XXXXXXXX\n. w7 holds the observed
-    // Status. Copy to w5 BEFORE calling emit_bytes (emit_bytes
-    // preserves w7, but keep the "w5 = value-to-hex-render"
-    // invariant that emit_hex32 expects).
-    mov     w5, w7
+    // Status. emit_bytes preserves w7; then render via emit_hex32.
     adr     x1, status_fail_msg
     mov     w2, #(status_fail_msg_end - status_fail_msg)
     bl      emit_bytes
+    mov     w5, w7
     bl      emit_hex32
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
-    // Future VIO-009 set_failed helper will redirect here to
-    // set the FAILED bit before halting. For now, fall through
-    // to .Lflush + .Ldone so the guest halts cleanly with the
-    // diagnostic on the serial line.
-    b       .Lflush
+    b       .Lset_failed
 
 .Lvirtio_fail:
     // Emit "VIRTIO:FAIL magic=XXXXXXXX\n".
@@ -553,6 +591,25 @@ _entry:
 
 .Lflush:
     dsb     sy
+    b       .Ldone
+
+// VIO-009: signal the device that the driver has given up.
+// Any fatal init error downstream of the VIRTIO probe routes
+// here before halt. RMW preserves whatever Status bits are
+// already set (ACK / DRIVER / FEATURES_OK in various
+// combinations depending on which stage failed). Only entered
+// after the probe matched — .Lvirtio_fail skips this step
+// because a MagicValue mismatch leaves the device's register
+// layout unverified and a Status write would be blind.
+.Lset_failed:
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    orr     w7, w7, #VIRTIO_STATUS_FAILED
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    // fall through to .Ldone
 
 .Ldone:
     // WFE forever — Firecracker sees halt via MMIO quiescence.
@@ -684,6 +741,13 @@ queues_fail_tx_msg_end:
 queues_ready_fail_msg:
     .ascii  "QUEUES:FAIL queue-not-ready"
 queues_ready_fail_msg_end:
+
+driver_ok_msg:
+    .ascii  "DRIVER_OK\n"
+driver_ok_msg_end:
+driver_ok_fail_msg:
+    .ascii  "DRIVER_OK:FAIL status="
+driver_ok_fail_msg_end:
 
 newline_msg:
     .ascii  "\n"
