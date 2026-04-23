@@ -2357,6 +2357,154 @@ AES-128 merge follow-up, codifying the side session's
 deliberate no-fallback implementation choice.
 
 
+### D058: No mutable state crosses a core or VM boundary — queue-passing actor model
+
+**Decision (2026-04-23):** mutable state in fireasmserver lives
+inside exactly one process (one core within a VM; or one VM
+within a fleet). It NEVER crosses a core boundary or a VM
+boundary. Cross-core communication within a VM is message-
+passing over lockless queues. Cross-VM communication is
+normal network protocols. Mutable state is transported
+between processes only by COPYING it into a message — never
+by sharing the underlying storage.
+
+Immutable-after-init state (config, certs, trust store, trust-
+anchor hashes, compiled WASM modules) MAY be read by every
+core within a VM. Such state is frozen at an explicit init-
+complete fence; writing to it after the fence is a hard
+fail.
+
+Each VM is internally structured as a set of single-threaded
+actors (one per core). Cores communicate with each other ONLY
+through lockless queues at well-defined boundaries (canonical
+example: the load-balancer core enqueues parsed HTTP requests
+to worker cores; workers enqueue responses back). Each actor
+owns its own state entirely and runs single-threaded; no
+actor ever observes another actor's in-process state.
+
+**What this PRECLUDES:**
+
+- Cross-core shared mutable memory for any data that changes
+  after init. No atomics-driven shared data structures, no
+  CAS loops, no hand-rolled lock-free containers across
+  cores.
+- Distributed consensus protocols implemented inside the
+  server (no Raft, no Paxos, no Viewstamped-Replication). A
+  customer who needs distributed consensus runs an external
+  coordinator (etcd, ZooKeeper, Consul) and our server
+  consumes its API.
+- Leader-election between server instances.
+- Cluster-wide transactional guarantees, two-phase commit
+  across fleet, live connection migration during rolling
+  upgrades.
+- Shared caches across VMs. Caches are per-VM; upstream
+  customer-provided caches (Redis, Memcached) hold cross-VM
+  state.
+- Shared rate-limiter counters across VMs. Per-VM token
+  buckets converge to approximate rate limits; exact
+  cluster-wide limiting delegates to external.
+
+**What this EXPLICITLY PERMITS:**
+
+- Single-core stateful processes. A database engine running
+  on one worker core is architecturally welcome: the engine
+  owns its state, queries reach it via the same lockless
+  queue mechanism workers use for request processing, the
+  engine responds via the same mechanism. Redis-shape
+  single-threaded-store patterns fit; the DB engine's
+  correctness reasoning stays sequential because no other
+  core touches its state.
+- Multi-VM sharding where one VM = one shard. The DB on each
+  VM's core holds its partition; routing requests to the right
+  shard is a layer above (customer-run router, or an eventual
+  internal front-end VM that speaks a shard-aware protocol).
+- WASM runtimes per core. Each worker owns its WASM engine +
+  module instances. Different workers are different WASM
+  instances; no cross-instance shared memory. A WASM module
+  that wants cross-request state talks to the DB-on-a-core
+  or to an external store.
+- Per-VM local caches (TLS session tickets, DNS resolution
+  cache, compiled WASM bytecode). Clients reconnecting to a
+  different VM get full handshakes; caching is a performance
+  optimization, not a correctness requirement.
+
+**Why:** two reasons, compounding.
+
+First, concurrency reasoning. Shared-mutable-state concurrent
+systems have state spaces that grow combinatorially with
+process count. TLA+ / TLC model-checking hits tractability
+walls around N=3..4 processes for nontrivial shared-state
+protocols. Message-passing models stay linear in N — bounded
+by message-ordering permutations, which compose. Since D058
+commits the project to TLA+-first design for concurrency
+(see Phase 1 of the concurrency roadmap), tractable formal
+verification is not optional. The N=1..8 test matrix Ed
+wants — verified formally and exercised empirically — is
+feasible under this invariant and not under the alternative.
+
+Second, the "software should be like air" axiom
+(`user_tagline_software_as_air.md`). Distributed-consistent-
+state is where Jepsen finds 10-year-old CVE-equivalents in
+the biggest databases on earth. Refusing that whole class of
+problem — by moving it to external coordinators when needed
+— is how we achieve invisible reliability. Per-core single-
+threaded actors with message-passing boundaries are the
+architectural pattern with the best track record here
+(Erlang, Redis, nginx-worker-model, Envoy's thread-local
+architecture all embody variants).
+
+**Retrofit cost:** adopting this now is cheap; retrofitting
+later is prohibitive. Every data structure, every handler,
+every TLS session, every FSA transition must respect this
+invariant from day one. Going from shared-mutable to
+actor-model is a full rewrite; going the other way (if a
+specific feature later needs cross-core mutable state) is
+a localized introduction of coordination at that feature's
+boundary — much cheaper.
+
+**How to apply:**
+
+- Every data structure's ownership is documented: "owned by
+  core N for its lifetime" or "immutable after init-complete
+  fence." No ambiguous-owner structures ship.
+- Cross-core APIs are message-shaped: function call between
+  cores is not a thing; enqueueing a message and awaiting a
+  reply is. The lockless queue primitives become the only
+  inter-core communication surface.
+- The FSA runtime is per-core from day one — each core
+  runs its own FSA dispatcher with its own transition state.
+- The TLA+ specification (Phase 1) models the inter-core
+  queue protocols and the actor lifecycles. Safety and
+  liveness invariants on the queue protocol are TLC-checked
+  at N=1..8 before any concurrency code lands.
+- When a feature is proposed that seems to need shared
+  mutable state, the first question is "can this be
+  message-passed?" If yes, use queues. If no, delegate to
+  external.
+
+**Cross-refs:**
+
+- `user_tagline_software_as_air.md` — the axiom this decision
+  operationalizes.
+- `feedback_automation_cost_is_bounded_bug_cost_is_not.md` —
+  the testing posture enabled by tractable TLA+.
+- `feedback_overconfident_foresight_as_discipline_cutter.md`
+  — the pattern NOT to cut; this decision is the positive
+  framing of that rule at architectural scale.
+- Astier's FSA reference document (`~/.claude/Finite_State_
+  Automaton_for_Input_Output_Containers_1746783516.pdf`) —
+  the per-actor runtime pattern draws from it.
+- `D003` — 100% assembly; lockless queue primitives are
+  implemented in assembly on both arches.
+- `D032` — crypto-math strategy; TLS sessions live in the
+  core that terminates them, satisfying D058 by construction.
+
+**Attribution:** design decision landed 2026-04-23 during
+the TLS / multicore / WASM architecture discussion, after
+Ed's explicit "multiprocessing is a bug minefield; break
+mutable sharing now; use queues between processes" framing.
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
