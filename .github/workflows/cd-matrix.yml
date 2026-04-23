@@ -57,6 +57,96 @@ jobs:
       - name: pytest
         run: pytest -q --no-header
 
+  qemu-fork-build:
+    # D054 sandbox: build edhodapp/qemu fork into $HOME/opt/qemu-fork
+    # for x86_64 matrix cells that need SHA-NI runtime exercise
+    # (sha256rnds2, future AES-NI, future VPCLMULQDQ). Stock Ubuntu
+    # Noble qemu 8.2.2 mis-emulates SHA-NI; the fork (master track,
+    # qemu 11.x) handles it cleanly.
+    #
+    # actions/cache@v4 keyed on the fork's HEAD SHA — cache hit in
+    # seconds, cold build ~30 min. Cache evicts when the fork
+    # advances; first run after a fork update pays the full cost
+    # once, then caches.
+    #
+    # The ~1.5 GB install tree fits comfortably under the 10 GB
+    # per-repo cache budget.
+    name: QEMU fork build (cached)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      qemu-fork-sha: ${{ steps.fork-sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve qemu-fork HEAD SHA
+        id: fork-sha
+        run: |
+          set -euo pipefail
+          # Fail the step hard on an empty result — a GitHub 5xx
+          # or network blip would otherwise produce an empty
+          # cache key and confuse restore/save semantics.
+          sha=$(git ls-remote https://github.com/edhodapp/qemu HEAD \
+                | awk '{print $1}')
+          if [ -z "$sha" ] || [ ${#sha} -ne 40 ]; then
+            echo "ERROR: could not resolve qemu-fork HEAD SHA" >&2
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "qemu-fork HEAD at $sha"
+
+      - name: Restore qemu-fork cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/opt/qemu-fork
+          key: qemu-fork-${{ runner.os }}-${{ steps.fork-sha.outputs.sha }}
+
+      - name: Install build deps (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              meson ninja-build pkg-config python3 \
+              libglib2.0-dev libpixman-1-dev libfdt-dev \
+              zlib1g-dev libslirp-dev libcap-ng-dev libattr1-dev
+
+      - name: Build qemu fork (cache miss only)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: tooling/qemu_build/build_qemu_fork.sh
+
+      - name: Verify installed qemu
+        run: |
+          ~/opt/qemu-fork/bin/qemu-x86_64 --version | head -1
+          # Sanity: SHA-NI must be advertised under -cpu Denverton.
+          # The probe runs UNDER qemu-user, which intercepts CPUID
+          # and answers with the emulated guest's CPU-model feature
+          # bits, not the host's. That's exactly what we want to
+          # verify here — that the fork-qemu advertises SHA-NI in
+          # its Denverton model table, not that the CI runner's
+          # silicon has SHA-NI.
+          #
+          # Uses <cpuid.h>'s __get_cpuid_count() rather than
+          # inline asm: the PIC-default on Ubuntu 24.04 gcc
+          # conflicts with an inline-asm "=b" output constraint
+          # (ebx is the PIC base register); __get_cpuid_count
+          # handles the save/restore transparently.
+          cat > /tmp/cpuid_sha.c <<'EOF'
+          #include <cpuid.h>
+          #include <stdio.h>
+          int main(void) {
+              unsigned int eax = 0, ebx = 0, ecx = 0, edx = 0;
+              if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
+                  fprintf(stderr, "CPUID leaf 7 unsupported\n");
+                  return 2;
+              }
+              return ((ebx >> 29) & 1u) ? 0 : 1;
+          }
+          EOF
+          gcc -O2 -Wall -Wextra -Werror /tmp/cpuid_sha.c -o /tmp/cpuid_sha
+          ~/opt/qemu-fork/bin/qemu-x86_64 -cpu Denverton /tmp/cpuid_sha
+          echo "SHA-NI advertised under -cpu Denverton: OK"
+
   c-lint:
     # Four-layer static analysis on the host-side crypto test
     # drivers (tooling/crypto_tests/*.c): gcc + clang compile-as-
@@ -96,9 +186,13 @@ jobs:
           # hosted CI spends minutes exercising SeaBIOS, not our code.
           # x86_64/firecracker covers the BIOS-free PVH direct-boot
           # path; that's where our x86_64 CI signal lives.
+          # x86_64 pinned to ubuntu-24.04 (not ubuntu-latest) to
+          # match qemu-fork-build's runner so the cached install
+          # tree is ABI-compatible. Bump qemu-fork-build and this
+          # pin together.
           - arch: x86_64
             platform: firecracker
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             experimental: false
             trace: "0"
           - arch: aarch64
@@ -118,11 +212,34 @@ jobs:
             # is a SKIP in CI (no KVM) so there's nothing to trace.
             trace: "0"
     name: build/${{ matrix.arch }}/${{ matrix.platform }}
+    # x86_64 cells need the fork-qemu sandbox cache populated
+    # before they can run the SHA-NI test cells (D054). `needs`
+    # is declared at job level, which gates ALL matrix cells —
+    # the aarch64 cells don't consume the cache but the wait
+    # cost is whatever qemu-fork-build takes (seconds on cache
+    # hit, ~30 min on cold fork-update).
+    #
+    # GitHub Actions doesn't support per-matrix-cell `needs`.
+    # The idiomatic split would be separate build-x86_64 and
+    # build-aarch64 jobs so the aarch64 cells don't wait for a
+    # cold fork build they don't consume. Not worth the
+    # duplication today: the fork HEAD changes rarely so
+    # cache-hit dominates; aarch64 wait on a hit is seconds.
+    # Revisit if cold builds become frequent.
+    needs: [qemu-fork-build]
     runs-on: ${{ matrix.runner }}
     continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore qemu-fork cache (x86_64 cells only)
+        if: matrix.arch == 'x86_64'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/opt/qemu-fork
+          key: qemu-fork-${{ runner.os }}-${{ needs.qemu-fork-build.outputs.qemu-fork-sha }}
+          fail-on-cache-miss: true
 
       - name: Install cross-toolchain
         run: |
