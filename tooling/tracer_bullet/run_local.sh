@@ -312,6 +312,25 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         exit 1
     fi
     echo "RX poll observed — VIO-R-003/004: $rx_line"
+
+    # VIO-R-006/007. On the RX:FRAME (success) path, boot.S
+    # recycles the consumed descriptor by writing its id into the
+    # next Available Ring slot, advancing AvailRing.idx, and
+    # notifying the device via QueueNotify(0). The RX:RETURNED
+    # marker confirms the close-the-cycle code executed.
+    #
+    # On the RX:TIMEOUT path nothing was received and nothing is
+    # returned — skip this check there.
+    if grep -qE '^RX:FRAME ' "$SERIAL"; then
+        if ! grep -qE '^RX:RETURNED$' "$SERIAL"; then
+            echo "FAIL: RX:FRAME observed but RX:RETURNED missing" \
+                 "(VIO-R-006/007 return-cycle did not complete)"
+            echo "=== serial.log ==="
+            sed 's/^/    /' "$SERIAL"
+            exit 1
+        fi
+        echo "RX:RETURNED observed — VIO-R-006/007 return + notify verified"
+    fi
 fi
 
 # Optional: run branch-cov on the captured QEMU trace. Advisory only —

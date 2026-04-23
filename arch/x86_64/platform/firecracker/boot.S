@@ -702,6 +702,70 @@ _start:
     lea esi, [newline]
     mov ecx, 1
     call emit_bytes
+
+    ; --- VIO-R-006/007: return consumed descriptor + notify ---
+    ; Close the receive cycle by recycling the descriptor we just
+    ; pulled off the Used Ring. Under §2.7.13, the driver returns
+    ; a consumed descriptor by writing its index into the next
+    ; Available Ring slot and bumping AvailRing.idx; §2.7.12 then
+    ; requires a Queue Notify (unless VIRTIO_F_EVENT_IDX suppresses
+    ; it, which VIO-F-007 doesn't negotiate in MVP).
+    ;
+    ; After VIO-R-002, AvailRing.idx = 256 and ring[0..255] hold
+    ; descriptors 0..255. To recycle the descriptor we consumed,
+    ; write its id into ring[idx % 256] = ring[0], advance idx
+    ; to 257. The device reads idx = 257, sees one new
+    ; available entry beyond its last-consumed position, picks
+    ; up the re-published descriptor.
+    ;
+    ; edi was clobbered by the emit_hex32 chain; re-read id from
+    ; ring[0].id. The used-ring element stays at offset +4 until
+    ; the device advances its own producer index and overwrites
+    ; the slot — which won't happen until we also advance our
+    ; consumer index, which we don't track in this one-shot
+    ; MVP. Safe to re-read here.
+    lfence
+    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]    ; id
+    lfence
+
+    ; Current AvailRing.idx (driver-owned, in guest RAM). The
+    ; re-read-from-shared-ring pattern works here because we're
+    ; the sole writer (§2.7.13) AND this one-shot MVP never
+    ; loops through more than one return. A multi-frame RX loop
+    ; MUST replace this re-read with a driver-private shadow
+    ; copy of next_avail_idx — the shared ring is the wrong
+    ; state if anything (device, future driver path) could
+    ; conceivably touch it.
+    movzx eax, word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2]
+
+    ; Slot index = idx mod VIRTQ_MAX_SIZE. VIRTQ_MAX_SIZE is
+    ; 256 (power of 2), so AND with 0xFF.
+    mov ebx, eax
+    and ebx, VIRTQ_MAX_SIZE - 1
+
+    ; Write descriptor id into ring[slot]. Ring slots start at
+    ; offset 4 after flags + idx.
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + ebx*2], di
+
+    ; Barrier before idx bump — the descriptor-id write must be
+    ; globally visible before the idx advance per §2.7.11.
+    mfence
+
+    ; Advance AvailRing.idx by 1 (u16, wraps naturally at 65536).
+    inc eax
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], ax
+
+    ; Barrier before QueueNotify so the idx advance is globally
+    ; visible before the device reads the kick.
+    mfence
+
+    ; Kick the device — queue index 0 (RX).
+    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY], 0
+    mfence
+
+    lea esi, [rx_returned_msg]
+    mov ecx, rx_returned_len
+    call emit_bytes
     jmp .halt
 
 .driver_ok_fail:
@@ -1018,6 +1082,9 @@ rx_bad_id_msg:         db 'RX:FAIL bad_id='
 rx_bad_id_len          equ $ - rx_bad_id_msg
 rx_num_bufs_msg:       db 'RX:FAIL num_bufs='
 rx_num_bufs_len        equ $ - rx_num_bufs_msg
+
+rx_returned_msg:       db 'RX:RETURNED', 10
+rx_returned_len        equ $ - rx_returned_msg
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
