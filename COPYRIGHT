@@ -1,0 +1,35 @@
+fireasmserver
+Copyright (C) 2026 Ed Hodapp <ed@hodapp.com>
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+
+fireasmserver is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version.
+
+fireasmserver is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero
+General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full license text is in `LICENSE`.
+
+
+No external contributions accepted
+----------------------------------
+
+Ed Hodapp is the sole author and sole copyright holder of fireasmserver.
+External contributions (pull requests, patches, and similar upstream
+submissions) are **not accepted** at this time. Consolidated copyright
+ownership preserves future licensing flexibility — Ed retains the right
+to relicense, dual-license for commercial clients, or open to
+contributions under a CLA later. Accepting external contributions under
+AGPL would lock those options down.
+
+Commercial deployments that cannot accept AGPL's network-copyleft (§13)
+obligations should contact Ed for a commercial license / consulting
+engagement.

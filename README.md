@@ -112,7 +112,7 @@ Next milestones: the L2 design note, the pure-assembly primitives (CRC-32, crypt
 
 ## License
 
-fireasmserver is licensed under the **GNU Affero General Public License, version 3 or any later version** (AGPL-3.0-or-later). See [LICENSE](LICENSE) for the full text.
+fireasmserver is licensed under the **GNU Affero General Public License, version 3 or any later version** (AGPL-3.0-or-later). See [COPYRIGHT](COPYRIGHT) for the short notice + single-author / commercial-license stance, and [LICENSE](LICENSE) for the full AGPLv3 text.
 
 If your use case is incompatible with the AGPL, contact ed@hodapp.com about commercial licensing.
 
