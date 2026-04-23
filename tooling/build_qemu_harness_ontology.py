@@ -977,8 +977,10 @@ constraints = [
     DomainConstraint(
         name="ETH-010",
         description=(
-            "MUST discard runt frames (<64 bytes incl. FCS). "
-            "Guard against runt-length L2 attacks."
+            "MUST discard runt frames (<64 bytes incl. FCS, "
+            "or <60 bytes if the driver has already stripped "
+            "FCS — mirrors the ETH-003 threshold). Guard "
+            "against runt-length L2 attacks."
         ),
         entity_ids=["ethernet-frame"],
         rationale="IEEE 802.3-2018 §3.2.7.",

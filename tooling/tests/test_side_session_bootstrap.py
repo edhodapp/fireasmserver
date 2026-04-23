@@ -570,7 +570,7 @@ def test_bootstrap_refuses_missing_briefing_source(
 
     with pytest.raises(
         BootstrapError,
-        match=r"(?i)briefing.*not a readable utf-8 file",
+        match=r"(?i)briefing.*not stat-able",
     ):
         bs.run()
 
@@ -592,6 +592,33 @@ def test_bootstrap_refuses_unreadable_briefing_source(
     with pytest.raises(
         BootstrapError,
         match=r"(?i)briefing.*not a readable utf-8 file",
+    ):
+        bs.run()
+
+    _assert_no_side_effects(minimal_repo, "demo_task", "2026-04-20")
+
+
+def test_bootstrap_refuses_oversized_briefing_source(
+    minimal_repo: Path, tmp_path: Path,
+) -> None:
+    """A briefing source larger than the 1 MiB ceiling must fail
+    at validation, not at read-time — per hygiene-gaps.md #29,
+    this is defense against wrong-file-in-flight operator errors
+    (passing a gigabyte log by accident, say). The threshold is
+    far above any realistic briefing so a false positive is
+    itself a signal that something is wrong."""
+    huge = tmp_path / "huge.md"
+    # 2 MiB — over the 1 MiB cap. Written via seek+write to
+    # avoid allocating 2 MiB of zeros in the test process.
+    with huge.open("wb") as fh:
+        fh.seek((2 << 20) - 1)
+        fh.write(b"\0")
+    bs = _make_bootstrapper(minimal_repo)
+    bs.briefing_source = huge
+
+    with pytest.raises(
+        BootstrapError,
+        match=r"(?i)above the.*byte ceiling",
     ):
         bs.run()
 

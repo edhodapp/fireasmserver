@@ -34,7 +34,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _make_parser()
     args = parser.parse_args(argv)
     try:
-        repo_root = _find_repo_root(Path.cwd())
+        try:
+            cwd = Path.cwd()
+        except (FileNotFoundError, OSError) as exc:
+            # Extreme edge case: CWD has been deleted (e.g.,
+            # another process removed the directory the tool
+            # was launched from). Path.cwd() raises
+            # FileNotFoundError on POSIX in that case; convert
+            # to an operator-facing BootstrapError rather than
+            # a raw traceback. hygiene-gaps.md #30.
+            raise BootstrapError(
+                f"current working directory is unreadable: {exc}",
+            ) from exc
+        repo_root = _find_repo_root(cwd)
         briefing_source = (
             Path(args.briefing_from_file).resolve()
             if args.briefing_from_file else None

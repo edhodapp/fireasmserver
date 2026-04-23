@@ -16,6 +16,7 @@ monkeypatch them with ``raising=True``.
 
 from __future__ import annotations
 
+import os
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,6 +34,14 @@ from side_session_bootstrap.ontology_writer import (
 from side_session_bootstrap.template import render_briefing
 
 _DAG_RELPATH = "tooling/qemu-harness.json"
+
+# 1 MiB ceiling on --briefing-from-file content. Real briefings
+# today are ~10 KB (2026-04-21_sha256.md is ~12 KB); an
+# operator-supplied path orders of magnitude larger is almost
+# certainly a wrong-file-in-flight mistake, and we would rather
+# catch that at validation time than OOM the tool on a
+# gigabyte file. hygiene-gaps.md #29.
+_BRIEFING_SOURCE_MAX_BYTES = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -102,7 +111,15 @@ class Bootstrapper:
         # pins the DAG record back to the git HEAD it was cut
         # from, closing hygiene-gaps.md #14.
         task = self._build_task(parent_commit_sha=saved_head)
-        worktree_path = self._worktree_path()
+        # Pass the SafeId-validated task.slug / task.date through
+        # to the path helpers, not the raw self.* fields. Today
+        # _build_task raises BootstrapError before this line if
+        # validation fails, so self.slug can never leak into
+        # _worktree_path — but expressing the invariant in types
+        # (the helpers now demand a validated slug) is defense-
+        # in-depth against a future refactor that reorders run()
+        # or weakens SafeId. hygiene-gaps.md #28.
+        worktree_path = self._worktree_path(task.slug)
         branch = make_branch_name(task.slug, task.date)
         self._check_no_preexisting_paths(worktree_path, branch)
 
@@ -142,7 +159,9 @@ class Bootstrapper:
             _run_rollback(rollback, reraise_annotation=False)
             raise
 
-        briefing_path = self._briefing_path(worktree_path)
+        briefing_path = self._briefing_path(
+            worktree_path, task.date, task.slug,
+        )
         return BootstrapResult(
             worktree_path=worktree_path,
             branch_name=branch,
@@ -156,9 +175,14 @@ class Bootstrapper:
 
     def _check_clean_main(self) -> None:
         """Dispatch requires the primary worktree to be on
-        ``main`` with no dirty state — the dispatch record
-        commits there (D052), and any uncommitted changes would
-        be swept up by the commit."""
+        ``main`` with no dirty state. The dispatch commit itself
+        stages a single named file (``_DAG_RELPATH``), not ``-a``,
+        so a dirty tree wouldn't be silently swept into the
+        commit — but the clean-tree precondition remains the
+        right discipline: a dispatch that lands while other
+        unrelated work is half-done leaves ambiguity about
+        which commit introduced what. Fail fast and let the
+        operator stash / commit first."""
         if not worktree_ops.is_working_tree_clean(self.repo_root):
             raise BootstrapError(
                 "primary worktree has dirty / uncommitted changes; "
@@ -182,12 +206,14 @@ class Bootstrapper:
     def _check_briefing_source_readable(self) -> None:
         """When ``--briefing-from-file`` is in play, read the source
         now and cache the bytes. Validated pre-mutation — a typo,
-        permission issue, encoding error, or directory-as-source
-        surfaces before any worktree / branch / DAG state is
-        created. Caching also closes the TOCTOU window between
-        validation and the later copy in ``_render_briefing``."""
+        permission issue, encoding error, size-above-ceiling, or
+        directory-as-source surfaces before any worktree / branch
+        / DAG state is created. Caching also closes the TOCTOU
+        window between validation and the later copy in
+        ``_render_briefing``."""
         if self.briefing_source is None:
             return
+        _check_briefing_source_size(self.briefing_source)
         try:
             self._briefing_source_content = (
                 self.briefing_source.read_text(encoding="utf-8")
@@ -290,7 +316,9 @@ class Bootstrapper:
 
         Defined as a method so behavioral rollback tests can
         monkeypatch it with raising=True."""
-        briefing_path = self._briefing_path(worktree_path)
+        briefing_path = self._briefing_path(
+            worktree_path, task.date, task.slug,
+        )
         briefing_path.parent.mkdir(parents=True, exist_ok=True)
         if self._briefing_source_content is not None:
             content = self._briefing_source_content
@@ -338,16 +366,29 @@ class Bootstrapper:
                 f"invalid task input: {_format_validation_error(exc)}",
             ) from exc
 
-    def _worktree_path(self) -> Path:
+    def _worktree_path(self, slug: str) -> Path:
+        """Derive the sibling-worktree path. Callers MUST pass a
+        ``SafeId``-validated slug (``task.slug``), not the raw
+        ``self.slug`` field — expressing the invariant at the
+        helper's signature is defense-in-depth against a future
+        refactor that reorders ``run()``'s validation step.
+        hygiene-gaps.md #28."""
         return (
             self.repo_root.parent
-            / f"{self.repo_root.name}-{self.slug}"
+            / f"{self.repo_root.name}-{slug}"
         )
 
-    def _briefing_path(self, worktree_path: Path) -> Path:
+    def _briefing_path(
+        self, worktree_path: Path, date: str, slug: str,
+    ) -> Path:
+        """Derive the briefing markdown path inside the peer
+        worktree. Callers MUST pass ``IsoDate``- and ``SafeId``-
+        validated date + slug values (``task.date``, ``task.slug``)
+        — same rationale as ``_worktree_path``. hygiene-gaps.md
+        #28."""
         return (
             worktree_path / "docs" / "side_sessions"
-            / f"{self.date}_{self.slug}.md"
+            / f"{date}_{slug}.md"
         )
 
     def _launch_prompt(
@@ -362,14 +403,40 @@ class Bootstrapper:
         # shell-injection surface in the generated command is
         # not a surface to leave open.
         quoted_path = shlex.quote(str(worktree_path))
+        # Default agent binary is claude-code; override via
+        # FIREASMSERVER_AGENT_CMD for cases where the operator
+        # runs a different shell wrapper or the binary isn't
+        # on PATH. hygiene-gaps.md #21.
+        agent_cmd = os.environ.get(
+            "FIREASMSERVER_AGENT_CMD", "claude",
+        )
         return (
             f"cd {quoted_path}\n"
-            f"claude\n\n"
+            f"{agent_cmd}\n\n"
             f"Then paste:\n"
             f"  Read {rel_briefing} and execute it. "
             f"You are on branch {branch} in an isolated "
             f"worktree. Do not checkout other branches. "
             f"Report your plan before writing implementation code."
+        )
+
+
+def _check_briefing_source_size(path: Path) -> None:
+    """Pre-flight size check for ``--briefing-from-file`` paths.
+    Extracted from ``_check_briefing_source_readable`` to keep
+    that method under the project's cyclomatic-complexity cap
+    (flake8 ``--max-complexity=5``). hygiene-gaps.md #29."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise BootstrapError(
+            f"briefing source {path} is not stat-able: {exc}",
+        ) from exc
+    if size > _BRIEFING_SOURCE_MAX_BYTES:
+        raise BootstrapError(
+            f"briefing source {path} is {size} bytes, above the "
+            f"{_BRIEFING_SOURCE_MAX_BYTES}-byte ceiling; refusing "
+            "to read (likely a wrong-file-in-flight operator error)",
         )
 
 
@@ -439,7 +506,21 @@ def _run_rollback(
     for hook in reversed(rollback):
         try:
             hook()
-        except Exception as exc:  # pylint: disable=broad-except
+        except BaseException as exc:  # pylint: disable=broad-except
+            # BaseException not Exception: a KeyboardInterrupt
+            # raised inside a rollback hook MUST NOT abort the
+            # remaining hooks — the operator wants every bit of
+            # cleanup we can give them before the interpreter
+            # tears down. hygiene-gaps.md #27.
+            #
+            # Trade-off the future reader should know about: a
+            # Ctrl-C struck DURING rollback is absorbed here
+            # rather than re-raised. The operator needs a second
+            # Ctrl-C (or for run()'s outer BaseException arm to
+            # fire) to actually exit. Best-effort cleanup is
+            # judged more important than single-Ctrl-C exit
+            # responsiveness — don't "fix" this by narrowing
+            # back to Exception without re-reading #27.
             if reraise_annotation:
                 errors.append(f"{type(exc).__name__}: {exc}")
     return errors

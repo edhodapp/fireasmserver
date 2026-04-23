@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1093,6 +1094,12 @@ class TestCLIDashM:
     """
 
     def test_dashm_entry(self) -> None:
+        # Inherit the parent PATH rather than hard-coding
+        # /usr/bin:/bin. On a CI image or developer box with
+        # Python living in /usr/local/bin, /opt/homebrew/bin,
+        # or a venv at an arbitrary path, the hard-coded value
+        # would fail to resolve sys.executable's required
+        # runtime. hygiene-gaps.md #9.
         result = subprocess.run(
             [sys.executable, "-m", "audit_ontology", "--help"],
             capture_output=True, text=True,
@@ -1101,7 +1108,7 @@ class TestCLIDashM:
                 "PYTHONPATH": str(
                     Path(__file__).resolve().parents[1] / "src"
                 ),
-                "PATH": "/usr/bin:/bin",
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             },
             check=False, timeout=15,
         )
