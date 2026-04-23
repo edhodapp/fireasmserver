@@ -47,12 +47,25 @@
 
 // virtio-MMIO register offsets (Virtio 1.2 §4.2.2, Table 4.1) —
 // arch-neutral, identical to x86_64's equivalents.
-.equ VIRTIO_MMIO_STATUS,          0x070
+.equ VIRTIO_MMIO_DEVICE_FEATURES,     0x010
+.equ VIRTIO_MMIO_DEVICE_FEATURES_SEL, 0x014
+.equ VIRTIO_MMIO_DRIVER_FEATURES,     0x020
+.equ VIRTIO_MMIO_DRIVER_FEATURES_SEL, 0x024
+.equ VIRTIO_MMIO_STATUS,              0x070
 
 // Device Status bit values (Virtio 1.2 §2.1). Bit-position numbering
 // matches the REQUIREMENTS.md VIO table. Shared across arches.
 .equ VIRTIO_STATUS_ACKNOWLEDGE,   1    // bit 0 — driver found the device
 .equ VIRTIO_STATUS_DRIVER,        2    // bit 1 — driver knows how to use it
+.equ VIRTIO_STATUS_FEATURES_OK,   8    // bit 3 — feature subset accepted
+
+// Feature bits (Virtio 1.2 §6 — transport + device-specific). Bits
+// are 64-wide; MMIO exposes them via two 32-bit pages selected by
+// DeviceFeaturesSel / DriverFeaturesSel (0=bits 0-31, 1=bits 32-63).
+// VIRTIO_F_VERSION_1 is bit 32 globally → bit 0 of the high page.
+// MVP policy: accept VERSION_1 only. MAC, STATUS, MQ, CSUM, GSO,
+// EVENT_IDX stay off until the code paths that consume them land.
+.equ VIRTIO_F_VERSION_1_HIBIT,    1    // bit 32 == 1 in the high page
 
 .section .text, "ax"
 .globl _start
@@ -186,6 +199,108 @@ _entry:
     adr     x1, status_driver_msg
     mov     w2, #(status_driver_msg_end - status_driver_msg)
     bl      emit_bytes
+
+    // --- Feature negotiation (VIO-004, VIO-005, VIO-006) ---
+    // Virtio 1.2 §2.1.2 steps 4-6. MVP policy: accept VERSION_1
+    // only (high-page bit 0); everything else stays off.
+    //
+    // Register allocation across this block:
+    //   w9 = offered dev_lo (the low-page features the device
+    //        offers). Carried across until we either emit
+    //        FEATURES:OK (discarded) or FEATURES:FAIL no-v1
+    //        (dumped in hex). emit_bytes preserves x9;
+    //        emit_hex32 clobbers x9 but by the time we call it
+    //        for dev_lo we've already copied w9 into w5 for
+    //        the hex render.
+    //   w7 = scratch for MMIO reads + Status compare.
+    //   x6 = VIRTIO_MMIO_BASE (still held from the probe).
+
+    // VIO-004 part 1a: read dev_lo (low-page offered features).
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_DEVICE_FEATURES_SEL]   // SEL = 0
+    dsb     sy
+    ldr     w9, [x6, #VIRTIO_MMIO_DEVICE_FEATURES]        // dev_lo → w9
+    dsb     sy
+
+    // VIO-004 part 1b: read dev_hi, check VERSION_1 offered.
+    mov     w7, #1
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_DEVICE_FEATURES_SEL]    // SEL = 1
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_DEVICE_FEATURES]        // dev_hi → w7
+    dsb     sy
+    tst     w7, #VIRTIO_F_VERSION_1_HIBIT
+    b.eq    .Lfeatures_fail_no_v1
+
+    // VIO-004 part 2: write driver features.
+    //   low-page = 0 (we accept nothing bits 0-31).
+    //   high-page = VIRTIO_F_VERSION_1_HIBIT only.
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_DRIVER_FEATURES_SEL]   // SEL = 0
+    dsb     sy
+    str     wzr, [x6, #VIRTIO_MMIO_DRIVER_FEATURES]       // low = 0
+    dsb     sy
+    mov     w5, #1
+    str     w5, [x6, #VIRTIO_MMIO_DRIVER_FEATURES_SEL]    // SEL = 1
+    dsb     sy
+    mov     w5, #VIRTIO_F_VERSION_1_HIBIT
+    str     w5, [x6, #VIRTIO_MMIO_DRIVER_FEATURES]        // high = 1
+    dsb     sy
+
+    // VIO-005: RMW FEATURES_OK into Status.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    orr     w7, w7, #VIRTIO_STATUS_FEATURES_OK
+    dsb     sy
+    str     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+
+    // VIO-006: re-read Status. MUST be ACK | DRIVER | FEATURES_OK.
+    // Equality compare catches FAILED and any stray bit, same
+    // discipline as VIO-003's cross-check.
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    cmp     w7, #(VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK)
+    b.ne    .Lfeatures_fail_rejected
+
+    adr     x1, features_ok_msg
+    mov     w2, #(features_ok_msg_end - features_ok_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lfeatures_fail_no_v1:
+    // Device did not offer VIRTIO_F_VERSION_1. Dump both feature
+    // pages for post-mortem. w9 = dev_lo, w7 = dev_hi.
+    // Both emit_bytes calls preserve w7; first emit_hex32 call
+    // clobbers x9, but by then we've already copied w9 → w5.
+    adr     x1, features_no_v1_prefix_msg
+    mov     w2, #(features_no_v1_prefix_msg_end - features_no_v1_prefix_msg)
+    bl      emit_bytes
+    mov     w5, w9                      // dev_lo → hex
+    bl      emit_hex32
+    adr     x1, features_hi_sep_msg
+    mov     w2, #(features_hi_sep_msg_end - features_hi_sep_msg)
+    bl      emit_bytes
+    mov     w5, w7                      // dev_hi → hex
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lfeatures_fail_rejected:
+    // Device cleared FEATURES_OK after we set it, OR set an
+    // unexpected bit. w7 holds the observed status value.
+    adr     x1, features_rejected_msg
+    mov     w2, #(features_rejected_msg_end - features_rejected_msg)
+    bl      emit_bytes
+    mov     w5, w7                      // status → hex, post-emit_bytes
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
     b       .Lflush
 
 .Lstatus_fail:
@@ -199,7 +314,7 @@ _entry:
     bl      emit_bytes
     bl      emit_hex32
     adr     x1, newline_msg
-    mov     w2, #1
+    mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
     // Future VIO-009 set_failed helper will redirect here to
     // set the FAILED bit before halting. For now, fall through
@@ -215,7 +330,7 @@ _entry:
     mov     w5, w7                   // observed magic into w5 for emit_hex32
     bl      emit_hex32
     adr     x1, newline_msg
-    mov     w2, #1
+    mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
 
 .Lflush:
@@ -315,8 +430,25 @@ status_fail_msg:
     .ascii  "STATUS:FAIL status="
 status_fail_msg_end:
 
+features_ok_msg:
+    .ascii  "FEATURES:OK\n"
+features_ok_msg_end:
+
+features_no_v1_prefix_msg:
+    .ascii  "FEATURES:FAIL no-v1 dev_lo="
+features_no_v1_prefix_msg_end:
+
+features_hi_sep_msg:
+    .ascii  " dev_hi="
+features_hi_sep_msg_end:
+
+features_rejected_msg:
+    .ascii  "FEATURES:FAIL rejected status="
+features_rejected_msg_end:
+
 newline_msg:
     .ascii  "\n"
+newline_msg_end:
 
 // _image_end is defined in the linker script (placed after both .text
 // and .rodata) so the Image header's image_size covers the entire file.
