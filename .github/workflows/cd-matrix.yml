@@ -57,6 +57,32 @@ jobs:
       - name: pytest
         run: pytest -q --no-header
 
+  c-lint:
+    # Four-layer static analysis on the host-side crypto test
+    # drivers (tooling/crypto_tests/*.c): gcc + clang compile-as-
+    # lint, clang-tidy, cppcheck, scan-build. Each catches a
+    # different class of bug; combined runtime is seconds. Arch-
+    # neutral — runs once per push, not per matrix cell. Landed
+    # 2026-04-22 under the automation-cost-is-bounded discipline;
+    # Makefile target lives at tooling/crypto_tests/lint.
+    #
+    # Runner pinned to ubuntu-24.04 deliberately, not
+    # ubuntu-latest — clang-tidy's check set evolves across
+    # Ubuntu LTS versions, and that drift would flip the gate
+    # green / red independent of code changes. Bump deliberately.
+    name: C lint (clang-tidy + cppcheck + scan-build + gcc/clang -Werror)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C lint toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              gcc clang clang-tidy clang-tools cppcheck
+      - name: Lint
+        run: make -C tooling/crypto_tests lint
+
   build:
     strategy:
       fail-fast: false

@@ -1,0 +1,82 @@
+---
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Project-wide clang-tidy configuration for C code (host-side
+# test drivers under tooling/crypto_tests/, plus any future C
+# glue). Assembly lives in arch/<arch>/ and is out of scope for
+# clang-tidy — it analyses C, not asm.
+#
+# Check selection rationale:
+#   bugprone-*       — load-bearing correctness category.
+#   cert-*           — CERT C secure-coding rules; noisy but
+#                      catches integer-overflow and
+#                      string-handling classes cheaply.
+#   clang-analyzer-* — symbolic-execution checks. Redundant with
+#                      scan-build but having them fire in-tree
+#                      catches regressions at pre-push speed.
+#   performance-*    — narrow set that applies to C.
+#   portability-*    — same.
+#   readability-*    — formatting, control-flow, naming.
+#   misc-*           — miscellaneous correctness.
+#
+# Disabled sub-checks:
+#   readability-magic-numbers           — crypto test drivers are
+#                                         full of intentional
+#                                         magic (vector table
+#                                         indices, hash-constant
+#                                         expected values).
+#   readability-identifier-length       — single-letter names
+#                                         (i, j, k loop indices,
+#                                         ch/cl/cx register-mirror
+#                                         variable names) are
+#                                         idiomatic here.
+#   readability-function-cognitive-complexity
+#                                       — test drivers have a
+#                                         single big main() that
+#                                         invokes every vector;
+#                                         not refactoring to
+#                                         satisfy the limit.
+#   readability-isolate-declaration     — multi-variable
+#                                         declarations (``int
+#                                         i, j, k;``) are
+#                                         idiomatic C, not a
+#                                         correctness concern.
+#   clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+#                                       — demands C11 Annex K
+#                                         `_s`-suffixed variants
+#                                         (memcpy_s, strcpy_s)
+#                                         which aren't
+#                                         universally available
+#                                         (glibc doesn't ship
+#                                         them; Annex K adoption
+#                                         has been poor). Plain
+#                                         memcpy/memset with
+#                                         known bounds is
+#                                         correct C, not
+#                                         "insecure."
+#
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  misc-*,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-function-cognitive-complexity,
+  -readability-isolate-declaration,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+
+WarningsAsErrors: '*'
+
+HeaderFilterRegex: '(tooling/crypto_tests|arch/[^/]+/crypto)/.*\.h'
+
+FormatStyle: none
+
+CheckOptions:
+  # Allow ALL_CAPS for macro constants (cert-dcl37-c requires
+  # uppercase but some bugprone-* checks want the reverse).
+  - key: readability-identifier-naming.MacroDefinitionCase
+    value: UPPER_CASE

@@ -56,6 +56,34 @@ CRC_HDRS := vectors.h
 SHA_SRCS := sha256_test.c
 SHA_HDRS := sha256_vectors.h
 
+# -- Lint stack ----------------------------------------------------
+# Four independent static-analysis layers per D-series discipline
+# (automation cost is bounded; bug cost is not). Each catches a
+# different class of bug:
+#   gcc compile-as-lint   — strict warnings + -Werror
+#   clang compile-as-lint — same flags, different compiler;
+#                           divergences between the two ARE the
+#                           signal
+#   clang-tidy            — semantic checks via .clang-tidy config
+#   cppcheck              — complementary engine (UB detection,
+#                           buffer bounds, leaks)
+#   scan-build            — clang static analyzer with full
+#                           symbolic execution, deeper than
+#                           clang-tidy's clang-analyzer-* subset
+GCC_HOST      ?= gcc
+CLANG_HOST    ?= clang
+CLANG_TIDY    ?= clang-tidy
+CPPCHECK      ?= cppcheck
+SCAN_BUILD    ?= scan-build
+
+LINT_CFLAGS   := -Wall -Wextra -Wpedantic -Werror -Wshadow \
+                 -Wstrict-prototypes -Wmissing-prototypes \
+                 -Wdouble-promotion -Wformat=2 \
+                 -Wcast-align -Wconversion \
+                 -std=c11
+
+LINT_SRCS     := $(CRC_SRCS) $(SHA_SRCS)
+
 .PHONY: all \
         build-x86_64 build-aarch64 \
         build-x86_64-crc32 build-aarch64-crc32 \
@@ -65,6 +93,8 @@ SHA_HDRS := sha256_vectors.h
         test-x86_64-sha256 test-x86_64-sha256-native \
         test-x86_64-sha256-shani test-x86_64-sha256-shani-max \
         test-aarch64-sha256 \
+        lint lint-gcc lint-clang lint-clang-tidy \
+        lint-cppcheck lint-scan-build \
         clean
 
 all: $(X86_CRC_BIN) $(AARCH_CRC_BIN) $(X86_SHA_BIN) $(AARCH_SHA_BIN)
@@ -129,6 +159,48 @@ test-x86_64-sha256-shani-max: $(X86_SHA_BIN)
 
 test-aarch64-sha256: $(AARCH_SHA_BIN)
 	$(QEMU_AARCH64) $(AARCH_SHA_BIN)
+
+lint: lint-gcc lint-clang lint-clang-tidy lint-cppcheck lint-scan-build
+
+lint-gcc:
+	@echo "=== gcc compile-as-lint ==="
+	@for src in $(LINT_SRCS); do \
+	    echo "  [gcc] $$src"; \
+	    $(GCC_HOST) $(LINT_CFLAGS) -c -o /dev/null $$src || exit 1; \
+	done
+
+lint-clang:
+	@echo "=== clang compile-as-lint ==="
+	@for src in $(LINT_SRCS); do \
+	    echo "  [clang] $$src"; \
+	    $(CLANG_HOST) $(LINT_CFLAGS) -c -o /dev/null $$src || exit 1; \
+	done
+
+lint-clang-tidy:
+	@echo "=== clang-tidy ==="
+	$(CLANG_TIDY) $(LINT_SRCS) -- $(LINT_CFLAGS)
+
+lint-cppcheck:
+	@echo "=== cppcheck ==="
+	$(CPPCHECK) --enable=warning,performance,portability,style \
+	    --error-exitcode=1 --inline-suppr \
+	    --suppress=missingIncludeSystem \
+	    --std=c11 -I. $(LINT_SRCS)
+
+lint-scan-build:
+	@echo "=== scan-build (clang static analyzer) ==="
+	@# -disable-checker matches the .clang-tidy disable: C11 Annex K
+	@# `_s`-suffixed functions aren't universally available, so plain
+	@# memcpy/memset with known bounds is correct C, not "insecure."
+	@for src in $(LINT_SRCS); do \
+	    echo "  [scan-build] $$src"; \
+	    $(SCAN_BUILD) --status-bugs \
+	        -enable-checker security -enable-checker unix \
+	        -enable-checker nullability \
+	        -disable-checker security.insecureAPI.DeprecatedOrUnsafeBufferHandling \
+	        $(CLANG_HOST) $(LINT_CFLAGS) -c -o /dev/null $$src \
+	            || exit 1; \
+	done
 
 clean:
 	rm -rf $(BUILD_DIR)

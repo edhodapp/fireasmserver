@@ -76,6 +76,36 @@ run_crc_tests() {
     make -C tooling/crypto_tests -s test
 }
 
+run_c_gates() {
+    echo
+    echo "=== pre-push: C linter stack ==="
+    # Four-layer static analysis over the host-side crypto test
+    # drivers: gcc + clang compile-as-lint, clang-tidy, cppcheck,
+    # scan-build. Each catches a different class of bug and the
+    # combined runtime is seconds — per the 2026-04-22 automation-
+    # cost-is-bounded discipline, all four run every push.
+    #
+    # FAIL on missing tools, don't SKIP. An un-linted push is
+    # exactly the "unwired gate" the complete-pipeline-before-
+    # shipping discipline forbids. Install via:
+    #   sudo apt install clang clang-tidy clang-tools cppcheck
+    local missing=()
+    local tool
+    for tool in clang clang-tidy cppcheck scan-build; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing+=("$tool")
+        fi
+    done
+    if [[ ${#missing[@]} -ne 0 ]]; then
+        echo "FAIL: C lint toolchain incomplete — missing:" \
+            "${missing[*]}"
+        echo "  install: sudo apt install clang clang-tidy" \
+            "clang-tools cppcheck"
+        return 1
+    fi
+    make -C tooling/crypto_tests -s lint
+}
+
 run_pytest_suite() {
     echo
     echo "=== pre-push: full pytest suite ==="
@@ -117,6 +147,7 @@ run_local_cell x86_64  firecracker   || fail=1
 # tests that exercise every branch.
 run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
+run_c_gates                          || fail=1
 run_crc_tests                        || fail=1
 run_pytest_suite                     || fail=1
 run_ontology_audit                   || fail=1

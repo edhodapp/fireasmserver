@@ -42,15 +42,15 @@ extern uint32_t crc32_ieee_802_3_has_pclmulqdq(void)
  * that the assembly matches the specification. */
 static uint32_t crc32_ref(const void *data, size_t len) {
     const unsigned char *p = (const unsigned char *)data;
-    uint32_t crc = 0xFFFFFFFFu;
+    uint32_t crc = 0xFFFFFFFFU;
     for (size_t i = 0; i < len; ++i) {
         crc ^= p[i];
         for (int k = 0; k < 8; ++k) {
-            uint32_t mask = -(crc & 1u);
-            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+            uint32_t mask = -(crc & 1U);
+            crc = (crc >> 1) ^ (0xEDB88320U & mask);
         }
     }
-    return crc ^ 0xFFFFFFFFu;
+    return crc ^ 0xFFFFFFFFU;
 }
 
 static const unsigned char vec_a[]          = "a";
@@ -62,13 +62,13 @@ static unsigned char vec_1024_zero[1024];
 static unsigned char vec_1024_ff[1024];
 
 static const struct crc_vector VECTORS[] = {
-    { "empty",          NULL,           0,    0x00000000u },
-    { "a",              vec_a,          1,    0xE8B7BE43u },
-    { "abc",            vec_abc,        3,    0x352441C2u },
-    { "message digest", vec_msg_digest, 14,   0x20159D7Fu },
-    { "alphabet",       vec_alphabet,   26,   0x4C2750BDu },
-    { "1024 x 0x00",    vec_1024_zero,  1024, 0xEFB5AF2Eu },
-    { "1024 x 0xFF",    vec_1024_ff,    1024, 0xB83AFFF4u },
+    { "empty",          NULL,           0,    0x00000000U },
+    { "a",              vec_a,          1,    0xE8B7BE43U },
+    { "abc",            vec_abc,        3,    0x352441C2U },
+    { "message digest", vec_msg_digest, 14,   0x20159D7FU },
+    { "alphabet",       vec_alphabet,   26,   0x4C2750BDU },
+    { "1024 x 0x00",    vec_1024_zero,  1024, 0xEFB5AF2EU },
+    { "1024 x 0xFF",    vec_1024_ff,    1024, 0xB83AFFF4U },
 };
 #define N_VECTORS (sizeof VECTORS / sizeof VECTORS[0])
 
@@ -100,7 +100,7 @@ static int sweep_vs_reference(const struct path_spec *p) {
      * 16 folds at length 256). */
     unsigned char buf[256];
     for (size_t i = 0; i < sizeof buf; ++i) {
-        buf[i] = (unsigned char)((i * 37u + 13u) & 0xFFu);
+        buf[i] = (unsigned char)((i * 37U + 13U) & 0xFFU);
     }
     int failures = 0;
     for (size_t len = 0; len <= sizeof buf; ++len) {
@@ -121,7 +121,7 @@ static int check_crossarch_agreement(void) {
     int failures = 0;
     unsigned char buf[256];
     for (size_t i = 0; i < sizeof buf; ++i) {
-        buf[i] = (unsigned char)((i * 37u + 13u) & 0xFFu);
+        buf[i] = (unsigned char)((i * 37U + 13U) & 0xFFU);
     }
     if (crc32_ieee_802_3_slice8 && crc32_ieee_802_3_pclmulqdq) {
         for (size_t len = 0; len <= sizeof buf; ++len) {
