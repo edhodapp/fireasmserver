@@ -100,16 +100,16 @@ aes128_rcon:
 // Register map:
 //   x0   key (caller-provided, read once)
 //   x1   round_keys base (persistent across iterations)
-//   x2   S-box base
 //   x3   Rcon base
 //   x4   round counter 0..10 (pre-incremented: 1..10 in body)
 //   w5-w8 running words w[4(i-1)..4i-1] for current round
 //   w9   temp: RotWord(w[4i-1])
 //   w10  accumulator for SubWord(temp)
-//   w11  byte-index scratch
-//   w12  byte-lookup scratch
+//   w11  byte-extract scratch (ubfx destination / umov destination)
 //   w13  Rcon byte for this iteration
 //   x14  store-address scratch
+//   v0   SubWord scratch vector (bytes placed at positions 0/4/8/12)
+//   v1   zero round key for the aese-as-SubBytes trick (loop-invariant)
 // ===============================================================
     .globl  aes128_expand_key
     .type   aes128_expand_key, %function
