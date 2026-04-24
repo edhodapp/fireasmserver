@@ -55,6 +55,7 @@
 .equ VIRTIO_MMIO_QUEUE_NUM_MAX,       0x034
 .equ VIRTIO_MMIO_QUEUE_NUM,           0x038
 .equ VIRTIO_MMIO_QUEUE_READY,         0x044
+.equ VIRTIO_MMIO_QUEUE_NOTIFY,        0x050
 .equ VIRTIO_MMIO_STATUS,              0x070
 .equ VIRTIO_MMIO_QUEUE_DESC_LOW,      0x080
 .equ VIRTIO_MMIO_QUEUE_DESC_HIGH,     0x084
@@ -84,6 +85,19 @@
 .equ VIRTQ_MAX_SIZE,    0x100
 .equ RX_QUEUE_BASE,     VIRTQ_BASE + 0 * VIRTQ_STRIDE
 .equ TX_QUEUE_BASE,     VIRTQ_BASE + 1 * VIRTQ_STRIDE
+
+// Virtqueue descriptor flag bits (Virtio 1.2 §2.7.5.1).
+.equ VIRTQ_DESC_F_NEXT,     1    // buffer continues via next field
+.equ VIRTQ_DESC_F_WRITE,    2    // device may write (RX buffer)
+.equ VIRTQ_DESC_F_INDIRECT, 4    // descriptor points at a chain
+
+// RX buffer pool. 256 buffers × 2 KiB = 512 KiB. Placed directly
+// above the virtqueue pages (which end at VIRTQ_BASE + 2 × stride
+// = 0x80406000). At 0x80500000 we have comfortable padding; ends
+// at 0x80580000, well within the 128 MiB guest RAM ceiling of
+// 0x88000000.
+.equ RX_BUFFER_BASE,    0x80500000
+.equ RX_BUFFER_SIZE,    0x800     // 2 KiB
 
 // Device Status bit values (Virtio 1.2 §2.1). Bit-position numbering
 // matches the REQUIREMENTS.md VIO table. Shared across arches.
@@ -508,6 +522,95 @@ _entry:
     adr     x1, driver_ok_msg
     mov     w2, #(driver_ok_msg_end - driver_ok_msg)
     bl      emit_bytes
+
+    // --- VIO-R-002: pre-populate RX queue with WRITE-flagged buffers ---
+    // Virtio 1.2 §5.1.6.3 — the driver pre-populates RX before
+    // the device has anything to deposit. DRIVER_OK just
+    // asserted, so the device is live and starts consuming
+    // these buffers as soon as AvailRing.idx advances + the
+    // notify lands.
+    //
+    // All 256 RX slots get filled: each descriptor points at a
+    // distinct 2 KiB buffer in the pool at RX_BUFFER_BASE.
+    // No descriptor chaining (VIRTIO_NET_F_MRG_RXBUF not
+    // negotiated under the VIO-F-001 MVP subset — every frame
+    // must fit in one descriptor).
+    //
+    // Order per §2.7.13 / §2.7.11:
+    //   1. Fill descriptor table entries
+    //   2. Fill AvailRing.ring[0..N-1] with indices 0..N-1
+    //   3. dsb — driver's writes drain before idx bump
+    //   4. Publish AvailRing.idx = N
+    //   5. dsb — idx bump drains before notify
+    //   6. Write 0 to VIRTIO_MMIO_QUEUE_NOTIFY (kick RX)
+    //
+    // Register use inside the loop:
+    //   x11 = RX_QUEUE_BASE (u32 loaded via ldr w11,= + zext to x11)
+    //   x10 = loop counter i (0..255)
+    //   x12 = descriptor entry pointer
+    //   x13 = buffer physical address
+    //   x14, x15 = scratch
+    // None live across the subsequent emit_bytes call.
+    ldr     w11, =RX_QUEUE_BASE
+    // Hoist RX_BUFFER_BASE out of the loop; we add the per-iter
+    // offset on each pass. Saves 256 redundant movz+movk pairs
+    // at init time.
+    ldr     w9, =RX_BUFFER_BASE
+    mov     x10, xzr
+
+.Lrx_fill_loop:
+    // desc[i] at RX_QUEUE_BASE + VIRTQ_OFF_DESC + 16*i.
+    // (VIRTQ_OFF_DESC = 0 so the add is a no-op; left explicit
+    // for symmetry with avail/used ring addressing below.)
+    lsl     x12, x10, #4
+    add     x12, x11, x12
+
+    // buffer_i = RX_BUFFER_BASE + 2048*i. w9 holds the hoisted
+    // base; x14 is the per-iter byte offset.
+    lsl     x14, x10, #11
+    add     x13, x9, x14
+
+    // addr_lo + addr_hi (pool is < 4 GiB so hi = 0).
+    str     w13, [x12]
+    str     wzr, [x12, #4]
+    // len = 2048.
+    mov     w14, #RX_BUFFER_SIZE
+    str     w14, [x12, #8]
+    // flags = VIRTQ_DESC_F_WRITE (device may write frame bytes).
+    mov     w14, #VIRTQ_DESC_F_WRITE
+    strh    w14, [x12, #12]
+    // next = 0 (no chain).
+    strh    wzr, [x12, #14]
+
+    // AvailRing.ring[i] = i. Slot addr = RX_QUEUE_BASE +
+    // VIRTQ_OFF_AVAIL + 4 (past flags + idx header) + 2*i.
+    add     x14, x11, #VIRTQ_OFF_AVAIL
+    add     x14, x14, #4
+    strh    w10, [x14, x10, lsl #1]
+
+    add     x10, x10, #1
+    cmp     x10, #VIRTQ_MAX_SIZE
+    b.lo    .Lrx_fill_loop
+
+    // Drain descriptor/ring stores before idx bump.
+    dsb     sy
+
+    // AvailRing.idx = 256 at offset +2 of the avail region.
+    add     x14, x11, #VIRTQ_OFF_AVAIL
+    mov     w15, #VIRTQ_MAX_SIZE
+    strh    w15, [x14, #2]
+
+    // Drain idx bump before notify.
+    dsb     sy
+
+    // QueueNotify(0) — kicks the RX queue. Write-only register;
+    // no read-back available.
+    str     wzr, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
+    dsb     sy
+
+    adr     x1, rx_populated_msg
+    mov     w2, #(rx_populated_msg_end - rx_populated_msg)
+    bl      emit_bytes
     b       .Lflush
 
 .Ldriver_ok_fail:
@@ -766,6 +869,10 @@ driver_ok_msg_end:
 driver_ok_fail_msg:
     .ascii  "DRIVER_OK:FAIL status="
 driver_ok_fail_msg_end:
+
+rx_populated_msg:
+    .ascii  "RX:POPULATED\n"
+rx_populated_msg_end:
 
 newline_msg:
     .ascii  "\n"
