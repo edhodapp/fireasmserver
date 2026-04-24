@@ -294,6 +294,25 @@ _start:
     mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], 0
     mfence
 
+    ; Virtio 1.2 §4.2.4: after writing 0 to Status the driver
+    ; MUST wait until a read returns 0 before re-initializing.
+    ; Firecracker's MMIO is synchronous today so the first read
+    ; succeeds, but polling matches the spec and surfaces if a
+    ; future VMM ever goes async. Bounded iteration count
+    ; survives a wedged device; on timeout we fall through and
+    ; let the subsequent VIO-002 RMW catch the anomaly via
+    ; .status_fail's equality-compare.
+    mov ecx, 0x100000
+.reset_wait:
+    lfence
+    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    lfence
+    test eax, eax
+    jz  .reset_done
+    dec ecx
+    jnz .reset_wait
+.reset_done:
+
     ; VIO-002: read-modify-write ACKNOWLEDGE.
     lfence
     mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]

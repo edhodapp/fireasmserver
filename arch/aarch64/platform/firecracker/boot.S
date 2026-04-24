@@ -301,6 +301,24 @@ _entry:
     str     wzr, [x6, #VIRTIO_MMIO_STATUS]
     dsb     sy
 
+    // Virtio 1.2 §4.2.4: after writing 0 to Status the driver
+    // MUST wait until a read returns 0 before re-initializing.
+    // Firecracker's MMIO is synchronous today so the first
+    // read succeeds, but polling matches the spec and surfaces
+    // if a future VMM ever goes async. Bounded iteration count
+    // survives a wedged device; on timeout we fall through and
+    // let the subsequent VIO-002 RMW catch the anomaly via
+    // .Lstatus_fail's equality-compare.
+    mov     w10, #0x100000
+.Lreset_wait:
+    dsb     sy
+    ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
+    dsb     sy
+    cbz     w7, .Lreset_done
+    subs    w10, w10, #1
+    b.ne    .Lreset_wait
+.Lreset_done:
+
     // VIO-002: RMW ACKNOWLEDGE.
     dsb     sy
     ldr     w7, [x6, #VIRTIO_MMIO_STATUS]
