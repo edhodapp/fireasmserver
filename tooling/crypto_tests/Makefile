@@ -298,3 +298,13 @@ lint-scan-build:
 
 clean:
 	rm -rf $(BUILD_DIR)
+	# Cascade into the arch-side crypto build dirs. Without this,
+	# a `make clean && make test` cycle in this directory leaves
+	# the asm .o files (arch/<isa>/crypto/build/*.o) stale —
+	# they get rebuilt only when the .S file is newer. Symptom
+	# observed 2026-04-23 while working on pt-zero-on-mismatch:
+	# the test harness ran against a pre-edit binary and passed
+	# with outdated semantics. Cascading the clean here makes
+	# `make clean && make test` rebuild everything end-to-end.
+	$(MAKE) -C $(REPO_ROOT)/arch/x86_64/crypto clean
+	$(MAKE) -C $(REPO_ROOT)/arch/aarch64/crypto clean
