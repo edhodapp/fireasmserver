@@ -372,6 +372,89 @@ aes128_routine = Entity(
 )
 
 
+# The AES-128-GCM AEAD routine (NIST SP 800-38D). Anchor for
+# AES128-GCM-* constraints. Composes aes128_encrypt_block for
+# CTR keystream generation + GHASH over GF(2^128) for the
+# authentication tag. Primary workhorse AEAD for TLS 1.3 cipher
+# suite TLS_AES_128_GCM_SHA256 and the corresponding TLS 1.2
+# cipher suites. Round III of the side-session crypto workstream.
+aes128_gcm_routine = Entity(
+    id="aes128-gcm-routine",
+    name="AES128GcmRoutine",
+    description=(
+        "The host-callable AES-128-GCM AEAD — "
+        "`aes128_gcm_encrypt` takes (key, iv, aad, aad_len, pt, "
+        "pt_len) and produces (ct, tag); `aes128_gcm_decrypt` "
+        "takes (key, iv, aad, aad_len, ct, ct_len, tag) and "
+        "produces (pt, verify_result). IV is fixed 96 bits per "
+        "NIST SP 800-38D §5.2.1.1; the 32-bit counter is "
+        "derived per spec. Tag is a full 16 bytes. Tag "
+        "comparison is constant-time via 64-bit OR-fold; on "
+        "mismatch the plaintext buffer contents are "
+        "indeterminate per standard AEAD contract. GHASH ships "
+        "as a branch-free bit-serial GF(2^128) multiply in GPRs "
+        "(correctness-first first attempt); the hardware-"
+        "accelerated path (PCLMULQDQ on x86_64, PMULL on "
+        "aarch64) lands as a drop-in replacement under the same "
+        "contract and is tracked separately."
+    ),
+    properties=[
+        Property(
+            name="key_size",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "AES-128 key size in bytes. Always 16."
+            ),
+        ),
+        Property(
+            name="iv_size",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "IV size in bytes. Always 12 (96 bits) per "
+                "NIST SP 800-38D §5.2.1.1; other IV lengths "
+                "would require running GHASH over the IV, "
+                "which this primitive does not support."
+            ),
+        ),
+        Property(
+            name="tag_size",
+            property_type=PropertyType(kind="int"),
+            description=(
+                "Authentication tag size in bytes. Always 16 "
+                "(128 bits). Truncated-tag variants are not "
+                "supported."
+            ),
+        ),
+        Property(
+            name="aad_length_domain",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "Legal additional-authenticated-data length "
+                "range in bytes. NIST SP 800-38D §5.2.1.1 caps "
+                "AAD at 2^61 - 1 bytes (≈ 2 EiB); no realistic "
+                "caller approaches the bound. Per D032, no "
+                "runtime check is required for an input no "
+                "caller can reach."
+            ),
+        ),
+        Property(
+            name="pt_length_domain",
+            property_type=PropertyType(kind="str"),
+            description=(
+                "Legal plaintext length range in bytes. NIST "
+                "SP 800-38D §5.2.1.1 caps plaintext at "
+                "2^36 - 32 bytes (≈ 64 GiB) per IV/key pair "
+                "to preserve CTR uniqueness. Per D055 the "
+                "public API applies a length clamp at the "
+                "caller boundary to keep this bound a code "
+                "invariant rather than a trust-the-caller "
+                "precondition."
+            ),
+        ),
+    ],
+)
+
+
 # The ARP packet format (RFC 826). Anchor for ARP-001..011 in
 # L2 requirements. ARP runs over Ethernet but its packet shape
 # is a distinct object from the frame that carries it, so
@@ -1789,6 +1872,100 @@ constraints = [
         status="implemented",
     ),
 
+    # -- Crypto-layer primitives: AES-128-GCM AEAD --
+    DomainConstraint(
+        name="AES128-GCM-001",
+        description=(
+            "AES-128-GCM AEAD conforms to NIST SP 800-38D "
+            "§7.1-7.2 with byte-level equivalence against the "
+            "SP 800-38D Appendix B TC1-TC4 test vectors on "
+            "both arches. Supports 96-bit IVs only (J0 = "
+            "IV || 0x00000001 per §5.2.1.1); 128-bit fixed "
+            "tags; constant-time tag comparison via 64-bit "
+            "OR-fold. On tag mismatch, plaintext buffer "
+            "contents are indeterminate per the AEAD contract. "
+            "Composes aes128_encrypt_block for CTR keystream "
+            "generation over (J0+1, J0+2, ...). x86_64 "
+            "additionally cross-checks under AES-NI-enabled "
+            "fork-qemu cells (-cpu Denverton and -cpu max)."
+        ),
+        entity_ids=["aes128-gcm-routine"],
+        rationale=(
+            "NIST SP 800-38D §5 (algorithm specification), "
+            "§7.1-7.2 (encrypt/decrypt procedures), §5.2.1.1 "
+            "(96-bit IV construction), Appendix B (test "
+            "vectors). RFC 5288 for the TLS 1.2 mapping. "
+            "RFC 8446 §5.2 for the TLS 1.3 cipher suite "
+            "TLS_AES_128_GCM_SHA256. D032 (crypto-math "
+            "strategy: ISA-idiomatic, macros-first, constant-"
+            "time). D055 (external-input length clamp at the "
+            "public crypto API boundary). D057 (AES-NI "
+            "required at runtime; no scalar fallback — "
+            "consumed transitively via aes128_encrypt_block)."
+        ),
+        implementation_refs=[
+            "arch/x86_64/crypto/aes128_gcm.S:aes128_gcm_encrypt",
+            "arch/x86_64/crypto/aes128_gcm.S:aes128_gcm_decrypt",
+            "arch/x86_64/crypto/aes128_gcm.S:aes128_gcm_has_pclmulqdq",
+            "arch/aarch64/crypto/aes128_gcm.S:aes128_gcm_encrypt",
+            "arch/aarch64/crypto/aes128_gcm.S:aes128_gcm_decrypt",
+        ],
+        verification_refs=[
+            "tooling/tests/test_aes128_gcm.py",
+            "tooling/crypto_tests/aes128_gcm_test.c",
+        ],
+        status="implemented",
+    ),
+
+    # Deviation from the intended D057 no-scalar-fallback posture
+    # for the GHASH path. Tracked explicitly per "Track every
+    # requirements deviation" — documenting the temporary state
+    # and the replacement plan prevents it from becoming a silent
+    # latent bug.
+    DomainConstraint(
+        name="AES128-GCM-002",
+        description=(
+            "GHASH GF(2^128) multiply currently ships as a "
+            "branch-free bit-serial 128-iteration loop in GPRs "
+            "on both arches, not the hardware-accelerated "
+            "PCLMULQDQ (x86_64) / PMULL (aarch64) path that "
+            "production TLS 1.3 throughput will require. "
+            "Correctness-first: the bit-serial path is constant-"
+            "time by construction (fixed iteration count, no "
+            "data-dependent branches, no table lookups) and "
+            "was cross-validated byte-for-byte against an "
+            "in-driver portable-C reference over SP 800-38D "
+            "Appendix B vectors, a 32-case deterministic sweep, "
+            "and 4x128 single-bit tag-forgery rejection. The "
+            "hardware-accelerated path lands as a drop-in "
+            "replacement under the same contract and the same "
+            "test vectors; at that point AES128-GCM-002 is "
+            "superseded by a new constraint making PCLMULQDQ/"
+            "PMULL runtime-required analogous to D057 for "
+            "AES-NI."
+        ),
+        entity_ids=["aes128-gcm-routine"],
+        rationale=(
+            "Side-session 2026-04-23 deliberate choice to ship "
+            "a correct bit-serial path first and replace with "
+            "the hardware-accelerated path under differential "
+            "regression testing. Documents the temporary "
+            "deviation so it cannot be rediscovered later "
+            "without context. Candidate D-entry for the "
+            "eventual no-scalar-fallback codification is "
+            "tracked separately."
+        ),
+        implementation_refs=[
+            "arch/x86_64/crypto/aes128_gcm.S:__gcm_ghash_mul",
+            "arch/aarch64/crypto/aes128_gcm.S:__gcm_ghash_mul",
+        ],
+        verification_refs=[
+            "tooling/tests/test_aes128_gcm.py",
+            "tooling/crypto_tests/aes128_gcm_test.c",
+        ],
+        status="deviation",
+    ),
+
     # -- L2 product constraints: Ethernet-layer primitives --
     DomainConstraint(
         name="ETH-005",
@@ -2613,6 +2790,38 @@ verification_cases = [
         ),
     ),
     VerificationCase(
+        name="aes128-gcm-primitive",
+        covers=["AES128-GCM-001", "AES128-GCM-002"],
+        tier="A",
+        status="passing",
+        implementation_refs=[
+            "tooling/tests/test_aes128_gcm.py",
+            "tooling/crypto_tests/aes128_gcm_test.c",
+        ],
+        rationale=(
+            "Unit-level verification of the AES-128-GCM AEAD "
+            "primitive on both arches against NIST SP 800-38D "
+            "Appendix B TC1-TC4, a 32-case deterministic "
+            "(seeded) sweep, and a 4x128 single-bit "
+            "tag-forgery rejection test (every single-bit "
+            "flip of a valid tag across 4 distinct vectors "
+            "must decrypt-fail). An in-driver portable-C "
+            "AES-128-GCM reference composes a reference "
+            "aes128_encrypt_block with a reference GHASH and "
+            "cross-checks every vector and every sweep block "
+            "byte-for-byte — two independent attempts at the "
+            "same answer, no OpenSSL dependency. Four cells: "
+            "x86_64 native, fork-qemu under -cpu Denverton "
+            "and -cpu max (D054 sandbox advertises AES-NI + "
+            "PCLMULQDQ under both), aarch64 via "
+            "qemu-aarch64-static with FEAT_AES emulated. "
+            "Covers the intentional bit-serial-GHASH deviation "
+            "(AES128-GCM-002) by running the same regression "
+            "suite the hardware-accelerated replacement must "
+            "pass when it lands."
+        ),
+    ),
+    VerificationCase(
         name="virtio-init-sequence",
         covers=[
             "VIO-001", "VIO-002", "VIO-003", "VIO-004",
@@ -2655,7 +2864,8 @@ ontology = Ontology(
     entities=[
         guest_image, vm_instance, test_case, test_result,
         fsa_transition, ethernet_frame, virtio_net_device,
-        sha256_routine, aes128_routine, arp_packet,
+        sha256_routine, aes128_routine, aes128_gcm_routine,
+        arp_packet,
         observability_event_site,
     ],
     relationships=[boots_rel, runs_against_rel, produces_rel],
