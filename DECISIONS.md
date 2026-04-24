@@ -2505,6 +2505,445 @@ Ed's explicit "multiprocessing is a bug minefield; break
 mutable sharing now; use queues between processes" framing.
 
 
+### D059: Init-time static memory layout — modules declare, init-code assigns, then freeze
+
+**Decision (2026-04-23):** memory in fireasmserver is statically
+allocated, but the layout is computed at boot time rather than
+hardcoded as `.equ` constants. Each module (virtio driver, FSA
+runtime, per-core actor, TLS state machine, WASM engine, RX/TX
+buffer pools, stacks) declares its memory requirements as data
+— owner, lifetime tag, writability, and an expression for size
+and alignment — and a bump allocator runs once during early boot
+to assign absolute addresses. Once the `init_complete` fence
+fires, the layout is frozen for the lifetime of the VM. No
+allocator runs at steady state; no region is ever freed,
+resized, relocated, or reused. D059 states the **layout pattern**;
+D060 states the **parameterization model** (cpu characteristics,
+tuning profiles, bytecode expression language) that makes D059
+workable across CPU families.
+
+**Three modes distinguished:**
+
+1. **Pure-static-hardcoded** — every address is a compile-time
+   `.equ`. The assembler and the human pick every constant by
+   hand. Fragile: nothing enforces non-overlap, growth paths
+   converge, hand-edits drift. What the aarch64/firecracker
+   stub looked like on 2026-04-23.
+2. **Dynamic** (Linux `malloc`/`kmalloc`, jemalloc, buddy
+   allocators, GC heaps) — allocator is live at steady state;
+   bookkeeping, fragmentation, lock contention, shared mutable
+   state across cores. Explicitly rejected.
+3. **Init-time-static (this decision)** — bump allocator runs
+   once at boot, walks module requests, computes the layout,
+   returns absolute addresses. After init, the allocator is
+   code that never runs again. Every address still satisfies
+   "owned by actor N for its lifetime" or "immutable after
+   init-complete fence" per D058.
+
+**Why this is load-bearing, not a convenience:**
+
+- **D058 is preserved by construction.** The init allocator
+  runs serially on the boot core, before any worker core
+  leaves its holding WFE. No cross-core contention; no shared
+  mutable state at steady state (the bump pointer is dead
+  code after init). Layout is computed once, then readable-
+  only.
+- **Pure static breaks at scale.** Every new data structure
+  today is a human-picked absolute constant (`RX_BUFFER_BASE
+  = 0x80500000`). Nothing in the build prevents two authors
+  (or two side sessions) from colliding on the same region.
+  The stack-vs-image growth-toward-each-other topology
+  flagged by Gemini on 2026-04-23 (stack top at `0x80200000`,
+  image at `0x80080000`, 1.5 MiB pool they grow into from
+  opposite ends) is an instance: nothing warns you when the
+  two meet.
+- **The advantage this illustrates about working in
+  100% assembly.** We are not forced to pick between
+  "hardcode everything" and "ship a kernel-grade allocator."
+  We control the whole machine; we can afford a small
+  straight-line bump allocator that runs exactly once and
+  whose output is just a table of addresses the rest of the
+  server uses. Neither C-with-malloc nor a Linux-style
+  MMU/page-allocator would match this cleanly; both are
+  designed for workloads where memory shape changes at
+  steady state. Ours does not.
+- **The ontology gets a new entity kind.** A `MemoryRegion`
+  with fields `{owner, size, alignment, lifetime, writable-
+  after-init}` is exactly the shape the SysE-grade ontology
+  already tracks. The TLA+ spec can add a safety invariant:
+  "no two regions overlap," TLC-checked on the actual
+  declarations.
+- **Actor architecture gets cleaner per-core setup.** When a
+  worker core boots, its FSA runtime's actor pools, queue
+  buffers, and per-core stack are just addresses looked up
+  in the frozen layout table. No per-core allocator needed.
+
+**What this permits:**
+
+- Modules MAY declare multiple distinct regions (RX pool, TX
+  pool, descriptor tables, per-actor state blocks).
+- Regions MAY have alignment constraints larger than the
+  allocator's natural alignment (e.g., 4 KiB for virtqueue
+  pages, 64 KiB for future hugepage placement).
+- Regions MAY be tagged `init-only` (scratch during boot),
+  `steady-state` (normal working memory),
+  `immutable-after-init` (config, certs, trust store, compiled
+  code — write-protected when MMU lands; contract-enforced
+  today), or `stack` (top-of-RAM, grows down).
+- Per-core stacks are regions like any other; they are the
+  highest-addressed regions, grow down into unused RAM, and
+  never converge on the image.
+
+**What this forbids:**
+
+- No allocator at steady state. The bump pointer is dead
+  code after init-complete; any later allocation request is
+  a design bug, not a runtime fallback.
+- No region resize or relocation. If a module's working set
+  outgrows its region, the fix is at the declaration site,
+  rebuilt and re-booted — not at runtime.
+- No region aliasing: two modules cannot share a writable
+  region. Read-only shared regions (trust store, compiled
+  WASM) are permitted and tagged explicitly.
+- No per-core allocators that run *after* the boot core's
+  init allocator finishes. Worker cores receive their
+  regions via the frozen layout table; they do not compute
+  their own.
+
+**Build-time profile selection (settled 2026-04-23).**
+A single profile is baked into each build: `make PROFILE=<name>`
+selects `arch/<isa>/profiles/<name>.asm`. The selected profile
+is embedded in `.rodata`; the artifact name carries the profile
+(`kernel-<arch>-<platform>-<profile>.elf`). Operators pick the
+binary that matches their workload; there is no runtime
+selection knob. Multi-profile-in-image with runtime cmdline
+selection is explicitly deferred — the tuning_profile symbol
+and the phase-1 allocator step are named and shaped to permit
+that extension as an additive change if demand emerges.
+
+**Unknown-CPU posture (settled 2026-04-23).** On a CPU model the
+known-model table does not recognize, fall back to conservative
+defaults (64-byte cache line, 32 KiB L1, 256 KiB L2, no cache
+sharing) and emit `UNKNOWN-CPU model=<XX:YY:Z>` on serial. Boot
+proceeds. The "Software should be like air" axiom favors
+running reliably-if-sub-optimally over refusing-to-boot; the
+log line is the customer's explicit signal that a tuned profile
+is available on request.
+
+**Pre-stack bootstrap.** The init allocator must run before any
+call-stack exists. Each arch reserves a ~64-byte bootstrap
+scratch in `.bss` (`__bootstrap_stack_top`) for the allocator's
+leaf needs; the real stack region(s) are declared in the memreq
+table and their addresses are installed into SP/ESP after the
+allocator completes.
+
+**Retrofit order:**
+
+1. Plumbing (macros, linker symbols, empty `.memreq` section,
+   stub allocator). No-op; boot path unchanged.
+2. Python reference implementation + test vectors + Hypothesis
+   property tests (all arch-independent tooling).
+3. Per-arch allocator implementation + bytecode interpreter
+   (D060). User-mode QEMU differential tests pass before
+   anything else.
+4. Per-arch integration into boot.S. Tracer bullets confirm
+   READY + LAYOUT-TEST markers.
+5. Migrate existing hardcoded regions (`VIRTQ_BASE`,
+   `RX_BUFFER_BASE`, stack top) one at a time, each a
+   reviewable commit.
+6. Ontology entity kinds (`MemoryRegion`, `TuningParameter`,
+   `CpuCharacteristic`) + audit invariants.
+
+The stack-headroom concern on 2026-04-23 (stack top at
+`0x80200000` converging on image growth) is the concrete
+motivating case; step 5's stack migration resolves it by
+declaring stack as a top-of-RAM growing-down region.
+
+**Cross-refs:**
+
+- `D003` — 100% assembly; this is the shape of memory
+  management that assembly gives us without reaching for
+  an OS or a malloc.
+- `D043` — FSA runtime model (statically-allocated per-type
+  pools). D059 generalizes that pattern across modules.
+- `D058` — actor model; D059 is the memory-discipline piece
+  that keeps D058 tractable as modules multiply.
+- `D060` — parameterization model (cpu characteristics,
+  tuning profiles, bytecode expressions) that D059 consumes.
+- `D049` — ontology as formal verifiable requirements; the
+  `MemoryRegion` entity kind lives here.
+- `D051` — ontology audit as closing gate; layout invariants
+  (no overlap, declared owner, declared lifetime) are
+  checked here.
+- `D055` / `D056` — external-input length clamp and ISA
+  overflow detection; applied to the (deferred) cmdline
+  parser if/when multi-profile-in-image is adopted.
+- `user_tagline_software_as_air.md` — reliability axiom; the
+  memory-layout failure mode we are preventing is the class
+  of bug that only appears as the image grows.
+
+**Attribution:** decision landed 2026-04-23 after the
+stack-headroom discussion. Gemini flagged "1.5 MiB between
+image and stack, growth paths converge" on commit `749386f`;
+Ed's framing ("an in-between mode: drivers declare memory
+needs, init-time layout, never dynamic") redirected the
+response from "patch the magic number" to "codify the mode."
+Through discussion the scope expanded to cover per-CPU-family
+cache-topology tuning, split off as D060.
+
+
+### D060: Layered tuning model — CPU characteristics, build-time profiles, bytecode expression language
+
+**Decision (2026-04-23):** memory layout and tunable-behavior
+parameters in fireasmserver are organized in four layers, each
+with a different lifecycle. D059 declares the layout pattern;
+D060 declares the parameterization model that feeds it. Cache
+topology and other machine characteristics that vary across CPU
+models — not across ISAs — are first-class inputs, and the
+server's `.memreq` declarations reference them through a small
+bytecode expression language that the init allocator interprets.
+
+**The four layers:**
+
+1. **Layer 0 — ISA / arch invariants.** Fixed at ISA choice;
+   cannot change at runtime or deploy. Register file, calling
+   convention, required ISA extensions (AES-NI on x86_64 per
+   D057; ARMv8 AES+PMULL on aarch64; future scalar-AES +
+   vector-carryless-multiply on RV64), VMM boot protocol (PVH
+   on x86_64 Firecracker; Linux arm64 Image on aarch64).
+   Representation: `.equ`/`%define` constants in per-arch
+   includes. No dynamism.
+2. **Layer 1 — CPU-model intrinsics.** Fixed per physical
+   machine; detected from CPU registers at boot. Cache line
+   size, L1/L2/L3 sizes and associativity, core topology
+   (which cores share which cache levels), hardware
+   prefetcher capabilities, supported page sizes.
+   Representation: a `cpu_characteristics` struct in `.bss`
+   populated by `detect_cpu_characteristics` during allocator
+   phase 0.
+3. **Layer 2 — Deployment-tuning parameters.** Fixed per
+   deployed binary. RX/TX queue depths, buffer sizes (within
+   cache-line constraints from Layer 1), per-core actor pool
+   sizes, connection limits per worker, TLS session cache
+   size per core, number of worker cores to launch. Selected
+   at build time per D059's build-time-profile decision.
+   Representation: a `tuning_profile` table in `.rodata`
+   populated from `arch/<isa>/profiles/<name>.asm`.
+4. **Layer 3 — Derived layout expressions.** Not stored
+   anywhere persistent. Computed by evaluating Layer 2 values
+   against Layer 1 intrinsics at init time, using the
+   bytecode expression language below. Every `.memreq`
+   region's size and alignment are expressions in this
+   language.
+
+**Bytecode expression language:**
+
+Each `.memreq` record carries two bytecode fields — a size
+expression (up to 16 bytes) and an alignment expression
+(shorter, typically `CPU l1d_line` or `LIT 0x1000`). The
+allocator evaluates both expressions at init time against the
+frozen Layer 1 + Layer 2 tables, then bump-allocates.
+
+Opcodes (7 primary + 1 escape):
+
+- `LIT <u32>`      — push literal.
+- `TUNING <id>`    — push `tuning_profile[id]`.
+- `CPU <id>`       — push `cpu_characteristics[id]`.
+- `MUL`            — pop b, pop a, push a\*b.
+- `DIV_LIT <u8>`   — pop a, push a / small-literal (covers the
+  "stack = L2 / 4" quirk without needing a full DIV opcode).
+- `ALIGN_UP`       — pop align, pop value, push align_up.
+- `END`            — top of stack is the result.
+- `CALL_THUNK <ptr>` — ESCAPE: call named assembly routine;
+  its return value is the result. For the rare region whose
+  sizing doesn't fit the primary vocabulary.
+
+Each opcode is 1 byte + ≤4 bytes payload. A typical expression
+(`tuning.depth × align_up(tuning.buffer_bytes, cpu.l1d_line)`)
+is 7 bytes.
+
+**Stack machine shape:** 4-deep, lives in registers (no memory
+stack — the allocator runs pre-stack). On x86_64: rax/rcx/rdx/r8.
+On aarch64: x0/x1/x2/x3. Straight-line dispatch, ~40 lines per
+arch, no function calls between opcodes, no dynamic dispatch,
+no heap. It is a calculator, not a language.
+
+**Why bytecode rather than per-region assembly thunks:**
+
+- **The sizing logic is arch-invariant.** "Depth times
+  aligned-up buffer" is the same on every arch. Writing it
+  once as bytecode, with a per-arch interpreter, is strictly
+  better than writing it three times in three syntaxes.
+- **Audit-visibility without drift.** The ontology audit
+  (D051) reads the bytecode directly to know what tuning
+  parameters and CPU characteristics each region consumes.
+  There is no possibility of drift between "what the code
+  reads" and "what the audit believes the code reads" —
+  the bytecode *is* the declaration.
+- **Three-arch multiplication.** Per-region-per-arch thunks
+  would be ~20 regions × 3 arches = 60 tiny routines, each
+  a potential drift site. Bytecode: ~20 declarations + 3
+  interpreters.
+- **Escape hatch covers the rare case.** `CALL_THUNK` keeps
+  exotic regions expressible without forcing the language to
+  grow opcodes for every novelty.
+
+**Three-phase init allocator:**
+
+- **Phase 0 — detect cpu characteristics.** Populate the
+  `cpu_characteristics` table from per-arch CPU registers.
+  On unknown CPU: load conservative defaults, emit
+  `UNKNOWN-CPU model=<...>` on serial, proceed (per D059's
+  unknown-CPU posture).
+- **Phase 1 — load tuning profile.** Copy the selected
+  profile's data from `.rodata` to the allocator-readable
+  `tuning_profile` table. Validate every field against its
+  declared valid range; halt with `PROFILE-INVALID field=X
+  value=Y` on violation.
+- **Phase 2 — walk memreq records.** For each record,
+  interpret its size and alignment bytecode against the now-
+  frozen Layer 1 + Layer 2 tables. Forward-bump for non-
+  stack lifetimes; reverse-bump from `__ram_top` for stack
+  lifetimes. Populate `assigned_addr` and `assigned_size`
+  in each record. On forward-reverse crossing, halt with
+  `LAYOUT-OVERFLOW`.
+- **Phase 3 — init-complete fence.** Memory barrier, set
+  `init_complete_flag`, return. All further memory access
+  reads from the frozen layout table.
+
+**Per-arch CPU-model detection:**
+
+- **x86_64.** `CPUID EAX=1` → family/model → known-model
+  lookup; `CPUID EAX=4, ECX=0..N` (Intel) / `EAX=0x80000005,
+  0x80000006` (AMD) → cache sizes + line size; `CPUID EAX=0xB`
+  → topology. Unknown: defaults + `UNKNOWN-CPU` log.
+- **aarch64.** `CTR_EL0` → dcache line size (DminLine);
+  `MIDR_EL1` → implementer/part → known-model lookup;
+  `CLIDR_EL1 + CCSIDR_EL1` per level → cache sizes and
+  associativity; `MPIDR_EL1` → cluster membership.
+  `CCSIDR_EL1` may be trapped under KVM — verify per-
+  hypervisor on bring-up and fall back to MIDR-based table
+  if unreliable.
+- **RV64 (future).** DTB parse at `a1` on entry; no standard
+  CPU-characteristics CSR today. Cache topology is described
+  in the device tree per the `Zicbom`/`Zicboz` in-progress
+  extensions.
+
+**Unknown-CPU fallback defaults (Option A per D059):**
+`l1d_line_bytes=64, l1d_bytes=32768, l1i_bytes=32768,
+l2_bytes=262144, l3_bytes_per_cluster=0,
+cores_sharing_l2=1, cores_sharing_l3=1,
+hw_prefetcher_stride_lines=0, detected_model_id=0`.
+Conservative everywhere that being conservative means "smaller
+assumptions, less false-sharing risk."
+
+**Tuning profile files.** One file per profile per arch:
+`arch/<isa>/profiles/default.asm`,
+`arch/<isa>/profiles/low_latency.asm`, etc. Each file defines
+the same symbols (`tuning_profile_<name>`); the Makefile
+selects one via `%include "profiles/$(PROFILE).asm"`. Day-one
+ships only `default`; additional profiles are added per
+workload evidence, not speculatively.
+
+**Valid-range enforcement.** Every `TuningParameter` ontology
+entity declares a valid range (e.g., `rx_queue_depth: u32,
+valid_range=(16, 4096), power_of_two=True`). The allocator's
+phase-1 validator checks every field against its range; a
+profile authoring mistake halts boot at init, not at first-
+use. The audit gate (D051 extension) runs the reference
+allocator against every (profile, cpu_model) combination
+declared in the ontology to pre-flag configurations that would
+halt in production.
+
+**Test strategy (three tiers):**
+
+- **Tier 1 — bytecode VM differential testing.** Python
+  reference interpreter + each arch's assembly interpreter,
+  run under user-mode QEMU. Hypothesis-driven property tests
+  generate random valid bytecode + synthetic Layer 1/2
+  tables; the two implementations must agree on every input.
+  Fires on every commit via the Python quality gates. Settles
+  bytecode correctness cross-arch before any tracer bullet
+  runs.
+- **Tier 2 — allocator algorithm differential testing.**
+  Same two-implementation pattern, whole allocator. Python
+  reference + each arch's assembly, synthetic `.memreq`
+  sections. Invariants: disjointness, monotonic forward
+  bump, monotonic reverse bump, no forward-reverse crossing,
+  assigned_size matches bytecode-computed size, stack regions
+  at top-of-RAM.
+- **Tier 3 — tracer-bullet boots.** Full boot through
+  `init_complete` on actual VMMs, structured `LAYOUT-TEST`
+  report on serial, parsed and asserted against Python
+  reference's expected output. Initial set: 6 cells covering
+  Intel Xeon + AMD EPYC on x86_64 under QEMU-fork,
+  Neoverse-N1 + Cortex-A76 on aarch64 under QEMU-fork, plus
+  Firecracker on laptop-host and Pi-host as real-silicon /
+  real-hypervisor anchors. Expansion as new divergences
+  appear (Apple M 128-byte line, Atom/E-core smaller caches,
+  Neoverse-V1/V2).
+
+**CPU-model coverage principle: cover the divergence space,
+not the catalog.** New CPU models with the same cache line +
+cache sizes + detection shape as an existing cell are added to
+that cell's rotation, not to a new cell. New CPU models that
+differ materially (different cache line, different detection
+register, different topology) earn a new cell. This keeps test
+minutes tied to distinct-test-value, not to SKU count.
+
+**Scope: in-repo first.** Test vectors, Python reference,
+Hypothesis properties, differential harness, and tracer-bullet
+runners all live in `tooling/src/memlayout/` and
+`tooling/tests/memlayout/`. If a sibling project eventually
+benefits, the primitive can be promoted to `~/tools/`, per the
+"principles transfer; processes do not" rule — but first
+passes in-repo.
+
+**Ontology entities:**
+
+- `MemoryRegion{name, size_bytecode, align_bytecode, owner,
+  lifetime, writable_after_init, declared_in}` — one per
+  `.memreq` declaration.
+- `TuningParameter{name, type, valid_range, power_of_two,
+  default_by_profile, consumed_by}` — one per field in the
+  tuning_profile struct.
+- `CpuCharacteristic{name, detection_source_per_arch,
+  fallback_when_unknown, consumed_by}` — one per field in
+  cpu_characteristics.
+
+Audit invariants (D051 extension): no two regions overlap for
+any known (profile, cpu) tuple; every declaration has a
+declared owner and lifetime; `immutable_after_init` regions
+are not marked `writable=1`; every bytecode opcode references
+a declared parameter; every profile field lies within its
+valid range.
+
+**Cross-refs:**
+
+- `D059` — init-time static layout pattern that D060
+  parameterizes.
+- `D057` — required ISA extensions on each arch; these are
+  Layer 0, not Layer 2 knobs. No conditional region sizing
+  for crypto fallbacks.
+- `D007` — OSACA static pipeline analysis; its per-CPU-model
+  scheduling data is adjacent to but independent of Layer 1
+  detection.
+- `D049` / `D051` — ontology and audit gate.
+- `feedback_overconfident_foresight_as_discipline_cutter.md`
+  — the discipline of not pre-cutting CPU-family coverage
+  for efficiency's sake.
+- `feedback_automation_cost_is_bounded_bug_cost_is_not.md`
+  — leans YES on wiring the three test tiers in.
+
+**Attribution:** design converged 2026-04-23 through
+discussion of how cache topology (per-CPU-model, not per-arch)
+affects memory layout. Ed's framing: "This must be
+configurable. We discussed this layout for these sorts of
+tuning parameters early on. Time to get it right is now."
+The bytecode-vs-thunks choice flipped mid-discussion once the
+three-arch-multiplication cost and audit-drift risk were sized.
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation

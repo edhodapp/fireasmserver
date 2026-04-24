@@ -35,6 +35,38 @@ arch/
 
 Two implementations, one design. Each arch is ISA-idiomatic — not "C in assembly."
 
+## Memory: init-time static layout, cache-topology-aware
+
+fireasmserver does not run a dynamic memory allocator. Every byte of RAM the server touches is statically allocated — but the layout is *computed at boot* rather than hardcoded as compile-time constants (D059), and it is *parameterized* by the specific CPU model the VM runs on (D060).
+
+There are three modes a system like this could choose, and we deliberately pick the third:
+
+1. **Pure static, hardcoded** — every region is an `.equ` in assembly. A human picks `RX_BUFFER_BASE = 0x80500000` by hand and hopes nobody else picks a colliding constant. Scales badly; growth paths converge silently; cache-line alignment becomes a magic number that's wrong on the next CPU.
+2. **Dynamic (OS-style)** — a live allocator runs at steady state (`malloc`, buddy allocator, GC). Bookkeeping, fragmentation, lock contention, shared mutable state across cores. Explicitly rejected — it collides with the actor-model invariant from D058.
+3. **Init-time static, parameterized** *(fireasmserver's choice)* — each module declares its memory requirements as data: owner (which core/actor), lifetime (`steady-state` / `init-only` / `immutable-after-init` / `stack`), and a *bytecode expression* that computes size and alignment at init from CPU characteristics and a build-time tuning profile. A small bump allocator runs **once** on the boot core during early boot, evaluates the expressions, assigns absolute addresses, and freezes the layout. After the `init_complete` fence fires, the allocator is dead code; no region is ever allocated, resized, relocated, or freed for the rest of the VM's life.
+
+This is an advantage of working in 100% assembly. We are not forced to choose between "hardcode every address" and "ship a kernel-grade allocator." We own the whole machine, so we can afford a compact straight-line bump allocator that runs exactly once and produces a frozen table of addresses the rest of the server reads. A C-with-`malloc` project cannot make this choice cleanly; a Linux-hosted project cannot either. We can, because we are the OS.
+
+**Four-layer tuning model (D060).** Memory layout is driven by inputs at four distinct lifecycles:
+
+- **Layer 0 — ISA invariants.** Register file, calling convention, required ISA extensions (AES-NI on x86_64, ARMv8 AES+PMULL on aarch64). Fixed at build.
+- **Layer 1 — CPU-model intrinsics.** Cache line size, L1/L2/L3 sizes, cache sharing topology. *Detected at boot* by reading `CPUID` on x86_64, `CTR_EL0`+`MIDR_EL1`+`CCSIDR_EL1` on aarch64. Unknown CPU → conservative defaults + serial log line; boot proceeds ("Software should be like air" — run reliably everywhere rather than refuse on unfamiliar silicon).
+- **Layer 2 — Deployment-tuning profile.** RX/TX queue depths, per-core actor pool sizes, TLS session cache size, worker core count. Selected at build time: `make PROFILE=default` / `make PROFILE=low_latency`. One artifact per profile per cell; the profile name is in the artifact filename.
+- **Layer 3 — Derived layout expressions.** Each `.memreq` region's size and alignment is a small bytecode expression over Layers 1 and 2. A typical declaration reads *"buffer pool size = tuning.rx_queue_depth × align_up(tuning.rx_buffer_bytes, cpu.l1d_line)"*. The allocator evaluates this at init. 7 primary opcodes + a `CALL_THUNK` escape hatch for rare regions that need arbitrary assembly.
+
+Properties this buys:
+
+- **Compatible with the actor model (D058) by construction.** The allocator runs serially on the boot core before any worker core leaves WFE; no cross-core contention; no shared mutable allocator state at steady state.
+- **Correct false-sharing avoidance on any CPU.** Cache line size is never a magic number — it's read once, rounded into every padded structure.
+- **Workload-targeted deploys.** `make PROFILE=low_latency` vs `make PROFILE=high_throughput` produces different binaries whose layouts are tuned end-to-end. No runtime switch cost.
+- **Collisions are detectable before production.** The ontology tracks `MemoryRegion` / `TuningParameter` / `CpuCharacteristic` entities; the audit gate runs the reference allocator against every (profile, cpu_model) tuple and checks disjointness + declared ownership + valid-range invariants.
+- **Per-core setup is trivial.** When a worker core boots, its FSA actor pools, queue buffers, and stack are addresses looked up in the frozen table. No per-core allocator.
+- **Growth paths don't converge.** Stacks are top-of-RAM-growing-down regions declared like any other — they never point at the image.
+
+**Testing is three-tiered.** A Python reference interpreter and each arch's assembly interpreter are differential-tested under user-mode QEMU with Hypothesis-driven property tests (Tier 1 — bytecode correctness). The whole allocator is differential-tested the same way (Tier 2 — layout correctness). Actual-VMM tracer bullets (initial set: 6 cells across Intel Xeon + AMD EPYC on x86_64 QEMU-fork, Neoverse-N1 + Cortex-A76 on aarch64 QEMU-fork, plus Firecracker on laptop-host and Pi-host) verify CPU detection and end-to-end layout on real hypervisors (Tier 3). Coverage principle: cover the divergence space, not the catalog — a new CPU earns a new cell only if it differs materially in cache line, detection register, or topology.
+
+See [D059](DECISIONS.md) + [D060](DECISIONS.md) for the full decisions. Retrofit of the current hardcoded `.equ` layout (`VIRTQ_BASE`, `RX_BUFFER_BASE`, stack top) onto this scheme is the next memory-subsystem workstream.
+
 ## CD Pipeline
 
 Every commit passes through a multi-gate pipeline before reaching `main`:
@@ -59,7 +91,7 @@ Two hosts cooperate during development:
 
 Snapshot strategy for the Pi (D036): `backup_pi_rsync.sh` for fast incremental hardlink snapshots, `backup_pi_dd.sh` for crash-consistent block-level images that `flash_sd_card.sh` can restore. Both run with the Pi up — no SD removal for routine backups.
 
-See [DECISIONS.md](DECISIONS.md) for the full architecture decision log (D001–D043). Supersessions carry bidirectional cross-references: the new entry cites what it replaces, and the old entry is strike-through'd with a `DEPRECATED <ISO-8601>Z — see DNNN` marker (established convention since D042).
+See [DECISIONS.md](DECISIONS.md) for the full architecture decision log (D001–D060). Supersessions carry bidirectional cross-references: the new entry cites what it replaces, and the old entry is strike-through'd with a `DEPRECATED <ISO-8601>Z — see DNNN` marker (established convention since D042).
 
 ## Building
 
