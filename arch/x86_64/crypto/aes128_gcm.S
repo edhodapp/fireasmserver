@@ -648,12 +648,7 @@ aes128_gcm_decrypt:
     xor     rdx, [r14 + 8]
     or      rax, rdx                  ; rax = 0 iff all 16 bytes match
 
-    ; Branch-free normalization: eax → 0 if rax==0 else 1.
-    neg     rax                       ; CF set iff rax was non-zero
-    sbb     eax, eax                  ; eax = 0 or -1
-    and     eax, 1                    ; → 0 or 1
-
-    test    eax, eax
+    test    rax, rax
     jnz     .L_dec_mismatch
 
     ; Tag matched — proceed with CTR decryption.
