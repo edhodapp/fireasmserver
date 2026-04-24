@@ -2948,6 +2948,7 @@ three-arch-multiplication cost and audit-drift risk were sized.
 - virtio-net driver design
 - TCP state machine implementation
 - HTTP parser design
+- PCLMULQDQ/PMULL no-scalar-fallback codification — parallel to D057's posture for AES-NI, extended to the GHASH carryless-multiply path. Triggers when the hardware-accelerated GHASH replacement for `arch/{x86_64,aarch64}/crypto/aes128_gcm.S:__gcm_ghash_mul` lands green; closes ontology constraint `AES128-GCM-002` (the current bit-serial-GHASH deviation) in the same commit.
 - ~~Assembly branch coverage tooling~~ **DEPRECATED 2026-04-19T07:15Z** — implemented as `tooling/src/branch_cov/` (MVP in commit `e3aa166`, 2026-04-18) with capstone + pyelftools disassembly, QEMU-trace ingestion, per-cell baselines, and a ratchet-mode `--baseline` flag wired into `cd-matrix.yml` via `run_local.sh`.
 - PICT combinatorial testing integration
 - OSACA CI integration
