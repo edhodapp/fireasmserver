@@ -19,7 +19,9 @@
 //                      tag[16], pt) -> int  (w0)
 //       x0=key, x1=iv, x2=aad, x3=aad_len, x4=ct, x5=ct_len,
 //       x6=tag (in), x7=pt (out)
-//       Returns 0 on tag match, 1 on tag mismatch.
+//       Returns 0 on tag match, 1 on tag mismatch. On mismatch
+//       the pt buffer is zeroed before return (defense-in-depth;
+//       callers still MUST NOT use pt on mismatch).
 //
 //   Both entries permit pt/ct pointer aliasing for in-place
 //   operation (pt==ct): the 16-byte-chunked full-block path
@@ -479,9 +481,10 @@ aes128_gcm_encrypt:
     .size   aes128_gcm_encrypt, . - aes128_gcm_encrypt
 
 // ===============================================================
-// aes128_gcm_decrypt — verify tag first; on mismatch return 1 and
-// skip CTR decryption (pt contents indeterminate per AEAD
-// contract).
+// aes128_gcm_decrypt — verify tag first; on mismatch zero the pt
+// buffer for defense-in-depth, return 1, and skip CTR decryption
+// (pt MUST NOT be used by callers on mismatch regardless; zeroing
+// is a belt-and-suspenders).
 // ===============================================================
     .type   aes128_gcm_decrypt, %function
     .balign 16
@@ -575,7 +578,7 @@ aes128_gcm_decrypt:
     cmp     x3, #0
     cset    w0, ne                      // w0 = 0 (match) or 1 (mismatch)
 
-    cbnz    w0, .Ldec_epilogue_mismatch
+    cbnz    w0, .Ldec_mismatch
 
     // Tag matched — perform CTR decryption.
     ldr     w3, [sp, #332]
@@ -632,7 +635,33 @@ aes128_gcm_decrypt:
 
 .Ldec_success:
     mov     w0, #0
-.Ldec_epilogue_mismatch:
+    b       .Ldec_epilogue
+
+.Ldec_mismatch:
+    // Zero pt[0..ct_len). Defense-in-depth — the AEAD contract
+    // already forbids caller use of pt on mismatch, but zeroing
+    // eliminates a class of accidental-leakage bug if a caller
+    // violates the contract. x21 = pt ptr, x27 = ct_len
+    // (both callee-saved and preserved since aes128_gcm_decrypt
+    // entry). w0 still holds 1 from the earlier `cset w0, ne`;
+    // the zero loop below does not touch w0.
+    movi    v0.16b, #0
+    mov     x4, xzr
+.Ldec_zero_16_loop:
+    sub     x5, x27, x4
+    cmp     x5, #16
+    b.lo    .Ldec_zero_tail
+    str     q0, [x21, x4]
+    add     x4, x4, #16
+    b       .Ldec_zero_16_loop
+.Ldec_zero_tail:
+    cmp     x4, x27
+    b.hs    .Ldec_epilogue
+    strb    wzr, [x21, x4]
+    add     x4, x4, #1
+    b       .Ldec_zero_tail
+
+.Ldec_epilogue:
     ldp     x27, x28, [sp, #80]
     ldp     x25, x26, [sp, #64]
     ldp     x23, x24, [sp, #48]

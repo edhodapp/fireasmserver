@@ -20,7 +20,10 @@
 ;       rdi=key, rsi=iv, rdx=aad, rcx=aad_len, r8=ct, r9=ct_len,
 ;       [rbp+16]=tag (in), [rbp+24]=pt (out)
 ;       Returns 0 on tag match, 1 on tag mismatch. On mismatch the
-;       pt buffer contents are indeterminate and MUST NOT be used.
+;       pt buffer is zeroed before return as defense-in-depth.
+;       Callers still MUST NOT use the pt buffer on mismatch — the
+;       zero is a belt-and-suspenders against callers who violate
+;       the contract, not a semantic guarantee to rely on.
 ;
 ;   Both encrypt and decrypt permit pt/ct pointer aliasing for
 ;   in-place operation: full-block path reads pt/ct into xmm
@@ -548,8 +551,9 @@ aes128_gcm_encrypt:
 
 ; ===============================================================
 ; aes128_gcm_decrypt — symmetric. Verify tag first; on mismatch,
-; return 1 and skip CTR decryption entirely (pt contents
-; indeterminate per AEAD contract).
+; zero the pt buffer for defense-in-depth, return 1, and skip
+; CTR decryption entirely (pt MUST NOT be used by callers on
+; mismatch regardless; zeroing is a belt-and-suspenders).
 ;
 ; Callee-saved register use:
 ;   rbx = ct  ptr
@@ -714,6 +718,17 @@ aes128_gcm_decrypt:
     jmp     .L_dec_epilogue
 
 .L_dec_mismatch:
+    ; Zero pt[0..ct_len). Defense-in-depth — the AEAD contract
+    ; already forbids caller use of pt on mismatch, but zeroing
+    ; eliminates a class of accidental-leakage bug if a caller
+    ; violates the contract. r13 = pt ptr, r12 = ct_len
+    ; (callee-saved, preserved across the whole decrypt path).
+    ; rep stosb clobbers rdi and rcx; caller's SysV DF=0 is
+    ; still in force (we never touched DF).
+    mov     rdi, r13                  ; pt
+    mov     rcx, r12                  ; pt_len
+    xor     eax, eax
+    rep     stosb
     mov     eax, 1
 
 .L_dec_epilogue:

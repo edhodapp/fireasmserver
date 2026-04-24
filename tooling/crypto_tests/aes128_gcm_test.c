@@ -708,7 +708,16 @@ static int check_sweep(void) {
  * non-zero (tag-mismatch) result. A single-bit flip that sneaks
  * through would be the canonical AEAD authenticity failure — the
  * reason GCM specifies a constant-time OR-fold comparison in the
- * first place. */
+ * first place.
+ *
+ * Also verifies the defense-in-depth pt-zero-on-mismatch contract:
+ * the scratch_pt buffer is pre-filled with a 0xAA sentinel before
+ * each decrypt call. On mismatch, bytes [0..pt_len) must be
+ * zero (under-zeroing would leak stale keystream / stale caller
+ * data if the caller ignores the indeterminate-pt contract) and
+ * bytes [pt_len..sizeof(scratch_pt)) must still be 0xAA
+ * (over-zeroing would mean the impl wrote past the caller's
+ * buffer — a would-be buffer overflow caught at test time). */
 static int check_forgery(void) {
     int failures = 0;
     for (size_t i = 0; i < AES128_GCM_N_VECTORS; ++i) {
@@ -720,6 +729,7 @@ static int check_forgery(void) {
             size_t  byte_ix = bit >> 3U;
             uint8_t mask    = (uint8_t)(1U << (bit & 7U));
             forged[byte_ix] = (uint8_t)(forged[byte_ix] ^ mask);
+            memset(scratch_pt, 0xAA, sizeof(scratch_pt));
             int rc = aes128_gcm_decrypt(v->key, v->iv,
                                         v->aad, v->aad_len,
                                         v->ct, v->pt_len,
@@ -728,12 +738,39 @@ static int check_forgery(void) {
                 printf("FAIL  forgery accepted on %s bit %zu\n",
                        v->name, bit);
                 ++failures;
+                continue;
+            }
+            /* Under-zeroing check: pt[0..pt_len) must be 0. */
+            for (size_t j = 0; j < v->pt_len; ++j) {
+                if (scratch_pt[j] != 0U) {
+                    printf("FAIL  pt not zeroed on %s bit %zu "
+                           "at offset %zu (got 0x%02x, "
+                           "expected 0x00)\n",
+                           v->name, bit, j,
+                           (unsigned)scratch_pt[j]);
+                    ++failures;
+                    break;
+                }
+            }
+            /* Over-zeroing check: bytes past pt_len must still be
+             * the 0xAA sentinel. */
+            for (size_t j = v->pt_len; j < sizeof(scratch_pt); ++j) {
+                if (scratch_pt[j] != 0xAAU) {
+                    printf("FAIL  pt over-zeroed on %s bit %zu "
+                           "at offset %zu past pt_len %zu "
+                           "(got 0x%02x, expected 0xAA)\n",
+                           v->name, bit, j, (size_t)v->pt_len,
+                           (unsigned)scratch_pt[j]);
+                    ++failures;
+                    break;
+                }
             }
         }
     }
     if (failures == 0) {
         printf("(forgery: all %zu single-bit tag flips rejected "
-               "across %zu vectors)\n",
+               "across %zu vectors; pt zeroed on mismatch without "
+               "overrun)\n",
                (size_t)128U,
                (size_t)AES128_GCM_N_VECTORS);
     }
