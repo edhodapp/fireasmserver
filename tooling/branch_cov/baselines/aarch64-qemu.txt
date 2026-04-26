@@ -18,3 +18,95 @@
 # tbnz w3, #5, .Lwait — wait-while-FIFO-full. QEMU's PL011 emulation
 # drains instantly, so TXFF==1 never observed during this boot.
 0x64 taken
+
+# memlayout bytecode VM (D060 step 3A). The asm interpreter
+# now lives in arch/aarch64/memory/bytecode_vm.S and is linked
+# into the kernel image, but the boot.S init_memory_layout
+# stub doesn't yet call into it (that's step 4). Until that
+# wiring lands, every branch inside the VM is dead code at
+# tracer-bullet runtime.
+#
+# These gaps will close in step 4 when the allocator starts
+# walking the .memreq table and dispatching opcodes; the
+# ratchet will then notice the closed gaps, fail, and force
+# a re-baseline — exactly the mechanism the ratchet exists
+# to provide. For now, mark them as known-uncovered.
+#
+# Differential testing of the same VM happens out-of-band via
+# tooling/tests/test_memlayout_diff.py, which fully exercises
+# every opcode path under user-mode QEMU; the asm body's
+# branch coverage is verified there, not here. Recording
+# uncovered here only because the boot tracer bullet doesn't
+# call into the VM yet.
+0x104 not_taken
+0x104 taken
+0x10c not_taken
+0x10c taken
+0x114 not_taken
+0x114 taken
+0x11c not_taken
+0x11c taken
+0x124 not_taken
+0x124 taken
+0x12c not_taken
+0x12c taken
+0x144 not_taken
+0x144 taken
+0x17c not_taken
+0x17c taken
+0x1a0 not_taken
+0x1a0 taken
+0x1b0 not_taken
+0x1b0 taken
+0x1bc not_taken
+0x1bc taken
+0x1e0 not_taken
+0x1e0 taken
+0x1f0 not_taken
+0x1f0 taken
+0x1fc not_taken
+0x1fc taken
+0x218 not_taken
+0x218 taken
+0x234 not_taken
+0x234 taken
+0x258 not_taken
+0x258 taken
+0x260 not_taken
+0x260 taken
+0x284 not_taken
+0x284 taken
+0x290 not_taken
+0x290 taken
+0x294 not_taken
+0x294 taken
+0x2b8 not_taken
+0x2b8 taken
+0x2d4 not_taken
+0x2d4 taken
+0x2f0 not_taken
+0x2f0 taken
+0x30c not_taken
+0x30c taken
+0x318 not_taken
+0x318 taken
+0x324 not_taken
+0x324 taken
+0x334 not_taken
+0x334 taken
+0x35c not_taken
+0x35c taken
+0x368 not_taken
+0x368 taken
+0x370 not_taken
+0x370 taken
+0xb8 not_taken
+0xb8 taken
+0xbc not_taken
+0xbc taken
+0xe4 not_taken
+0xe4 taken
+0xf4 not_taken
+0xf4 taken
+0xfc not_taken
+0xfc taken
