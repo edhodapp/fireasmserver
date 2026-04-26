@@ -335,3 +335,66 @@ def test_thunk_huge_return_raises(
             code, cpu, profile,
             {7: lambda c, p: (1 << 65)},
         )
+
+
+def test_cpu_field_order_is_canonical() -> None:
+    """Field-order regression guard.
+
+    The CPU and TUNING opcodes index into pydantic field
+    order. Reordering or inserting a field in the middle of
+    these structs would silently shift every existing
+    bytecode's interpretation. Pin the order explicitly here
+    so any such change fails this test before it lands.
+    """
+    expected_cpu = (
+        "l1d_line_bytes",
+        "l1d_bytes",
+        "l1i_bytes",
+        "l2_bytes",
+        "l3_bytes_per_cluster",
+        "cores_sharing_l2",
+        "cores_sharing_l3",
+        "hw_prefetcher_stride_lines",
+        "detected_model_id",
+    )
+    actual = tuple(CpuCharacteristics.model_fields.keys())
+    assert actual == expected_cpu, (
+        "CpuCharacteristics field order changed — every "
+        "bytecode that uses CPU <id> now resolves to the "
+        "wrong field. Either restore the order or bump the "
+        "wire-level CPU opcode payload encoding."
+    )
+
+
+def test_tuning_field_order_is_canonical() -> None:
+    """Same regression guard for TuningProfile."""
+    expected_tuning = (
+        "rx_queue_depth",
+        "tx_queue_depth",
+        "rx_buffer_bytes_hint",
+        "actor_pool_size_per_core",
+        "tls_session_cache_entries",
+        "worker_core_count",
+    )
+    actual = tuple(TuningProfile.model_fields.keys())
+    assert actual == expected_tuning, (
+        "TuningProfile field order changed — every bytecode "
+        "that uses TUNING <id> now resolves to the wrong "
+        "field. Either restore the order or bump the "
+        "wire-level TUNING opcode payload encoding."
+    )
+
+
+def test_end_with_two_stack_elements_raises(
+    cpu: CpuCharacteristics, profile: TuningProfile,
+) -> None:
+    # `LIT 1; LIT 2; END` leaves 2 elements on the stack.
+    # END must reject this rather than silently returning 2
+    # with 1 ignored.
+    code = _b(
+        Opcode.LIT, _u32(1),
+        Opcode.LIT, _u32(2),
+        Opcode.END,
+    )
+    with pytest.raises(BytecodeError, match="2 stack"):
+        run_bytecode(code, cpu, profile)

@@ -33,13 +33,31 @@ class BytecodeError(Exception):
 
 @dataclass
 class _Interpreter:
-    """Per-evaluation state. Created fresh for each run."""
+    """Per-evaluation state. Created fresh for each run.
+
+    `cpu_fields` and `tuning_fields` are computed once at
+    construction so the per-opcode hot path doesn't pay an
+    O(N) tuple build on every CPU/TUNING execution. The audit
+    backend (D051 extension) runs this allocator across many
+    (profile, cpu_model) combinations; the cached lookup keeps
+    that loop tight.
+    """
 
     code: bytes
     cpu: CpuCharacteristics
     profile: TuningProfile
     thunks: Mapping[int, ThunkFn]
     stack: list[int]
+    cpu_fields: tuple[str, ...] = ()
+    tuning_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        self.cpu_fields = tuple(
+            self.cpu.__class__.model_fields.keys()
+        )
+        self.tuning_fields = tuple(
+            self.profile.__class__.model_fields.keys()
+        )
 
     def push(self, value: int) -> None:
         if len(self.stack) >= STACK_DEPTH:
@@ -69,12 +87,11 @@ class _Interpreter:
         return value, ip + 4
 
     def cpu_field(self, idx: int) -> int:
-        fields = list(self.cpu.__class__.model_fields.keys())
-        if idx >= len(fields):
+        if idx >= len(self.cpu_fields):
             raise BytecodeError(
                 f"cpu field id {idx} out of range"
             )
-        value = getattr(self.cpu, fields[idx])
+        value = getattr(self.cpu, self.cpu_fields[idx])
         if not isinstance(value, int):  # pragma: no cover
             # Defensive: pydantic enforces int on every
             # CpuCharacteristics field. Reachable only if the
@@ -86,14 +103,11 @@ class _Interpreter:
         return value
 
     def tuning_field(self, idx: int) -> int:
-        fields = list(
-            self.profile.__class__.model_fields.keys()
-        )
-        if idx >= len(fields):
+        if idx >= len(self.tuning_fields):
             raise BytecodeError(
                 f"tuning field id {idx} out of range"
             )
-        value = getattr(self.profile, fields[idx])
+        value = getattr(self.profile, self.tuning_fields[idx])
         if not isinstance(value, int):  # pragma: no cover
             # Defensive: pydantic enforces int on every
             # TuningProfile field. Same reasoning as cpu_field.
@@ -182,8 +196,12 @@ def _step(interp: _Interpreter, ip: int) -> int:
         # Defensive: every Opcode value except END has a
         # _DISPATCH entry; END is intercepted by run_bytecode
         # before _step is called. Reachable only if a new opcode
-        # is added to the enum without a dispatch entry.
-        raise BytecodeError(f"END not handled in step: {op}")
+        # is added to the enum without a corresponding
+        # _DISPATCH entry — message is intentionally generic
+        # so that a future "added an opcode, forgot the
+        # handler" failure surfaces without the misleading
+        # "END not handled" wording.
+        raise BytecodeError(f"unhandled opcode: {op}")
     return handler(interp, ip)
 
 
@@ -209,10 +227,26 @@ def run_bytecode(
     ip = 0
     while ip < len(code):
         if code[ip] == Opcode.END.value:
-            if not interp.stack:
-                raise BytecodeError(
-                    "END reached with empty stack"
-                )
-            return interp.stack[-1]
+            return _finish(interp)
         ip = _step(interp, ip)
     raise BytecodeError("bytecode missing END terminator")
+
+
+def _finish(interp: _Interpreter) -> int:
+    """Validate and return the stack-of-one result.
+
+    A well-formed expression leaves exactly one value on the
+    stack at END. Stricter than just "non-empty" — catches
+    silent residue from malformed expressions like
+    `LIT 1; LIT 2; END` (would otherwise return 2 with 1
+    leftover). Tightens the contract the assembly side has to
+    match in step 3.
+    """
+    if not interp.stack:
+        raise BytecodeError("END reached with empty stack")
+    if len(interp.stack) != 1:
+        raise BytecodeError(
+            f"END reached with {len(interp.stack)} stack "
+            f"elements; expected exactly 1"
+        )
+    return interp.stack[-1]
