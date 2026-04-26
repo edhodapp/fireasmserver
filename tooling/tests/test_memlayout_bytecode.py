@@ -290,18 +290,59 @@ def test_stack_overflow_raises(
         run_bytecode(code, cpu, profile)
 
 
-def test_mul_overflow_wraps_u64(
+def test_mul_overflow_raises(
     cpu: CpuCharacteristics, profile: TuningProfile,
 ) -> None:
-    # 2^32 × 2^32 = 2^64, which wraps to 0 in u64.
+    # D056: MUL detects u64 overflow and halts rather than
+    # silently wrapping. The asm side uses `mul` + `jc/jo`
+    # (x86_64) or `umulh` (aarch64) to mirror this; both halt
+    # rather than mask. A wrap-to-tiny-value would be the
+    # canonical "count × elem_size overflowed → tiny alloc →
+    # heap overflow when the data is written" failure mode.
     code = _b(
         Opcode.LIT, _u32(0xFFFFFFFF),
         Opcode.LIT, _u32(0xFFFFFFFF),
+        Opcode.LIT, _u32(0xFFFFFFFF),
+        Opcode.MUL,
         Opcode.MUL,
         Opcode.END,
     )
-    expected = (0xFFFFFFFF * 0xFFFFFFFF) & ((1 << 64) - 1)
+    with pytest.raises(BytecodeError, match="MUL overflow"):
+        run_bytecode(code, cpu, profile)
+
+
+def test_mul_below_overflow_threshold_succeeds(
+    cpu: CpuCharacteristics, profile: TuningProfile,
+) -> None:
+    # 2^32 × 2^31 = 2^63, fits in u64.
+    code = _b(
+        Opcode.LIT, _u32(0xFFFFFFFF),
+        Opcode.LIT, _u32(0x80000000),
+        Opcode.MUL,
+        Opcode.END,
+    )
+    expected = 0xFFFFFFFF * 0x80000000
     assert run_bytecode(code, cpu, profile) == expected
+
+
+def test_align_up_at_max_u64_raises(
+    cpu: CpuCharacteristics, profile: TuningProfile,
+) -> None:
+    # Direct ALIGN_UP overflow without going through MUL.
+    # Push MAX_U64 - 1 (just below top), align to 64 — value
+    # + align - 1 exceeds u64.
+    # We can't LIT a u64 (LIT is u32), so use a thunk.
+    code = _b(
+        Opcode.CALL_THUNK, _u32(99),
+        Opcode.LIT, _u32(64),
+        Opcode.ALIGN_UP,
+        Opcode.END,
+    )
+    thunks = {99: lambda c, p: (1 << 64) - 1}
+    with pytest.raises(
+        BytecodeError, match="ALIGN_UP overflow",
+    ):
+        run_bytecode(code, cpu, profile, thunks)
 
 
 def test_trailing_bytes_after_end_ignored(

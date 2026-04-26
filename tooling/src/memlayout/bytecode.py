@@ -35,12 +35,13 @@ class BytecodeError(Exception):
 class _Interpreter:
     """Per-evaluation state. Created fresh for each run.
 
-    `cpu_fields` and `tuning_fields` are computed once at
-    construction so the per-opcode hot path doesn't pay an
-    O(N) tuple build on every CPU/TUNING execution. The audit
-    backend (D051 extension) runs this allocator across many
-    (profile, cpu_model) combinations; the cached lookup keeps
-    that loop tight.
+    `cpu_values` and `tuning_values` snapshot the integer
+    fields of the (frozen) input models at construction time
+    so the per-opcode hot path is a pure index lookup —
+    no per-call `getattr` or `model_fields` walk. Materially
+    matters for the audit backend (D051 extension) which
+    runs this allocator across many (profile, cpu_model)
+    tuples and many regions per tuple.
     """
 
     code: bytes
@@ -48,15 +49,17 @@ class _Interpreter:
     profile: TuningProfile
     thunks: Mapping[int, ThunkFn]
     stack: list[int]
-    cpu_fields: tuple[str, ...] = ()
-    tuning_fields: tuple[str, ...] = ()
+    cpu_values: tuple[int, ...] = ()
+    tuning_values: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        self.cpu_fields = tuple(
-            self.cpu.__class__.model_fields.keys()
+        self.cpu_values = tuple(
+            getattr(self.cpu, name)
+            for name in self.cpu.__class__.model_fields.keys()
         )
-        self.tuning_fields = tuple(
-            self.profile.__class__.model_fields.keys()
+        self.tuning_values = tuple(
+            getattr(self.profile, name)
+            for name in self.profile.__class__.model_fields.keys()
         )
 
     def push(self, value: int) -> None:
@@ -87,34 +90,18 @@ class _Interpreter:
         return value, ip + 4
 
     def cpu_field(self, idx: int) -> int:
-        if idx >= len(self.cpu_fields):
+        if idx >= len(self.cpu_values):
             raise BytecodeError(
                 f"cpu field id {idx} out of range"
             )
-        value = getattr(self.cpu, self.cpu_fields[idx])
-        if not isinstance(value, int):  # pragma: no cover
-            # Defensive: pydantic enforces int on every
-            # CpuCharacteristics field. Reachable only if the
-            # struct is mutated to add a non-int field without
-            # also extending the bytecode VM.
-            raise BytecodeError(
-                f"cpu field {idx} is not an int"
-            )
-        return value
+        return self.cpu_values[idx]
 
     def tuning_field(self, idx: int) -> int:
-        if idx >= len(self.tuning_fields):
+        if idx >= len(self.tuning_values):
             raise BytecodeError(
                 f"tuning field id {idx} out of range"
             )
-        value = getattr(self.profile, self.tuning_fields[idx])
-        if not isinstance(value, int):  # pragma: no cover
-            # Defensive: pydantic enforces int on every
-            # TuningProfile field. Same reasoning as cpu_field.
-            raise BytecodeError(
-                f"tuning field {idx} is not an int"
-            )
-        return value
+        return self.tuning_values[idx]
 
     def op_lit(self, ip: int) -> int:
         value, new_ip = self.read_u32(ip)
@@ -134,7 +121,17 @@ class _Interpreter:
     def op_mul(self, ip: int) -> int:
         b_val = self.pop()
         a_val = self.pop()
-        self.push((a_val * b_val) & MAX_U64)
+        # D056: external-input arithmetic uses ISA overflow
+        # detection. The asm side will use `mul` + `jc/jo`
+        # (x86_64) or `umulh` checked against zero (aarch64)
+        # to halt on u64 overflow rather than silently wrap.
+        # Python matches: detect-then-raise, never mask.
+        result = a_val * b_val
+        if result > MAX_U64:
+            raise BytecodeError(
+                f"MUL overflow: {a_val} * {b_val} > u64"
+            )
+        self.push(result)
         return ip
 
     def op_div_lit(self, ip: int) -> int:
@@ -154,8 +151,18 @@ class _Interpreter:
             raise BytecodeError(
                 f"ALIGN_UP align {align} is not a power of two"
             )
-        aligned = (value + align - 1) & ~(align - 1)
-        self.push(aligned & MAX_U64)
+        # D056: detect overflow before masking. align_up(value,
+        # align) on a near-MAX_U64 value would silently wrap
+        # to 0 under modular arithmetic; the asm side will use
+        # `add` + `jc` to halt instead. Python matches.
+        intermediate = value + align - 1
+        if intermediate > MAX_U64:
+            raise BytecodeError(
+                f"ALIGN_UP overflow: {value} + {align} - 1 "
+                f"> u64"
+            )
+        aligned = intermediate & ~(align - 1)
+        self.push(aligned)
         return ip
 
     def op_call_thunk(self, ip: int) -> int:
