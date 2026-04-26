@@ -66,6 +66,29 @@ run_pi_cell() {
     ./tooling/tracer_bullet/pi_aarch64_firecracker.sh
 }
 
+run_memlayout_diff() {
+    echo
+    echo "=== pre-push: memlayout bytecode-VM differential ==="
+    # Builds the per-arch C+asm driver and runs the differential
+    # test harness — Python reference vs each arch's assembly
+    # interpreter under qemu-<arch>-static. Both must agree on
+    # every (bytecode, cpu_values, tuning_values) input.
+    # Auto-skips if a build tool (gcc / aarch64-linux-gnu-gcc /
+    # nasm) or qemu-aarch64-static is missing.
+    if ! make -C tooling/memlayout_diffharness -s all \
+            >/dev/null 2>&1; then
+        echo "SKIP: diff harness build failed (toolchain?)"
+        return 0
+    fi
+    if [[ ! -x "$REPO_ROOT/.venv/bin/pytest" ]]; then
+        echo "SKIP: no .venv/bin/pytest"
+        return 0
+    fi
+    "$REPO_ROOT/.venv/bin/pytest" \
+        tooling/tests/test_memlayout_diff.py \
+        -q --no-header
+}
+
 run_crypto_tests() {
     echo
     echo "=== pre-push: crypto primitive tests (both arches) ==="
@@ -151,6 +174,7 @@ run_local_cell x86_64  firecracker   || fail=1
 run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
 run_c_gates                          || fail=1
+run_memlayout_diff                   || fail=1
 run_crypto_tests                     || fail=1
 run_pytest_suite                     || fail=1
 run_ontology_audit                   || fail=1
