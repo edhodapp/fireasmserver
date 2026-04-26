@@ -21,6 +21,7 @@ dev = [
     "pytest-cov",
     "pytest-mock",
     "pytest-randomly",
+    "hypothesis>=6.0",
 ]
 
 [project.scripts]
