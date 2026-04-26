@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-10.0.0.2}"
+PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 PI_DEV="${PI_DEV:-/dev/mmcblk0}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
@@ -36,7 +36,7 @@ Options:
                per-backup — it writes the full card.
 
 Environment:
-  PI_HOST  (default 10.0.0.2)
+  PI_HOST  (default 10.0.2.2)
   PI_USER  (default ed)
   PI_DEV   (default /dev/mmcblk0)
   SSH_KEY  (default ~/.ssh/fireasm_pi5_ed)

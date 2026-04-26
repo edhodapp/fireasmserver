@@ -15,7 +15,7 @@
 set -euo pipefail
 
 VERSION="${FIRECRACKER_VERSION:-v1.15.1}"
-PI_HOST="${PI_HOST:-10.0.0.2}"
+PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
 

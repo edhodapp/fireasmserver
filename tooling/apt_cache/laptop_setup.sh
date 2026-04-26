@@ -6,7 +6,7 @@
 #
 # Idempotent — safe to re-run. Installs the package if absent, ensures the
 # service is enabled and running, and adds a UFW rule allowing only the
-# laptop↔Pi network (10.0.0.0/24 by default) to reach the cache port.
+# laptop↔Pi network (10.0.2.0/24 by default) to reach the cache port.
 #
 # After this, run ./tooling/apt_cache/pi_setup.sh to configure the running
 # Pi. For future pi-gen builds, the Pi-side config is baked in via
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-PI_NET="${PI_NET:-10.0.0.0/24}"
+PI_NET="${PI_NET:-10.0.2.0/24}"
 PORT="${PORT:-3142}"
 
 if [[ $EUID -eq 0 ]]; then

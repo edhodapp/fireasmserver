@@ -183,7 +183,7 @@ export FIREASMSERVER_KERNEL_DIR="$KERNEL_OUT_ABS"
 # D035: forward proxy config overrides to pi_gen_stage/06-apt-proxy so a
 # user overriding these at build time sees them baked into the image.
 # Also forwarded to pi_setup.sh by virtue of the same env var names.
-export FIREASMSERVER_LAPTOP_IP="${FIREASMSERVER_LAPTOP_IP:-10.0.0.1}"
+export FIREASMSERVER_LAPTOP_IP="${FIREASMSERVER_LAPTOP_IP:-10.0.2.1}"
 export FIREASMSERVER_PROXY_PORT="${FIREASMSERVER_PROXY_PORT:-3142}"
 # Force noninteractive for every apt/dpkg invocation inside every chroot.
 # A dpkg prompt (dialog/whiptail) with no tty attached will hang the build
@@ -213,4 +213,4 @@ echo "  ./tooling/pi5_build/flash_sd_card.sh /dev/sdX"
 echo "  # or use 'rpi-imager' GUI for a point-and-click flow"
 echo
 echo "SSH access after first boot:"
-echo "  ssh -i $SSH_KEY_PRIV ed@10.0.0.2"
+echo "  ssh -i $SSH_KEY_PRIV ed@10.0.2.2"

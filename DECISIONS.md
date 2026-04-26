@@ -241,6 +241,15 @@ to build in `aofire-asm-agent`.
 
 ### D022: Pi 5 as local-only AArch64 test host
 
+**DEPRECATED 2026-04-26T04:18Z — superseded by D061.** The
+local-only AArch64 test-host posture stands; only the IP-address
+specifics are revised. Pi 5 moves to `10.0.2.2/24` on a new USB
+NIC; laptop link moves to `10.0.2.1/24`. Driven by repurposing
+the original `10.0.0.x` USB NIC for ws_pi5 (Pi 4) work. See D061
+for the full revised network layout, including why `10.0.2.0/24`
+was chosen over `10.0.1.0/24` (the latter would collide with
+D024's VM-bridge subnet).
+
 **Decision:** The Raspberry Pi 5 is a local-only AArch64 test platform, not a
 GitHub Actions self-hosted runner. It sits on a direct Ethernet link to the
 laptop via USB NIC, with static addresses: Pi 5 `10.0.0.2/24`, laptop
@@ -2942,6 +2951,102 @@ configurable. We discussed this layout for these sorts of
 tuning parameters early on. Time to get it right is now."
 The bytecode-vs-thunks choice flipped mid-discussion once the
 three-arch-multiplication cost and audit-drift risk were sized.
+
+
+### D061: Pi 5 laptop-link network migrated to `10.0.2.0/24`
+
+**Supersedes:** D022 (deprecated 2026-04-26T04:18Z). The Pi 5
+local-test-host *posture* is unchanged — D022's whole rationale
+(no self-hosted runner, no GitHub from the Pi, scp-delivered
+artifacts, CI lives in GitHub Actions) stands in full. This
+entry revises only the IP-address specifics, because the
+original USB NIC was repurposed for ws_pi5 (Pi 4) work.
+
+**Decision (2026-04-26):** the laptop↔Pi 5 direct-Ethernet link
+moves to a new `10.0.2.0/24` subnet on a new USB NIC + UART
+adapter pair. Static addresses: Pi 5 `10.0.2.2/24`, laptop
+`10.0.2.1/24`. The Pi 5 SD card's NetworkManager static-IP
+connection at `/etc/NetworkManager/system-connections/fireasm-
+eth0.nmconnection` was edited offline (SD mounted on the laptop)
+to the new address; the source-of-truth nmconnection at
+`tooling/pi5_build/pi_gen_stage/01-network/files/fireasm-eth0.
+nmconnection` was updated in lockstep so future re-flashes
+inherit the new IP.
+
+**Why `10.0.2.0/24` and not `10.0.1.0/24`:** the obvious next-
+subnet pick, `10.0.1.0/24`, would collide with D024's
+Firecracker-VM bridge subnet on the Pi (`br1` at `10.0.1.0/24`,
+Pi-side gateway `10.0.1.1`). Two distinct networks both numbered
+`10.0.1.0/24` would alias the Pi's eth0 onto the VM bridge — the
+Pi could not distinguish a laptop neighbor from a Firecracker
+guest at the same address, and Linux refuses to attach
+overlapping subnets to two interfaces. `10.0.2.0/24` keeps the
+two networks orthogonal: laptop link is `10.0.2.x`, VM bridge
+stays `10.0.1.x`, no aliasing.
+
+**Why NOT migrate the VM bridge instead:** the VM bridge
+already has Firecracker-side configuration, harness-side IP
+allocation, and operational muscle memory tied to `10.0.1.x`.
+Moving it would touch more code and more conventions than
+moving the laptop link, which only required: SD-card edit, nm-
+connection source update, and a sweep of `10.0.0.{0/24,1,2}`
+references across `tooling/`, `README.md`, and the laptop's
+local NIC config.
+
+**Side-effect on D024's static route:** D024 documented the
+laptop-side route as `ip route add 10.0.1.0/24 via 10.0.0.2`.
+That `via` gateway moves with the Pi: the new form is `ip route
+add 10.0.1.0/24 via 10.0.2.2`. D024's body itself remains
+immutable per the decision-log convention; the gateway change
+is a consequence of D061, not a revision of D024's underlying
+choice (the VM bridge subnet `10.0.1.0/24` is unchanged, only
+the path to it changed).
+
+**Side-effect on the old `10.0.0.0/24` namespace:** the old USB
+NIC and `10.0.0.x` addresses now belong to the Pi 4 / ws_pi5
+project. fireasmserver no longer references `10.0.0.x`
+anywhere; any remaining match in tooling or docs is a bug.
+
+**Verification:** post-edit reachability check passed —
+`ssh -i ~/.ssh/fireasm_pi5_ed ed@10.0.2.2` succeeded immediately
+on first boot of the SD card after IP-edit eject + reinsert.
+No second flash needed. Pi-side `apt-cacher-ng` proxy reach,
+Firecracker tracer-bullet pi cell, and backup scripts all
+inherit the new IP from the env-var-defaulted shell scripts
+in this commit.
+
+**How to apply (for future readers):**
+
+- Treat D022 + D061 as a pair: D022 explains *why* there is a
+  Pi 5 local-test-host posture; D061 explains *where* it lives
+  on the network as of 2026-04-26.
+- Any new tool, script, or doc that needs to reach the Pi 5
+  defaults to `PI_HOST=10.0.2.2` and `LAPTOP_IP=10.0.2.1`,
+  matching the env-var conventions already in `pre_push.sh`,
+  `pi_aarch64_firecracker.sh`, `backup_pi_*.sh`, and
+  `apt_cache/`.
+- A future move (third NIC, separate test host, anything that
+  changes the laptop-link subnet) gets its own supersession
+  entry; never edit D061 in place.
+
+**Cross-refs:**
+
+- `D022` — the now-deprecated original choice of `10.0.0.0/24`.
+  Posture (local-only AArch64 test host) preserved verbatim.
+- `D024` — VM bridge subnet `10.0.1.0/24`, untouched. D061
+  notes the gateway-of-route change but does not supersede
+  D024.
+- `feedback_chroot_image_build_noninteractive.md` — pi-gen
+  re-flash discipline; the source nmconnection update in this
+  commit means a re-flash now produces an image that boots on
+  the new subnet without further manual editing.
+
+**Attribution:** decision landed 2026-04-26 after Ed
+repurposed the original USB NIC for the Pi 4 / ws_pi5 work
+and added a new NIC + UART adapter pair for the Pi 5. The
+collision-avoidance reasoning around D024's `10.0.1.0/24`
+surfaced during the discussion before any source change was
+made.
 
 
 ## Future decisions (not yet made)

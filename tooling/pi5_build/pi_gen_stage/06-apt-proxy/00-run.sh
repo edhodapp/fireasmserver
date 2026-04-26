@@ -6,7 +6,7 @@
 : "${ROOTFS_DIR:?ROOTFS_DIR must be set by pi-gen}"
 
 # Defaults match D024's laptop-side address and D035's default port.
-LAPTOP_IP="${FIREASMSERVER_LAPTOP_IP:-10.0.0.1}"
+LAPTOP_IP="${FIREASMSERVER_LAPTOP_IP:-10.0.2.1}"
 PROXY_PORT="${FIREASMSERVER_PROXY_PORT:-3142}"
 
 install -d -m 0755 "${ROOTFS_DIR}/etc/apt/apt.conf.d"

@@ -3,7 +3,7 @@
 #
 # Configure a running Pi 5 to use the laptop-hosted apt-cacher-ng proxy.
 # Per D035. Assumes the laptop-side setup (laptop_setup.sh) has already
-# run and the Pi is reachable via SSH at 10.0.0.2 with the fireasm_pi5_ed
+# run and the Pi is reachable via SSH at 10.0.2.2 with the fireasm_pi5_ed
 # key.
 #
 # Idempotent — re-running overwrites /etc/apt/apt.conf.d/00proxy on the Pi
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-10.0.0.2}"
+PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
 
@@ -22,7 +22,7 @@ SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
 # image proxy config AND this running-Pi override script. Avoids silent
 # drift where a custom build gets a different proxy address than
 # pi_setup.sh writes on its next run.
-LAPTOP_IP="${FIREASMSERVER_LAPTOP_IP:-10.0.0.1}"
+LAPTOP_IP="${FIREASMSERVER_LAPTOP_IP:-10.0.2.1}"
 PORT="${FIREASMSERVER_PROXY_PORT:-3142}"
 
 if [[ $EUID -eq 0 ]]; then
@@ -66,7 +66,7 @@ if ! ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
     echo "ERROR: Pi cannot reach TCP $LAPTOP_IP:$PORT" >&2
     echo "       Check that apt-cacher-ng is running on the laptop" >&2
     echo "       (./tooling/apt_cache/laptop_setup.sh) and that any" >&2
-    echo "       firewall permits 10.0.0.0/24." >&2
+    echo "       firewall permits 10.0.2.0/24." >&2
     exit 1
 fi
 

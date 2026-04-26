@@ -1,7 +1,7 @@
 #!/bin/bash -e
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Install the static-IP NetworkManager connection for eth0.
-# Per D022 + D024: Pi 5 is 10.0.0.2/24 on direct Ethernet to laptop.
+# Per D022 + D024: Pi 5 is 10.0.2.2/24 on direct Ethernet to laptop.
 
 : "${ROOTFS_DIR:?ROOTFS_DIR must be set by pi-gen}"
 
