@@ -24,8 +24,10 @@ from pathlib import Path
 from memlayout.bytecode import BytecodeError, run_bytecode
 from memlayout.models import (
     CpuCharacteristics,
+    MemoryRegion,
     TuningProfile,
 )
+from memlayout.reference import LayoutOverflow, allocate
 
 
 # Maps Python BytecodeError messages → wire-level rc codes.
@@ -203,3 +205,193 @@ def run_asm_cases(
         struct.unpack("<iQ", proc.stdout[i:i + 12])
         for i in range(0, expected_len, 12)
     ]
+
+
+# ---- Allocator differential support ------------------------------
+
+# Allocator-side rc codes (matches enum memlayout_err in
+# bcvm_abi.h). The 1..17 range from the bytecode VM is reused
+# verbatim when an inner-VM evaluation fails inside a record's
+# size or alignment expression.
+ALLOC_OK = 0
+ALLOC_ERR_OVERFLOW = 100
+ALLOC_ERR_HEAP_TOP = 101
+ALLOC_ERR_BAD_LIFETIME = 102
+
+MEMREQ_RECORD_BYTES = 48
+SIZE_BC_BYTES = 16
+ALIGN_BC_BYTES = 8
+
+
+def serialize_record(region: "MemoryRegion") -> bytes:
+    """Encode a MemoryRegion to its 48-byte wire form."""
+    size_bc = region.size_bytecode.ljust(SIZE_BC_BYTES, b"\x00")
+    align_bc = region.align_bytecode.ljust(
+        ALIGN_BC_BYTES, b"\x00",
+    )
+    return (
+        struct.pack("<I", region.name_hash)
+        + size_bc
+        + align_bc
+        + struct.pack(
+            "<HBB",
+            region.owner_id, int(region.lifetime),
+            int(region.writable),
+        )
+        + struct.pack("<QQ", 0, 0)
+    )
+
+
+def parse_record(blob: bytes) -> tuple[int, int]:
+    """Read the assigned (addr, size) pair from a record."""
+    return struct.unpack("<QQ", blob[32:48])
+
+
+def serialize_alloc_case(
+    regions: "list[MemoryRegion]",
+    cpu: CpuCharacteristics,
+    profile: TuningProfile,
+    heap_start: int,
+    ram_top: int,
+) -> bytes:
+    """Encode one allocator test case."""
+    cpu_vals = tuple(
+        getattr(cpu, name)
+        for name in cpu.__class__.model_fields.keys()
+    )
+    tun_vals = tuple(
+        getattr(profile, name)
+        for name in profile.__class__.model_fields.keys()
+    )
+    payload = struct.pack("<I", len(regions))
+    for region in regions:
+        payload += serialize_record(region)
+    payload += _serialize_cpu_tun(cpu_vals)
+    payload += _serialize_cpu_tun(tun_vals)
+    payload += struct.pack("<QQ", heap_start, ram_top)
+    return payload
+
+
+def alloc_driver_path(arch: str) -> Path:
+    """Per-arch allocator driver binary path."""
+    repo_root = Path(__file__).resolve().parents[3]
+    return (
+        repo_root
+        / "tooling/memlayout_diffharness/build"
+        / arch / "alloc_driver"
+    )
+
+
+def alloc_driver_command(arch: str) -> list[str]:
+    binary = str(alloc_driver_path(arch))
+    if arch == "x86_64":
+        return [binary]
+    qemu = shutil.which(f"qemu-{arch}-static")
+    if qemu is None:  # pragma: no cover
+        raise RuntimeError(
+            f"qemu-{arch}-static not found in PATH"
+        )
+    return [qemu, binary]
+
+
+def run_asm_alloc(
+    arch: str,
+    regions: "list[MemoryRegion]",
+    cpu: CpuCharacteristics,
+    profile: TuningProfile,
+    heap_start: int,
+    ram_top: int,
+) -> tuple[int, int, int, list[tuple[int, int]]]:
+    """Run one allocator case through the per-arch asm driver.
+
+    Returns (rc, forward_end, reverse_end, [(addr, size), ...])
+    where the assigned tuples are in record order (one per
+    input region; (0, 0) entries indicate skipped lifetimes
+    or unreached records on error).
+    """
+    payload = serialize_alloc_case(
+        regions, cpu, profile, heap_start, ram_top,
+    )
+    cmd = alloc_driver_command(arch)
+    proc = subprocess.run(  # noqa: S603 — args are own data
+        cmd, input=payload, capture_output=True,
+        check=False, timeout=120,
+    )
+    if proc.returncode != 0:  # pragma: no cover
+        raise RuntimeError(
+            f"{cmd[0]} returncode {proc.returncode}: "
+            f"{proc.stderr!r}"
+        )
+    expected_len = (
+        4 + 8 + 8 + len(regions) * MEMREQ_RECORD_BYTES
+    )
+    if len(proc.stdout) != expected_len:  # pragma: no cover
+        raise RuntimeError(
+            f"alloc driver stdout {len(proc.stdout)} bytes, "
+            f"expected {expected_len}"
+        )
+    rc, forward_end, reverse_end = struct.unpack(
+        "<iQQ", proc.stdout[:20],
+    )
+    assignments = []
+    for i in range(len(regions)):
+        offset = 20 + i * MEMREQ_RECORD_BYTES
+        rec = proc.stdout[offset:offset + MEMREQ_RECORD_BYTES]
+        assignments.append(parse_record(rec))
+    return rc, forward_end, reverse_end, assignments
+
+
+def _zero_assigns(
+    regions: "list[MemoryRegion]",
+) -> list[tuple[int, int]]:
+    return [(0, 0) for _ in regions]
+
+
+def _alloc_error_verdict(
+    exc: Exception,
+    regions: "list[MemoryRegion]",
+) -> tuple[int, int, int, list[tuple[int, int]]]:
+    """Map a Python-side allocator exception to wire-rc form."""
+    msg = str(exc)
+    if isinstance(exc, LayoutOverflow):
+        if "heap_start" in msg:
+            rc = ALLOC_ERR_HEAP_TOP
+        else:
+            rc = ALLOC_ERR_OVERFLOW
+        return rc, 0, 0, _zero_assigns(regions)
+    # BytecodeError — translate via the existing substring map.
+    for needle, rc in _PY_TO_RC:
+        if needle in msg:
+            return rc, 0, 0, _zero_assigns(regions)
+    return -1, 0, 0, _zero_assigns(regions)  # pragma: no cover
+
+
+def python_alloc_verdict(
+    regions: "list[MemoryRegion]",
+    cpu: CpuCharacteristics,
+    profile: TuningProfile,
+    heap_start: int,
+    ram_top: int,
+) -> tuple[int, int, int, list[tuple[int, int]]]:
+    """Python reference allocator verdict in wire-comparable form.
+
+    Returns the same tuple shape as run_asm_alloc so the test
+    harness can compare element-wise.
+    """
+    try:
+        layout = allocate(
+            regions, cpu, profile,
+            heap_start=heap_start, ram_top=ram_top,
+        )
+    except (LayoutOverflow, BytecodeError) as exc:
+        return _alloc_error_verdict(exc, regions)
+    by_name = {
+        a.name: (a.addr, a.size) for a in layout.assignments
+    }
+    assignments = [by_name[r.name] for r in regions]
+    return (
+        ALLOC_OK,
+        layout.forward_bump_end,
+        layout.reverse_bump_end,
+        assignments,
+    )

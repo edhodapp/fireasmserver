@@ -62,4 +62,64 @@ typedef struct bcvm_call {
  * where SP isn't yet established). */
 void memlayout_run_bytecode(bcvm_call_t *call);
 
+
+/* ---- Allocator ABI (D059 + D060 step 3B). The allocator
+ * walks the .memreq table at [memreq_start, memreq_end), runs
+ * each record's size and alignment bytecode via the bytecode
+ * VM, and forward-bumps non-stack regions / reverse-bumps
+ * stack regions. Errors that originate inside the VM surface
+ * as the same enum bcvm_err code, plus the allocator-specific
+ * codes below. */
+
+enum memlayout_err {
+    MEMLAYOUT_OK = 0,
+    /* Re-uses BCVM_ERR_* codes 1-17 verbatim when an
+     * inner-VM evaluation fails. */
+    MEMLAYOUT_ERR_OVERFLOW = 100,        /* forward bump past
+                                          * reverse bump or
+                                          * past u64 */
+    MEMLAYOUT_ERR_HEAP_TOP = 101,        /* heap_start >
+                                          * ram_top at entry */
+    MEMLAYOUT_ERR_BAD_LIFETIME = 102,    /* lifetime byte not
+                                          * in 0..3 */
+};
+
+/* Each .memreq record is 48 bytes (matches the macro emitters
+ * in arch/<isa>/memory/memreq.inc). Field offsets the asm
+ * allocator reads/writes directly: */
+#define MEMREQ_OFF_NAME_HASH      0
+#define MEMREQ_OFF_SIZE_BC        4
+#define MEMREQ_OFF_ALIGN_BC       20
+#define MEMREQ_OFF_OWNER          28
+#define MEMREQ_OFF_LIFETIME       30
+#define MEMREQ_OFF_WRITABLE       31
+#define MEMREQ_OFF_ASSIGNED_ADDR  32
+#define MEMREQ_OFF_ASSIGNED_SIZE  40
+#define MEMREQ_RECORD_BYTES       48
+#define MEMREQ_SIZE_BC_BYTES      16
+#define MEMREQ_ALIGN_BC_BYTES     8
+
+/* Lifetime tag values (match memlayout.types.Lifetime). */
+#define MEMLAYOUT_LIFETIME_STEADY     0
+#define MEMLAYOUT_LIFETIME_INIT_ONLY  1
+#define MEMLAYOUT_LIFETIME_IMMUT      2
+#define MEMLAYOUT_LIFETIME_STACK      3
+
+typedef struct memlayout_call {
+    uint8_t        *memreq_start;
+    uint8_t        *memreq_end;
+    const uint64_t *cpu_values;
+    size_t          cpu_count;
+    const uint64_t *tun_values;
+    size_t          tun_count;
+    uint64_t        heap_start;
+    uint64_t        ram_top;
+    int32_t         rc_out;
+    int32_t         _pad;
+    uint64_t        forward_end_out;
+    uint64_t        reverse_end_out;
+} memlayout_call_t;
+
+void memlayout_run_allocator(memlayout_call_t *call);
+
 #endif /* FIREASM_BCVM_ABI_H */

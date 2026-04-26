@@ -86,6 +86,7 @@ run_memlayout_diff() {
     fi
     "$REPO_ROOT/.venv/bin/pytest" \
         tooling/tests/test_memlayout_diff.py \
+        tooling/tests/test_memlayout_alloc_diff.py \
         -q --no-header
 }
 
