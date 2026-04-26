@@ -36,16 +36,45 @@ SECTIONS
     }
 
     /*
-     * _image_end is defined here, *after* both .text and .rodata output
-     * sections, so the Linux arm64 Image header's image_size field
-     * (computed as `_image_end - _start` in boot.S) covers the full
-     * image the loader needs to place in memory. Previously this symbol
-     * lived in the assembly and got pulled into .text output, causing
-     * image_size to exclude .rodata (e.g., the READY string) — Firecracker
-     * loads the whole file regardless, but a stricter arm64 boot loader
-     * would truncate per the spec.
+     * Init-time static memory layout (D059 + D060) — step-1 plumbing.
+     * The .memreq input section collects 48-byte declaration records
+     * emitted by arch/<isa>/memory/memreq.inc. Today no module
+     * declares a region, so the section links as zero-size; the
+     * __memreq_start / __memreq_end bracket symbols still resolve
+     * correctly so the real allocator (lands in step 3) iterates
+     * an empty range and returns immediately, without special-casing.
+     */
+    . = ALIGN(8);
+    .memreq : {
+        __memreq_start = .;
+        KEEP(*(.memreq))
+        __memreq_end = .;
+    }
+
+    /*
+     * _image_end is defined here, *after* .text + .rodata + .memreq,
+     * so the Linux arm64 Image header's image_size field (computed
+     * as `_image_end - _start` in boot.S) covers the full image the
+     * loader needs to place in memory. Previously this symbol lived
+     * in the assembly and got pulled into .text output, causing
+     * image_size to exclude .rodata (e.g., the READY string) —
+     * Firecracker loads the whole file regardless, but a stricter
+     * arm64 boot loader would truncate per the spec.
      */
     _image_end = .;
+
+    /*
+     * Layout contract symbols for the init-time bump allocator
+     * (D059 + D060). __heap_start is the first 4-KiB-aligned byte
+     * past the loaded image; __ram_top is the inclusive-exclusive
+     * bound on guest physical RAM. Firecracker's aarch64 layout
+     * places guest RAM at [0x80000000, 0x88000000) by default
+     * (128 MiB). The allocator forward-bumps non-stack regions
+     * from __heap_start and reverse-bumps stack regions from
+     * __ram_top.
+     */
+    __heap_start = ALIGN(_image_end + (0x80000000 + 0x80000), 0x1000);
+    __ram_top    = 0x88000000;
 
     /DISCARD/ : {
         *(.comment)
