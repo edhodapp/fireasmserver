@@ -13,7 +13,12 @@ AS      := aarch64-linux-gnu-as
 LD      := aarch64-linux-gnu-ld
 OBJCOPY := aarch64-linux-gnu-objcopy
 
-ASFLAGS :=
+# -I path for `.include "bcvm_errors.inc"` from
+# arch/aarch64/memory/bytecode_vm.S. The errors.inc file is
+# the shared contract between the diff harness driver and
+# the kernel-side VM; both ends include it from the same
+# location.
+ASFLAGS := -I ../../tooling/memlayout_diffharness
 LDFLAGS :=
 
 SRC_DIR       := platform/$(PLATFORM)

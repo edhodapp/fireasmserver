@@ -16,11 +16,17 @@ LD := x86_64-linux-gnu-ld
 # ELF. firecracker boots via PVH, which requires a 64-bit ELF wrapping
 # the same `[bits 32]` entry stub. ELF class is a function of (arch,
 # platform).
+# -i path for `%include "bcvm_errors.nasm.inc"` from
+# arch/x86_64/memory/bytecode_vm.S — shared contract with
+# the diff harness driver. Trailing slash is required by
+# NASM's path-handling.
+NASM_INCLUDE := -i ../../tooling/memlayout_diffharness/
+
 ifeq ($(PLATFORM),firecracker)
-ASFLAGS := -f elf64
+ASFLAGS := -f elf64 $(NASM_INCLUDE)
 LDFLAGS :=
 else
-ASFLAGS := -f elf32
+ASFLAGS := -f elf32 $(NASM_INCLUDE)
 LDFLAGS := -m elf_i386
 endif
 
