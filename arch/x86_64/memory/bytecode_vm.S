@@ -4,7 +4,7 @@
 ; expressions. Differential-tested under user-mode QEMU
 ; against the Python reference at tooling/src/memlayout/. Both
 ; must agree on every (bytecode, cpu_values, tuning_values)
-; input — see tooling/tests/test_memlayout_diff_x86_64.py.
+; input — see tooling/tests/test_memlayout_diff.py.
 ;
 ; ABI (matches tooling/memlayout_diffharness/bcvm_abi.h):
 ;   void memlayout_run_bytecode(bcvm_call_t *call);
@@ -12,25 +12,43 @@
 ; On return: call->rc_out = 0 (success) or BCVM_ERR_* (fail).
 ;            call->result_out = stack-top on success.
 ;
-; Register map within the body:
-;   rbx — call struct pointer (callee-saved; saved at entry)
-;   r12 — code base
-;   r13 — code_end (= code + code_len)
-;   r14 — cpu_values base
-;   r15 — cpu_count
-;   rbp — tun_values base (deliberately repurposed from frame
-;                          ptr; we don't establish a frame)
-;   r10 — tun_count
-;   r11..r9 — value stack (r11 = top, r9 = bottom; only 4 slots)
-;   ecx — stack depth (0..4)
-;   r8  — instruction pointer (offset into code)
-;   rax — scratch / return-register convention sink
+; Register map within the body — chosen so that MUL's implicit
+; rdx clobber and DIV_LIT's rsi/rdi temp use never touch the
+; value stack:
+;   Callee-saved (preserved across the call):
+;     rbx — call struct pointer
+;     rbp — tun_values base
+;     r12 — code base
+;     r13 — code_end (= code + code_len)
+;     r14 — cpu_values base
+;     r15 — value stack slot 3 (bottom)
+;   Caller-saved:
+;     r11 — value stack top (slot 0)
+;     r10 — value stack slot 1
+;     r9  — value stack slot 2
+;     ecx — stack depth (0..4)
+;     r8  — instruction pointer (offset into code)
+;     rax, rdi, rsi, rdx — scratch (mul/div implicitly use
+;                          rdx and rax; both are kept fully
+;                          out of the stack).
+;   Memory-access:
+;     cpu_count via qword [rbx + 24]
+;     tun_count via qword [rbx + 40]
+;   (only consulted in CPU/TUNING opcodes; no caching needed.)
 ;
-; Push/pop are NASM macros so each invocation expands inline.
-; The VM keeps no memory stack of its own at steady state;
-; the function-level pushes at entry are the AAPCS-equivalent
-; SysV ABI save of callee-saved registers, which the boot.S
-; step-4 caller will supply via __bootstrap_stack_top.
+; This reorg fixes the HIGH bug from the first attempt: previous
+; layout had rdx as stack slot 1 and rsi as stack slot 2; `mul`
+; would clobber rdx mid-MUL, corrupting any value at depth≥2;
+; `div`'s divisor temp aliased rsi the same way. Random Hypothesis
+; bytecode rarely exercises the depth≥3-then-MUL shape, so the
+; bug slipped past 100 random vectors per arch and 25 hand
+; vectors. New layout keeps mul/div scratch in registers that
+; are never simultaneously stack slots.
+;
+; Pre-stack-safe within the body — no push/pop instructions, no
+; call/ret. The function-level pushes at entry follow the SysV
+; ABI for callee-saved registers; the boot.S step-4 caller will
+; supply __bootstrap_stack_top for that frame save.
 ;
 ; Opcodes (must match memlayout.types.Opcode):
 ;   0x00 END
@@ -46,23 +64,14 @@
 
 %include "bcvm_errors.nasm.inc"
 
-; ---- 4-deep value stack via dedicated registers.
-;
-; Slots: r11 (top), rdx, rsi, r9 (bottom).
-; Depth: ecx.
-;
-; Push expands to: if ecx == 4, jump to overflow; else
-; r9 ← rsi, rsi ← rdx, rdx ← r11, r11 ← src; ecx += 1.
-;
-; Pop expands to: if ecx == 0, jump to underflow; else
-; dst ← r11, r11 ← rdx, rdx ← rsi, rsi ← r9, r9 ← 0; ecx -= 1.
+; ---- 4-deep value stack: r11 (top), r10, r9, r15 (bottom).
 
 %macro bcvm_push 1
     cmp     ecx, 4
     je      .Lbcvm_stack_overflow
-    mov     r9,  rsi
-    mov     rsi, rdx
-    mov     rdx, r11
+    mov     r15, r9
+    mov     r9,  r10
+    mov     r10, r11
     mov     r11, %1
     inc     ecx
 %endmacro
@@ -71,10 +80,10 @@
     test    ecx, ecx
     jz      .Lbcvm_stack_underflow
     mov     %1,  r11
-    mov     r11, rdx
-    mov     rdx, rsi
-    mov     rsi, r9
-    xor     r9d, r9d
+    mov     r11, r10
+    mov     r10, r9
+    mov     r9,  r15
+    xor     r15d, r15d
     dec     ecx
 %endmacro
 
@@ -109,9 +118,7 @@ memlayout_run_bytecode:
     mov     r12, [rbx + 0]              ; code base
     mov     r13, [rbx + 8]              ; code_len
     mov     r14, [rbx + 16]             ; cpu_values
-    mov     r15, [rbx + 24]             ; cpu_count
     mov     rbp, [rbx + 32]             ; tun_values
-    mov     r10, [rbx + 40]             ; tun_count
 
     ; Empty bytecode: code is null OR code_len is zero.
     test    r12, r12
@@ -123,9 +130,9 @@ memlayout_run_bytecode:
 
     ; Init stack and ip.
     xor     r11d, r11d
-    xor     edx,  edx
-    xor     esi,  esi
+    xor     r10d, r10d
     xor     r9d,  r9d
+    xor     r15d, r15d
     xor     ecx,  ecx
     xor     r8d,  r8d                   ; r8 = ip = 0
 
@@ -163,7 +170,9 @@ memlayout_run_bytecode:
     add     rax, 4
     cmp     rax, r13
     ja      .Lbcvm_truncated
-    mov     eax, dword [r12 + r8]       ; LE u32 read
+    mov     eax, dword [r12 + r8]       ; LE u32 read (single
+                                        ; load — x86_64 supports
+                                        ; unaligned 32-bit loads)
     add     r8, 4
     mov     rdi, rax                    ; zero-extend to 64
     bcvm_push rdi
@@ -176,7 +185,7 @@ memlayout_run_bytecode:
     jae     .Lbcvm_truncated
     movzx   eax, byte [r12 + r8]
     inc     r8
-    cmp     rax, r10
+    cmp     rax, [rbx + 40]             ; tun_count (memory)
     jae     .Lbcvm_tuning_oor
     mov     rdi, [rbp + rax * 8]
     bcvm_push rdi
@@ -189,18 +198,19 @@ memlayout_run_bytecode:
     jae     .Lbcvm_truncated
     movzx   eax, byte [r12 + r8]
     inc     r8
-    cmp     rax, r15
+    cmp     rax, [rbx + 24]             ; cpu_count (memory)
     jae     .Lbcvm_cpu_oor
     mov     rdi, [r14 + rax * 8]
     bcvm_push rdi
     jmp     .Lbcvm_loop
 
 ; ---- MUL ---------------------------------------------------------
-; Pop b → rdi, pop a → rax, mul rdi (rdx:rax = a*b). Overflow
-; if rdx != 0 (per D056). Push rax.
+; Pop b → rdi, pop a → rax. mul rdi: rdx:rax = a * b. Overflow
+; iff rdx != 0 (per D056). Push rax. rdx is scratch, never a
+; stack slot — clobber is harmless.
 .Lbcvm_op_mul:
     bcvm_pop rdi                        ; b
-    bcvm_pop rax                        ; a (must be in rax for mul)
+    bcvm_pop rax                        ; a (must be in rax)
     mul     rdi                         ; rdx:rax = rax * rdi
     test    rdx, rdx
     jnz     .Lbcvm_mul_overflow
@@ -208,6 +218,10 @@ memlayout_run_bytecode:
     jmp     .Lbcvm_loop
 
 ; ---- DIV_LIT <u8> ------------------------------------------------
+; Read divisor (rax). Pop dividend → rdi. xchg rax, rdi puts
+; dividend in rax + divisor in rdi. xor edx, edx zeroes the
+; high half. div rdi: rax = quotient. rdx and rdi are scratch,
+; never stack slots.
 .Lbcvm_op_div_lit:
     lea     rax, [r12 + r8]
     cmp     rax, r13
@@ -217,15 +231,9 @@ memlayout_run_bytecode:
     test    al, al
     jz      .Lbcvm_div_zero
     bcvm_pop rdi                        ; dividend
-    mov     rsi, rax                    ; save divisor (rsi
-                                        ; was top-1 before the
-                                        ; pop, but the pop
-                                        ; already shifted, so
-                                        ; rsi is free to reuse
-                                        ; here)
-    mov     rax, rdi
-    xor     edx, edx                    ; rdx:rax / rsi
-    div     rsi
+    xchg    rax, rdi                    ; rax=dividend, rdi=div
+    xor     edx, edx
+    div     rdi
     bcvm_push rax
     jmp     .Lbcvm_loop
 
@@ -235,22 +243,14 @@ memlayout_run_bytecode:
     bcvm_pop rax                        ; value
     test    rdi, rdi
     jz      .Lbcvm_align_zero
-    lea     r10, [rdi - 1]              ; align - 1 (TEMP; we
-                                        ; reload r10/tun_count
-                                        ; from the struct on
-                                        ; tuning ops, but here
-                                        ; we never touch
-                                        ; tun_count again before
-                                        ; loop iter ends)
-    test    rdi, r10
+    lea     rsi, [rdi - 1]              ; mask = align - 1
+    test    rdi, rsi
     jnz     .Lbcvm_align_not_pow2
-    add     rax, r10                    ; value + (align - 1)
-    jc      .Lbcvm_align_up_overflow    ; CF on unsigned ovf
-    not     r10                         ; ~(align - 1)
-    and     rax, r10
+    add     rax, rsi                    ; value + (align - 1)
+    jc      .Lbcvm_align_up_overflow    ; D056 carry-detect
+    not     rsi                         ; ~(align - 1)
+    and     rax, rsi
     bcvm_push rax
-    ; r10 was tun_count; restore from struct.
-    mov     r10, [rbx + 40]
     jmp     .Lbcvm_loop
 
 ; ---- CALL_THUNK <u32> --------------------------------------------
@@ -272,7 +272,8 @@ memlayout_run_bytecode:
     mov     [rbx + 56], r11              ; result_out = top
     jmp     .Lbcvm_done
 
-; ---- Failure tail ------------------------------------------------
+; ---- Failure tail. Each error site loads the code into eax
+;      then falls into .Lbcvm_fail.
 .Lbcvm_empty:
     mov     eax, BCVM_ERR_EMPTY_BYTECODE
     jmp     .Lbcvm_fail

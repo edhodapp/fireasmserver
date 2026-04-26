@@ -109,6 +109,15 @@ def fixture_profile() -> TuningProfile:
 # file but stop at vectors the asm side actually supports
 # (CALL_THUNK with a registered thunk is excluded — the asm
 # side doesn't run thunks).
+#
+# Includes regression vectors from Gemini's 2026-04-26 HIGH
+# review on commit f10ca0f's first attempt: the x86_64 stack
+# layout that put rdx and rsi as slot-1 / slot-2 silently
+# corrupted any stack content at depth ≥ 3 across MUL/DIV.
+# Random Hypothesis bytes don't reliably construct the
+# depth-3-with-deep-slot-still-needed shape, so an explicit
+# vector pins it. Both arches must keep deep-slot values
+# intact across MUL and DIV_LIT.
 def _hand_vectors() -> list[tuple[bytes, str]]:
     return [
         (_b(Opcode.LIT, _u32(0x1234ABCD), Opcode.END),
@@ -171,6 +180,50 @@ def _hand_vectors() -> list[tuple[bytes, str]]:
          "mul_below_threshold"),
         (_b(Opcode.CALL_THUNK, _u32(7), Opcode.END),
          "call_thunk_unregistered"),
+
+        # Regression: Gemini HIGH 2026-04-26 — push 4 distinct
+        # values to fill stack, MUL pops top two and pushes
+        # one; the 2 remaining at the BOTTOM of the stack
+        # must survive the MUL. Then MUL again uses one of
+        # those preserved bottom values; if it had been
+        # silently zero-clobbered by an earlier mul's rdx
+        # write, the second product would differ from the
+        # Python reference.
+        # Stack history:
+        #   push 7, 11, 13, 17  → [17,13,11,7]
+        #   MUL                 → [17*13, 11, 7]
+        #   MUL                 → [17*13*11, 7]
+        #   MUL                 → [17*13*11*7]
+        # Every value at depth>=3 must round-trip through
+        # the first MUL untouched.
+        (_b(Opcode.LIT, _u32(7),
+            Opcode.LIT, _u32(11),
+            Opcode.LIT, _u32(13),
+            Opcode.LIT, _u32(17),
+            Opcode.MUL,
+            Opcode.MUL,
+            Opcode.MUL,
+            Opcode.END),
+         "mul_preserves_deep_stack"),
+
+        # Same shape, DIV_LIT instead — the divisor ABI on
+        # x86_64 used to alias rsi (slot 2) before the
+        # 2026-04-26 reorg.
+        # push 100, 200, 300, 400 → [400,300,200,100]
+        # DIV_LIT 4               → [100, 300, 200, 100]
+        # MUL                     → [100*300, 200, 100]
+        # MUL                     → [100*300*200, 100]
+        # MUL                     → [100*300*200*100]
+        (_b(Opcode.LIT, _u32(100),
+            Opcode.LIT, _u32(200),
+            Opcode.LIT, _u32(300),
+            Opcode.LIT, _u32(400),
+            Opcode.DIV_LIT, 4,
+            Opcode.MUL,
+            Opcode.MUL,
+            Opcode.MUL,
+            Opcode.END),
+         "div_lit_preserves_deep_stack"),
     ]
 
 
