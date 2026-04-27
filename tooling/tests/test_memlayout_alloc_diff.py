@@ -202,11 +202,28 @@ def _hand_alloc_cases() -> list[tuple[
              writable=True,
          )],
          0x1000, 0x10000),
-        # Inner-VM BytecodeError surfacing through the
-        # allocator: size_bc divides by literal zero →
-        # BCVM_ERR_DIV_LIT_ZERO (rc=12) propagates out as
-        # the allocator's rc, exercising the BytecodeError-
-        # to-rc mapping path in python_alloc_verdict.
+        # Regression for Gemini HIGH 2026-04-26: a forward-
+        # only layout (no stack regions) whose forward bump
+        # exceeds ram_top must halt with MEMLAYOUT_ERR_OVERFLOW.
+        # Both sides previously missed this — Python's
+        # _forward_bump only checked u64 wrap; the asm side
+        # only cross-checked vs reverse during pass 2 (which
+        # never ran when no stack region was declared). The
+        # differential test agreed on the WRONG answer (rc=0
+        # with a forward bump well past ram_top). Now both
+        # sides return MEMLAYOUT_ERR_OVERFLOW.
+        ("forward_only_overflows_ram_top",
+         [
+             _region("a", 0x1000, 0x1000),
+             _region("b", 0x1000, 0x1000),
+             _region("c", 0x1000, 0x1000),
+         ],
+         0x1000, 0x3000),
+        # Same bug class, single huge region whose size
+        # alone overshoots ram_top.
+        ("single_region_too_big",
+         [_region("hog", 0x10_0000, 0x1000)],
+         0x1000, 0x2000),
         ("inner_bc_div_zero",
          [MemoryRegion(
              name="bad_size",

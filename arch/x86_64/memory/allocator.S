@@ -72,6 +72,14 @@
 %define BC_OFF_RESULT      56
 %define BC_SIZE_BYTES      64
 
+; Allocator-local scratch slot inside the 72-byte stack frame:
+; the first 64 bytes hold the bcvm_call struct (field offsets
+; 0..63 above); the next 8 bytes hold a per-record size cache
+; while the second eval (align_bc) runs. Named constant rather
+; than a hardcoded 0x40 to avoid visual-confusion bugs with
+; BC_OFF_TUN_COUNT (40 decimal vs 0x40 = 64 hex).
+%define ALLOC_SCRATCH_SIZE_OFF 64
+
 ; -- Lifetime values --
 %define LT_STEADY    0
 %define LT_INIT_ONLY 1
@@ -142,7 +150,7 @@ memlayout_run_allocator:
     test    eax, eax
     jnz     .Lalloc_inner_fail
     mov     rcx, [rbp + BC_OFF_RESULT]      ; size into rcx
-    mov     [rbp + 0x40], rcx                ; stash at sp+0x40
+    mov     [rbp + ALLOC_SCRATCH_SIZE_OFF], rcx                ; stash at sp + ALLOC_SCRATCH_SIZE_OFF
 
     lea     rdi, [r12 + MR_OFF_ALIGN_BC]
     mov     rsi, MR_ALIGN_BC_BYTES
@@ -158,16 +166,22 @@ memlayout_run_allocator:
     test    rdx, rsi
     jnz     .Lalloc_overflow
 
-    ; align_up forward bump.
+    ; align_up forward bump. Detect carry on the
+    ; align-mask add per D056 (Gemini MEDIUM 2026-04-26).
     add     r14, rsi
+    jc      .Lalloc_overflow
     not     rsi
     and     r14, rsi
 
     ; Bounds: forward + size <= ram_top. Detect carry on
-    ; the addition.
-    mov     rcx, [rbp + 0x40]
+    ; the addition (u64 wrap) AND > ram_top (Gemini HIGH
+    ; 2026-04-26 — pure forward overflow was undetected
+    ; in the absence of stack regions).
+    mov     rcx, [rbp + ALLOC_SCRATCH_SIZE_OFF]
     add     r14, rcx
-    jc      .Lalloc_overflow                 ; per D056
+    jc      .Lalloc_overflow                 ; u64 wrap
+    cmp     r14, [rbx + ML_OFF_RAM_TOP]
+    ja      .Lalloc_overflow                 ; > ram_top
 
     ; Write back. r14 now holds forward + size; the assigned
     ; addr is forward - size = r14 - rcx.
@@ -198,7 +212,7 @@ memlayout_run_allocator:
     test    eax, eax
     jnz     .Lalloc_inner_fail
     mov     rcx, [rbp + BC_OFF_RESULT]
-    mov     [rbp + 0x40], rcx
+    mov     [rbp + ALLOC_SCRATCH_SIZE_OFF], rcx
 
     lea     rdi, [r12 + MR_OFF_ALIGN_BC]
     mov     rsi, MR_ALIGN_BC_BYTES
@@ -214,7 +228,7 @@ memlayout_run_allocator:
     jnz     .Lalloc_overflow
 
     ; size > reverse → underflow.
-    mov     rcx, [rbp + 0x40]
+    mov     rcx, [rbp + ALLOC_SCRATCH_SIZE_OFF]
     cmp     rcx, r15
     ja      .Lalloc_overflow
 

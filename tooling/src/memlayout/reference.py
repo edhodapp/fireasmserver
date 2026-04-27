@@ -64,12 +64,24 @@ def _align_down(value: int, align: int) -> int:
 
 
 def _forward_bump(
-    bump: int, size: int, align: int,
+    bump: int, size: int, align: int, ram_top: int,
 ) -> tuple[int, int]:
     addr = _align_up(bump, align)
+    if addr > MAX_U64:  # pragma: no cover
+        # Reachable only if heap_start is itself near 2^64
+        # AND the first region's alignment is large enough
+        # to push align_up past 2^64. Asm side catches the
+        # same condition via the carry flag on `adds`. The
+        # tests run with realistic heap_start values, so
+        # this path stays defensive in Python.
+        raise LayoutOverflow("align_up overflow")
     new_bump = addr + size
     if new_bump > MAX_U64:
         raise LayoutOverflow("forward bump overflow u64")
+    if new_bump > ram_top:
+        raise LayoutOverflow(
+            f"forward bump {new_bump} > ram_top {ram_top}"
+        )
     return addr, new_bump
 
 
@@ -89,6 +101,7 @@ def _pass_forward(
     profile: TuningProfile,
     thunks: Mapping[int, ThunkFn],
     heap_start: int,
+    ram_top: int,
 ) -> tuple[list[AssignedRegion], int]:
     bump = heap_start
     out: list[AssignedRegion] = []
@@ -98,7 +111,7 @@ def _pass_forward(
         size, align = _eval_size_align(
             region, cpu, profile, thunks,
         )
-        addr, bump = _forward_bump(bump, size, align)
+        addr, bump = _forward_bump(bump, size, align, ram_top)
         out.append(AssignedRegion(
             name=region.name, addr=addr, size=size,
         ))
@@ -156,7 +169,8 @@ def allocate(
         )
     used_thunks: Mapping[int, ThunkFn] = thunks or {}
     forward, forward_end = _pass_forward(
-        regions, cpu, profile, used_thunks, heap_start,
+        regions, cpu, profile, used_thunks,
+        heap_start, ram_top,
     )
     reverse, reverse_end = _pass_reverse(
         regions, cpu, profile, used_thunks, ram_top, forward_end,

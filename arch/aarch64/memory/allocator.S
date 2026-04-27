@@ -163,15 +163,20 @@ memlayout_run_allocator:
     sub     x0, x26, #1
     and     x1, x26, x0
     cbnz    x1, .Lalloc_overflow        // non-pow2 align
-    add     x22, x22, x0
+    adds    x22, x22, x0                // forward + (align - 1)
+    b.cs    .Lalloc_overflow            // align_up u64-carry
     mvn     x1, x0
     and     x22, x22, x1                // forward = align_up
 
-    // Bounds: forward + size <= ram_top (also implies no
-    // u64 wrap because ram_top is in u64). Use addition with
-    // carry detect.
+    // Bounds: forward + size <= ram_top.
+    // x23 still holds ram_top at pass 1 (reverse bump only
+    // moves in pass 2). Detect both u64 wrap and exceeding
+    // ram_top — Gemini HIGH 2026-04-26 caught the missing
+    // upper bound.
     adds    x0, x22, x25
-    b.cs    .Lalloc_overflow
+    b.cs    .Lalloc_overflow            // u64 wrap
+    cmp     x0, x23
+    b.hi    .Lalloc_overflow            // > ram_top
 
     // Write assigned_addr, assigned_size.
     str     x22, [x20, #MR_OFF_ASSIGNED_ADDR]
