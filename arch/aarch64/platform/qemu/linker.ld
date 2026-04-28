@@ -41,12 +41,23 @@ SECTIONS
     _image_end = .;
 
     /*
+     * Bootstrap stack for init_memory_layout() (D059 step 4.1).
+     * 4 KiB scratch for one allocator pass; 64 KiB slack past the
+     * image. The `(0x40000000 + 0x80000)` term is the link-time →
+     * runtime conversion (this script uses `. = 0x0`); see the
+     * firecracker linker.ld for the cross-arch asymmetry note.
+     * ALIGN(..., 16) enforces AArch64 SP alignment.
+     */
+    __bootstrap_stack_size = 0x1000;
+    __bootstrap_stack_top  = ALIGN(_image_end + (0x40000000 + 0x80000) + 0x10000, 16);
+
+    /*
      * Layout contract symbols. QEMU -M virt places the image at
      * RAM_BASE (0x40000000) + text_offset (0x80000); guest RAM is
      * configurable but defaults to 128 MiB, so the inclusive-
      * exclusive top is 0x48000000.
      */
-    __heap_start = ALIGN(_image_end + (0x40000000 + 0x80000), 0x1000);
+    __heap_start = ALIGN(__bootstrap_stack_top, 0x1000);
     __ram_top    = 0x48000000;
 
     /DISCARD/ : {

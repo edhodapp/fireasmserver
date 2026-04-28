@@ -64,16 +64,39 @@ SECTIONS
     _image_end = .;
 
     /*
+     * Bootstrap stack for init_memory_layout() (D059 step 4.1).
+     * 4 KiB of scratch consumed by a single allocator pass before
+     * .memreq lifetime=stack regions are assigned. Anchored 64 KiB
+     * past the loaded image. Firecracker zero-inits guest RAM and
+     * the runtime always pushes before reading, so no explicit
+     * zeroing is required. Replaced by a .memreq lifetime=stack
+     * declaration in step 5.
+     *
+     * The `(0x80000000 + 0x80000)` term is load-bearing: this script
+     * sets `. = 0x0` at the top, so every linker symbol resolves to
+     * a *file offset*, not a runtime address. The term converts
+     * link-time → runtime by adding RAM_BASE + text_offset. Don't
+     * "simplify" it away. The contrasting convention is x86_64,
+     * where `. = 0x100000` makes VMA equal to runtime PA and no
+     * conversion term is needed — see the x86_64 linker scripts
+     * for that branch of the asymmetry.
+     *
+     * ALIGN(..., 16) enforces AArch64 SP 16-byte alignment.
+     */
+    __bootstrap_stack_size = 0x1000;
+    __bootstrap_stack_top  = ALIGN(_image_end + (0x80000000 + 0x80000) + 0x10000, 16);
+
+    /*
      * Layout contract symbols for the init-time bump allocator
      * (D059 + D060). __heap_start is the first 4-KiB-aligned byte
-     * past the loaded image; __ram_top is the inclusive-exclusive
+     * past the bootstrap stack; __ram_top is the inclusive-exclusive
      * bound on guest physical RAM. Firecracker's aarch64 layout
      * places guest RAM at [0x80000000, 0x88000000) by default
      * (128 MiB). The allocator forward-bumps non-stack regions
      * from __heap_start and reverse-bumps stack regions from
      * __ram_top.
      */
-    __heap_start = ALIGN(_image_end + (0x80000000 + 0x80000), 0x1000);
+    __heap_start = ALIGN(__bootstrap_stack_top, 0x1000);
     __ram_top    = 0x88000000;
 
     /DISCARD/ : {

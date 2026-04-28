@@ -35,6 +35,24 @@ SECTIONS
     _image_end = .;
 
     /*
+     * Bootstrap stack for init_memory_layout() (D059 step 4.1).
+     * 4 KiB scratch for one allocator pass; 64 KiB slack past the
+     * image. Replaced by a .memreq lifetime=stack declaration in
+     * step 5.
+     *
+     * No RAM-base term in the formula: this script sets
+     * `. = 0x100000` at the top, so VMA equals runtime PA on
+     * x86_64. `_image_end` is already a runtime address; adding a
+     * RAM-base offset would land the stack past mapped guest RAM.
+     * The contrasting convention is aarch64, where `. = 0x0` makes
+     * symbols file offsets and the script must add RAM_BASE +
+     * text_offset explicitly — see the aarch64 linker scripts for
+     * that branch of the asymmetry.
+     */
+    __bootstrap_stack_size = 0x1000;
+    __bootstrap_stack_top  = ALIGN(_image_end + 0x10000, 16);
+
+    /*
      * Layout contract symbols. Firecracker's x86_64 default guest
      * RAM goes up to ~0xc0000000 (3 GiB) before the MMIO gap;
      * conservative bound for the bump allocator's reverse-from-
@@ -42,8 +60,7 @@ SECTIONS
      * Firecracker's default --vcpu-count and --mem-size envelope
      * and free of the MMIO regions Firecracker maps above 3 GiB.
      */
-    . = ALIGN(0x1000);
-    __heap_start = .;
+    __heap_start = ALIGN(__bootstrap_stack_top, 0x1000);
     __ram_top    = 0x40000000;
 }
 
