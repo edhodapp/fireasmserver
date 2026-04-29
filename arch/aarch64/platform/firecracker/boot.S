@@ -247,12 +247,33 @@ _entry:
     // so initialize it before any function that pushes a frame.
     // emit_hex32 does `stp x29, x30, [sp, #-32]!` on its VIRTIO-
     // fail path; an uninitialized sp would fault before emitting
-    // the diagnostic — exactly when it matters most. Point sp
-    // 2 MiB above RAM_BASE (0x8020_0000), well above the image
-    // load point at 0x8008_0000 + image_size (stub is a few KiB).
-    // Mirrors the x86_64 stub's 2-MiB stack convention.
-    movz    x5, #0x8020, lsl #16     // x5 = 0x80200000
+    // the diagnostic — exactly when it matters most.
+    //
+    // SP points at the bootstrap stack reserved by the linker
+    // script (D059 step 4.1: __bootstrap_stack_top — 4 KiB
+    // scratch, 16-byte aligned, anchored 64 KiB past _image_end).
+    // The bootstrap stack is consumed by init_memory_layout's
+    // single allocator pass (D060); the same stack is reused by
+    // downstream code (UART writers, VIRTIO init) until step 5
+    // migrates it to a .memreq lifetime=stack region. Replaces
+    // the previous hardcoded 0x80200000 anchor.
+    //
+    // CPU0-only by construction: the MPIDR park gate above filters
+    // secondary cores to WFE before this SP setup. Multi-core wake
+    // (post-step-5) gives each secondary its own .memreq-assigned
+    // stack from the allocator's per-core table; the bootstrap
+    // stack is never shared across cores.
+    ldr     x5, =__bootstrap_stack_top
     mov     sp, x5
+
+    // Run the init-time static memory allocator (D060 step 4.2).
+    // Pre-bootstrap-stack-safe contract: callee may use SP it was
+    // handed, must not assume a kernel boot stack is in place. With
+    // an empty .memreq section (today) the call returns immediately;
+    // the wire-up exists so the call site stops being a no-op the
+    // moment a module declares a region (step 5). Symmetric to the
+    // x86_64 platforms once D062's mode switch lands.
+    bl      init_memory_layout
 
     // UART base in x0, preserved across emit_bytes / emit_hex32 calls.
     movz    x0, #0x4000, lsl #16
@@ -734,6 +755,13 @@ _entry:
 
 .Ldone:
     // WFE forever — Firecracker sees halt via MMIO quiescence.
+    //
+    // Placeholder for secondary_entry (post-step-5). Today: every
+    // secondary core lands here from the MPIDR park gate at _entry
+    // and stays in WFE until power-off. Post-step-5: this becomes
+    // the PSCI_CPU_ON target — wakes here, reads MPIDR, indexes
+    // into the allocator's per-core stack-base table, sets SP to
+    // its own dedicated stack, then enters the per-core actor loop.
     wfe
     b       .Ldone
 

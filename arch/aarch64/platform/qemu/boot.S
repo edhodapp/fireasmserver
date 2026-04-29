@@ -38,6 +38,29 @@ _entry:
     and     x5, x5, #0xffffff
     cbnz    x5, .Ldone
 
+    // SP at the bootstrap stack reserved by the linker script
+    // (D059 step 4.1: __bootstrap_stack_top). 4 KiB scratch,
+    // 16-byte aligned, anchored 64 KiB past the image. Required
+    // before bl init_memory_layout — even though the current
+    // stub doesn't push, the future allocator's diagnostic path
+    // will, and the contract is pre-bootstrap-stack-safe, not
+    // pre-any-stack-safe.
+    //
+    // CPU0-only by construction: the MPIDR park gate above filters
+    // secondary cores to WFE before this SP setup. Multi-core wake
+    // (post-step-5) gives each secondary its own .memreq-assigned
+    // stack from the allocator's per-core table; the bootstrap
+    // stack is never shared across cores.
+    ldr     x5, =__bootstrap_stack_top
+    mov     sp, x5
+
+    // Run the init-time static memory allocator (D060 step 4.2).
+    // Returns immediately today (.memreq is empty); wire-up
+    // exists so the call site stops being a no-op the moment a
+    // module declares a region (step 5). Mirrors the firecracker
+    // platform.
+    bl      init_memory_layout
+
     // PL011 base in x0 (QEMU virt default).
     movz    x0, #0x0900, lsl #16
 
@@ -65,6 +88,12 @@ _entry:
     dsb     sy
 
 .Ldone:
+    // Placeholder for secondary_entry (post-step-5). Today: every
+    // secondary core lands here from the MPIDR park gate at _entry
+    // and stays in WFE until power-off. Post-step-5: this becomes
+    // the PSCI_CPU_ON target — wakes here, reads MPIDR, indexes
+    // into the allocator's per-core stack-base table, sets SP to
+    // its own dedicated stack, then enters the per-core actor loop.
     wfe
     b       .Ldone
 
