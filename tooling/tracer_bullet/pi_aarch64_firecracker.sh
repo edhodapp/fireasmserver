@@ -125,11 +125,16 @@ echo "--- launching Firecracker (SIGTERM after ${TIMEOUT}s) ---"
 if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
     set -u
     cd '$PI_TMP'
+    # Separate Firecracker's own stderr (host-side logger output)
+    # from the guest's serial stream so they can't interleave mid-
+    # marker — observed in laptop x86_64 CI on 2026-04-29 splitting
+    # 'STATUS:DRIVER' across a Firecracker log line. Same race is
+    # latent on the Pi; pre-empt it.
     timeout ${TIMEOUT}s firecracker \
         --no-api \
         --config-file config.json \
         --id tracer \
-        > serial.log 2>&1 || true
+        > serial.log 2> firecracker-stderr.log || true
     grep -qE '^${READY_MARKER}\$' serial.log && grep -qE '^LAYOUT-OK\$' serial.log
 "; then
     echo

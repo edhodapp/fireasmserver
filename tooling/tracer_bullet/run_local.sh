@@ -122,10 +122,18 @@ launch_firecracker_x86_64() {
   ]
 }
 EOF
+    # Firecracker's own log lines (e.g. "[tracer:main] Successfully
+    # started microvm...") go to stderr by default. Keep them out of
+    # SERIAL so they can't interleave with the guest's serial output
+    # — observed in CI on 2026-04-29 where Firecracker's "Successfully
+    # started" log fired between the kernel's "STATUS:" and "DRIVER\n"
+    # bytes, splitting the marker line and breaking the
+    # `^STATUS:DRIVER$` grep. Locally the timing happened to land
+    # outside any marker; CI made the race visible.
     (cd "$TMPDIR" && \
         timeout "${TIMEOUT}s" firecracker \
             --no-api --config-file fc.json --id tracer \
-            > "$SERIAL" 2>&1 || true)
+            > "$SERIAL" 2> "$TMPDIR/firecracker-stderr.log" || true)
 }
 
 launch_qemu_aarch64() {
