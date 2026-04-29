@@ -3049,6 +3049,202 @@ surfaced during the discussion before any source change was
 made.
 
 
+## 2026-04-28
+
+### D062: x86_64 stage-1 boot identity map — long-mode handoff in `boot.S`
+
+**Context.** D060 step 4.1 reserved bootstrap-stack symbols
+across all four cells (commit `0db911b`). Step 4.2 wires
+`boot.S → memlayout_run_allocator`. On aarch64 this is
+straightforward — both VMMs hand the kernel control in 64-bit
+EL2 and `boot.S` already drops to EL1. On x86_64 it isn't:
+`arch/x86_64/memory/allocator.S` is `[bits 64]` (uses
+`rax/rdi/rbx/r12..r15`, quad-sized loads/stores), but both
+x86_64 boot paths enter in **32-bit protected mode** —
+Firecracker via PVH, QEMU `-machine pc` via Multiboot1.
+Calling the allocator from `[bits 32]` boot.S faults because
+64-bit instructions decode to garbage.
+
+The differential harness in `tooling/memlayout_diffharness/`
+runs the allocator under user-mode `qemu-x86_64-static`
+(which is 64-bit), so the `[bits 64]` choice has been
+exercised in *that* gate. The kernel-binary call site simply
+did not exist before step 4.2.
+
+**Decision (2026-04-28):** the 32→64 mode switch on x86_64 is
+the responsibility of `boot.S`, in symmetry with aarch64
+`boot.S`'s EL2→EL1 drop. Both x86_64 platforms
+(`platform/firecracker/boot.S` and `platform/qemu/boot.S`)
+land in long mode with paging enabled, an identity-mapped low
+region, a sane 64-bit stack, and canonical data segments
+before transferring control to kernel code that calls
+`memlayout_run_allocator`. This is the canonical boot-state
+contract the rest of the kernel may assume on x86_64.
+
+**Scope of this decision (stage 1 only).** D062 specifies
+*boot-time* machine state. It does **not** specify the
+kernel's eventual virtual-memory policy. Identity-only-vs-
+higher-half, per-task page tables, permission models, and any
+future `mmap`-equivalent are stage-2 questions decided when
+there is something other than identity-mapped supervisor code
+running. The boot-time tables are not a contract on the
+kernel's later virtual layout; the kernel may build its own
+tables and `mov cr3` to them at any time, leaving the boot
+tables as orphans or scratch.
+
+**Stage-1 identity map shape.**
+
+- **Coverage:** low 1 GiB, identity-mapped. Covers loaded
+  image, bootstrap stack reservation (D060 step 4.1), and any
+  early MMIO. Our cells use PIO for serial on x86_64 so MMIO
+  is not a stage-1 concern, but 1 GiB gives uniform headroom
+  and avoids per-platform map customization.
+- **Page size:** 2 MiB. One PD level only — no PT level. 512
+  entries × 2 MiB = 1 GiB.
+- **Permissions:** present | writable | page-size (2 MiB). No
+  per-page permission policy at stage 1.
+- **Higher-half:** no. Identity-only at stage 1.
+
+**Static page-table reservations (linker script + `.bss`):**
+
+Three new symbols beside `__bootstrap_stack_top` (D060 step
+4.1):
+
+- `__boot_pml4` — 4 KiB, 4 KiB-aligned (one entry used:
+  PML4[0] → PDPT)
+- `__boot_pdpt` — 4 KiB, 4 KiB-aligned (one entry used:
+  PDPT[0] → PD)
+- `__boot_pd`   — 4 KiB, 4 KiB-aligned (512 entries:
+  identity-map low 1 GiB with 2 MiB pages)
+
+Pattern matches D060 step 4.1's bootstrap-stack reservation:
+layout is fixed and known at link time, so no allocator is
+required to place it. `boot.S` zeroes the three pages, fills
+`__boot_pd` with `(addr | PRESENT | WRITABLE | PAGE_SIZE)`
+for each 2 MiB slot, links PDPT[0]→PD and PML4[0]→PDPT, then
+loads CR3.
+
+**GDT shape.** Three entries, in `.rodata`:
+
+- `[0]` null
+- `[1]` 64-bit code: `L=1, D=0, P=1, S=1, type=code`
+- `[2]` 64-bit data: `P=1, S=1, type=data, W=1`
+
+The boot-time GDT is consumed only by the long-mode far-jump
+and the data-segment reload immediately after. It is not a
+contract on the kernel's eventual descriptor model.
+
+**Mode-switch sequence (common to both x86_64 platforms):**
+
+1. Validate boot-info pointer per platform (PVH `start_info`
+   in `%rsi`-equivalent / Multiboot1 magic + info struct in
+   `%eax`/`%ebx`). Validation runs in `[bits 32]` *before*
+   segment registers are touched.
+2. Zero and populate `__boot_pml4`, `__boot_pdpt`, `__boot_pd`.
+3. `lgdt` the boot-time GDT.
+4. Set `CR4.PAE`.
+5. `mov cr3, __boot_pml4`.
+6. `wrmsr` EFER with `LME=1`.
+7. Set `CR0.PE | CR0.PG`.
+8. Far jump through the 64-bit code segment selector to a
+   `[bits 64]` label.
+9. Reload data segments (null selectors are sufficient under
+   SysV AMD64 long mode for `ds/es/ss`).
+10. Set RSP to `__bootstrap_stack_top`.
+11. Jump to common kernel entry, which calls
+    `memlayout_run_allocator`.
+
+**Per-platform divergence (prologue only).** PVH and
+Multiboot1 hand the kernel slightly different state — A20,
+GDT contents from the loader, boot-info location. Each
+platform's `boot.S` validates its own boot-info struct in
+`[bits 32]` before reaching the common mode-switch sequence.
+From step 3 above onward, the code is identical across both
+x86_64 platforms.
+
+**aarch64 unchanged.** Both aarch64 cells already enter in
+64-bit mode and `boot.S` already handles EL2→EL1 if the
+loader landed at EL2. Step 4.2 on aarch64 only adds the
+`bl memlayout_run_allocator` call after the existing setup.
+
+**Why `boot.S`, not a separate module.** `boot.S`'s job is to
+take loader-handed machine state to canonical kernel state.
+The 32→64 transition *is* part of the bootloader-to-kernel
+handoff, exactly as aarch64's EL2→EL1 drop is. Splitting the
+mode switch into its own module would draw an artificial
+boundary inside one atomic transition. The symmetry with
+aarch64 makes `boot.S` the obviously-right home.
+
+**Why not a parallel `[bits 32]` allocator + bytecode VM on
+x86_64.** Considered and rejected. Doubles x86_64 surface
+area, defeats the differential harness (which is 64-bit user-
+mode only), and violates the "automation cost is bounded;
+bug-fix cost is not" feedback rule at the architecture level
+— every future allocator/VM change pays the cost twice.
+
+**Why not land aarch64 step 4.2 only and stub x86_64.**
+Considered. The cost is that x86_64 cells diverge from
+aarch64 in *semantic content*, not just plumbing — the
+LAYOUT-OK marker would be theatre on x86_64 until an
+unscheduled future sub-project lands. The mode switch is
+small enough (~140 lines split across both x86_64 platforms)
+that bundling it into step 4.2 is cheaper than carrying the
+asymmetry.
+
+**Watch-fors (apply during step 4.2 implementation):**
+
+1. **Triple-fault traps during early bring-up.** A bad GDT
+   load or page-table descriptor in QEMU triple-faults
+   silently — the cell just resets. Build a small ad-hoc tool
+   that runs the cell with `-d int,cpu_reset` and captures
+   `info registers` on first reset, so bring-up can bisect
+   the failing instruction instead of guessing. Per the
+   "build custom tools — leverage AI speed over human cost"
+   rule.
+2. **Multiboot1 vs PVH state validation.** GRUB Multiboot1
+   leaves a slightly different GDT shape than PVH's hand-
+   built GDT. Validate each platform's boot-info struct
+   *before* touching segment registers, not after. Validation
+   failures must halt with a serial marker the tracer-bullet
+   can read.
+3. **Branch-cov ratchet baseline shift.** ~140 lines of new
+   x86_64 boot code is a nontrivial baseline shift. Wholesale-
+   regenerate the ratchet at the same time as task #5 (the
+   existing planned regen for step 4.2 allocator wiring), not
+   in two passes — per the
+   `project_branchcov_address_brittleness` memory, in-place
+   patches break under linker-order shifts.
+
+**Cross-refs:**
+
+- `D059` — init-time static memory layout. Stage-1 page-table
+  reservations follow the same module-declares / linker-
+  places pattern that D059 established.
+- `D060` — layered tuning model. Step 4.1 reserved the
+  bootstrap stack; D062 extends the same pattern to bootstrap
+  page tables. The mode switch lands as part of step 4.2.
+- `D057` — AES-NI required at runtime on x86_64. Independent,
+  but cited because both decisions establish "x86_64 runtime
+  contracts the kernel may assume." D062 establishes the
+  boot-state half of that contract.
+- `project_directory_structure` (memory) — arch-primary /
+  platform-subordinate. The mode switch lives in
+  `platform/<vmm>/boot.S`, not `arch/x86_64/`, because PVH-
+  vs-Multiboot1 prologue divergence is platform-specific even
+  though the long-mode body is identical.
+
+**What this decision does not bind:**
+
+- Kernel virtual-memory policy (identity-only-forever,
+  higher-half, per-task). Stage-2 question.
+- Page-table format beyond stage 1. The kernel may rebuild
+  tables in any shape it chooses.
+- GDT contents beyond stage 1. The kernel may install its own
+  GDT.
+- TSS, IDT, syscall MSRs. Out of stage-1 scope; addressed
+  when first needed.
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
