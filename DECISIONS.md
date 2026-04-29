@@ -3053,6 +3053,13 @@ made.
 
 ### D062: x86_64 stage-1 boot identity map — long-mode handoff in `boot.S`
 
+**DEPRECATED 2026-04-29 — superseded by D063 (coverage clause
+only).** Stage-1 identity-map coverage extended from low 1 GiB
+to low 4 GiB after Shape B virtio port revealed firecracker
+MMIO at 3 GiB. boot.S-as-home, stage-1-only scope, three-table
+shape, 2 MiB page size, and all other D062 design carry
+forward.
+
 **Context.** D060 step 4.1 reserved bootstrap-stack symbols
 across all four cells (commit `0db911b`). Step 4.2 wires
 `boot.S → memlayout_run_allocator`. On aarch64 this is
@@ -3243,6 +3250,174 @@ asymmetry.
   GDT.
 - TSS, IDT, syscall MSRs. Out of stage-1 scope; addressed
   when first needed.
+
+
+## 2026-04-29
+
+### D063: Stage-1 boot identity-map extended to low 4 GiB
+
+**Supersedes:** D062 (deprecated 2026-04-29 — coverage clause
+only). The "boot.S as the home of the x86_64 mode switch"
+decision is unchanged. The stage-1-only scope (does not bind
+kernel virtual-memory policy) is unchanged. The page-table
+shape (PML4 + PDPT + PD with 2 MiB pages) is unchanged. Only
+the *coverage* — what physical-address range the stage-1
+identity map covers — is amended, from low 1 GiB to low 4 GiB.
+
+**Context.** D062 specified low 1 GiB coverage, justified by
+*"MMIO is not a stage-1 concern"* because the cells use PIO for
+serial. That premise held only while x86_64 boot ran in
+`[bits 32]` with paging off (today's state at commit
+`2de3a54`). Shape B (chosen 2026-04-29 over Shapes A and C)
+ports the firecracker tracer-bullet's virtio-net init from
+`[bits 32]` to `[bits 64]`, mode-switching at the start of
+`_start`. Once paging is on, every MMIO access goes through
+the page tables.
+
+Firecracker's virtio-MMIO base is `0xC0001000` (3 GiB + 4 KiB),
+defined in `arch/x86_64/platform/firecracker/boot.S` and
+corroborated by Firecracker's
+`src/vmm/src/arch/x86_64/layout.rs`. That address sits
+**outside** D062's low-1-GiB identity map. The first virtio-
+MMIO read after the mode switch would page-fault, and with no
+IDT installed at stage 1 the page-fault becomes a double-fault
+becomes a triple-fault — silent CPU reset. D062's premise was
+wrong for firecracker's actual stage-1 footprint.
+
+**Decision (2026-04-29):** Stage-1 identity map covers **low
+4 GiB**, identity-mapped, 2 MiB pages, three-table shape
+preserved.
+
+**Why low 4 GiB and not just enough to cover virtio-MMIO.**
+
+- Covers any MMIO region a Firecracker (or QEMU `-machine pc`)
+  host might place under the 4 GiB boundary. Firecracker's
+  MMIO32 region tops out near 0xC0001000 + a few KiB; QEMU's
+  typical layout fits comfortably below 4 GiB. Future-proofing
+  against either VMM moving MMIO within the 32-bit window
+  costs nothing.
+- 4 GiB is the natural alignment for "everything addressable
+  by 32-bit physical addresses" — the entire low-32-bit phys-
+  addr space is mapped uniformly. Any future stage-1 access
+  through a 32-bit-loadable address Just Works.
+- Removes per-platform map customization (D062's stated goal).
+  Both x86_64 platforms (and any future x86_64 platform) get
+  the same stage-1 coverage.
+- The cost is an extra 12 KiB of static reservation (PD grows
+  from 4 KiB to 16 KiB) and 2048-entry PD population at boot
+  instead of 512. Both are trivial.
+
+**Why 2 MiB pages and not 1 GiB pages (variant 1a vs 1b).**
+
+Variant 1a (1 GiB pages, two-table PML4 + PDPT) was considered
+and rejected. 1 GiB pages would eliminate the PD entirely and
+cover 4 GiB with 4 PDPTEs — simpler table walk, smaller
+reservation. But it requires the CPU to support `PDPE1GB`
+(CPUID.80000001H:EDX[26]) — universal at the hardware tier any
+Firecracker host runs on, but not unconditionally guaranteed
+across all x86_64 silicon. Adding a runtime CPUID gate plus a
+fallback path costs more code than the variant 1b saves.
+Variant 1b also keeps the three-table shape from D062,
+minimizing the diff against the existing linker-script
+reservations. **Choose 1b: 2 MiB pages, low 4 GiB, three-
+table.**
+
+**Stage-1 identity map shape (revised).**
+
+- **Coverage:** low 4 GiB, identity-mapped.
+- **Page size:** 2 MiB.
+- **Page tables:** three.
+  - `__boot_pml4` — 4 KiB. One entry used: PML4[0] → PDPT.
+  - `__boot_pdpt` — 4 KiB. **Four** entries used: PDPT[0..3]
+    → PD[0..3], one PDPTE per GiB.
+  - `__boot_pd`   — **16 KiB** (4 contiguous 4 KiB pages).
+    2048 entries: identity-map [0, 4 GiB) with 2 MiB pages
+    each carrying `(addr | PRESENT | WRITABLE | PAGE_SIZE)`.
+- **Permissions:** present | writable | page-size (2 MiB). No
+  per-page permission policy at stage 1.
+- **Higher-half:** no. Identity-only at stage 1.
+
+**Linker-script reservation change.**
+
+The three-symbol pattern in D062 stays. The size of `__boot_pd`
+grows from 4 KiB to 16 KiB:
+
+- `__boot_pml4` — 4 KiB, 4 KiB-aligned. (unchanged)
+- `__boot_pdpt` — 4 KiB, 4 KiB-aligned. (unchanged)
+- `__boot_pd`   — **16 KiB**, 4 KiB-aligned. (was 4 KiB)
+
+Both x86_64 linker scripts (firecracker + qemu) require the
+same edit. `__heap_start` moves up by 12 KiB.
+
+The existing PML4-alignment ASSERT carries forward verbatim.
+The "boot page tables overflow guest RAM" ASSERT updates to
+`__boot_pd + 0x4000 <= __ram_top` (was `+ 0x1000`).
+
+**boot.S population code changes.**
+
+Three-table walk stays. The PD-fill loop runs 2048 iterations
+instead of 512; PDPT writes 4 entries instead of 1. Linear,
+predictable, ~negligible boot-time cost (microseconds at
+modern clock speeds).
+
+```
+zero __boot_pml4 (4 KiB)
+zero __boot_pdpt (4 KiB)
+zero __boot_pd   (16 KiB)
+for i in 0..2048:
+    __boot_pd[i] = (i << 21) | PRESENT | WRITABLE | PAGE_SIZE
+for j in 0..4:
+    __boot_pdpt[j] = (__boot_pd + j*0x1000) | PRESENT | WRITABLE
+__boot_pml4[0] = __boot_pdpt | PRESENT | WRITABLE
+mov cr3, __boot_pml4
+```
+
+**What this decision does not change from D062.**
+
+- `boot.S` is still the home of the mode switch.
+- Per-platform `[bits 32]` prologue still validates boot info
+  before the shared mode-switch body.
+- GDT shape (3 entries: null, 64-bit code, 64-bit data)
+  unchanged.
+- Mode-switch sequence steps 3-11 unchanged.
+- Stage-1 only — does not bind kernel virtual-memory policy.
+- Does not bind page-table format beyond stage 1; kernel may
+  rebuild tables in any shape.
+- TSS, IDT, syscall MSRs still out of scope.
+
+**Watch-fors (additive to D062's list, all carry forward).**
+
+4. **PD population loop sizing.** The 2048-iteration loop is
+   still a tight `[bits 32]` loop in boot.S. ~few thousand
+   cycles total — invisible to boot timing. Worth flagging
+   only because the loop body must remain branch-free in its
+   hot path; a bug that makes it 2048× slower would still
+   complete in ms but wastes opportunity to catch bugs early.
+5. **Tracer-bullet branch-cov shift.** Adds new branches in
+   boot.S (4-iteration PDPT fill, 2048-iteration PD fill);
+   planned wholesale regen at task #9 absorbs this along with
+   the other step-4.2 shifts.
+
+**Cross-refs:**
+
+- `D062` — superseded only on coverage clause. All other
+  design carries forward verbatim.
+- `D059` — init-time static memory layout. Stage-1 page-table
+  reservations follow the same module-declares / linker-
+  places pattern.
+- `D060` — layered tuning model. Step 4.2 wires the call site;
+  D063 ensures the stage-1 paging actually covers the regions
+  step 4.2 reaches.
+
+**Trigger event for this decision.** 2026-04-29 working
+session: Shape B chosen over Shapes A/C (port virtio init from
+`[bits 32]` to `[bits 64]` rather than retain the transient
+asymmetry). First-pass implementation analysis identified that
+firecracker's `VIRTIO_MMIO_BASE = 0xC0001000` is outside D062's
+low-1-GiB coverage; first MMIO read after mode switch would
+page-fault → triple-fault. Two coverage-amendment variants
+surfaced (1a 1 GiB pages, 1b 2 MiB pages low 4 GiB); 1b chosen
+for shape continuity and CPUID-dependency avoidance.
 
 
 ## Future decisions (not yet made)
