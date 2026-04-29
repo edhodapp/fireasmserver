@@ -53,6 +53,32 @@ SECTIONS
     __bootstrap_stack_top  = ALIGN(_image_end + 0x10000, 16);
 
     /*
+     * Stage-1 boot identity-map page tables (D062). Three 4 KiB
+     * pages, 4 KiB-aligned, immediately past the bootstrap stack:
+     *   __boot_pml4 — 1 entry used (PML4[0] → PDPT)
+     *   __boot_pdpt — 1 entry used (PDPT[0] → PD)
+     *   __boot_pd   — 512 entries: identity-map low 1 GiB with
+     *                 2 MiB pages
+     * boot.S zeroes all three pages on entry and populates them
+     * before the 32→64 mode switch. VMM-zeroed guest RAM makes
+     * the zeroing belt-and-suspenders today, but the spec doesn't
+     * mandate zero-init so we don't rely on it.
+     *
+     * Reservation only: symbol assignments don't advance the
+     * location counter, parallel to __bootstrap_stack_top above.
+     * The 12 KiB of page-table space is "implicitly reserved" by
+     * advancing __heap_start past it — the bump allocator never
+     * sees these addresses, so nothing else can land here.
+     *
+     * Stage-1 only — does not bind kernel virtual-memory policy
+     * (per D062). The kernel may rebuild tables at any virtual
+     * shape it chooses post-allocator.
+     */
+    __boot_pml4 = ALIGN(__bootstrap_stack_top, 0x1000);
+    __boot_pdpt = __boot_pml4 + 0x1000;
+    __boot_pd   = __boot_pdpt + 0x1000;
+
+    /*
      * Layout contract symbols. Firecracker's x86_64 default guest
      * RAM goes up to ~0xc0000000 (3 GiB) before the MMIO gap;
      * conservative bound for the bump allocator's reverse-from-
@@ -60,7 +86,7 @@ SECTIONS
      * Firecracker's default --vcpu-count and --mem-size envelope
      * and free of the MMIO regions Firecracker maps above 3 GiB.
      */
-    __heap_start = ALIGN(__bootstrap_stack_top, 0x1000);
+    __heap_start = ALIGN(__boot_pd + 0x1000, 0x1000);
     __ram_top    = 0x40000000;
 }
 
@@ -68,3 +94,13 @@ SECTIONS
    The note descriptor is a .long, which would silently
    truncate a >4GiB symbol value. Catch that at link time. */
 ASSERT(_start < 0x100000000, "PVH entry point must fit in 32 bits")
+
+/* D062 stage-1 boot page tables must be 4 KiB aligned (CR3 hardware
+   requirement) and must fit within guest RAM. Aligned by construction
+   (ALIGN(..., 0x1000) + 0x1000 increments), but a future change to
+   the offsets could silently break alignment; CR3 with a misaligned
+   PML4 base faults at the long-mode jump. Image growth could push the
+   reservation past __ram_top with no diagnostic. Cheap link-time
+   check for both. */
+ASSERT((__boot_pml4 & 0xFFF) == 0, "boot PML4 must be 4 KiB aligned")
+ASSERT(__boot_pd + 0x1000 <= __ram_top, "boot page tables overflow guest RAM")

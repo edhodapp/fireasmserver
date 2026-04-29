@@ -57,8 +57,8 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S | $(BUILD_DIR)
 $(BUILD_DIR)/memory/%.o: memory/%.S | $(BUILD_DIR)/memory
 	$(AS) $(ASFLAGS) -o $@ $<
 
-$(BINARY): $(OBJECTS)
-	$(LD) $(LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $^
+$(BINARY): $(OBJECTS) $(LINKER_SCRIPT)
+	$(LD) $(LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS)
 
 $(BUILD_DIR) $(BUILD_DIR)/memory:
 	mkdir -p $@
