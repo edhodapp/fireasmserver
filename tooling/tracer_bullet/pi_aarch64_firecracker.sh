@@ -117,6 +117,11 @@ EOF
 # `timeout` sends SIGTERM after $TIMEOUT seconds. timeout exits 124
 # on the timeout path, which we discard (the READY check is authoritative).
 echo "--- launching Firecracker (SIGTERM after ${TIMEOUT}s) ---"
+# Two markers required:
+#   READY      — boot reached the kernel image (existing).
+#   LAYOUT-OK  — D060 step 4.2 success: init_memory_layout returned
+#                cleanly. Halt-on-overflow per its contract, so
+#                reaching the marker proves the allocator pass landed.
 if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
     set -u
     cd '$PI_TMP'
@@ -125,16 +130,16 @@ if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
         --config-file config.json \
         --id tracer \
         > serial.log 2>&1 || true
-    grep -q '${READY_MARKER}' serial.log
+    grep -qE '^${READY_MARKER}\$' serial.log && grep -qE '^LAYOUT-OK\$' serial.log
 "; then
     echo
     echo "=== tracer bullet PASSED ==="
-    echo "  '$READY_MARKER' observed in guest serial output within ${TIMEOUT}s."
+    echo "  '$READY_MARKER' and 'LAYOUT-OK' observed in guest serial within ${TIMEOUT}s."
     exit 0
 else
     echo
     echo "=== tracer bullet FAILED ==="
-    echo "  '$READY_MARKER' not observed. Dumping Pi-side serial.log:"
+    echo "  '$READY_MARKER' or 'LAYOUT-OK' not observed. Dumping Pi-side serial.log:"
     ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "sed 's/^/    /' '$PI_TMP/serial.log'" || true
     exit 1
 fi

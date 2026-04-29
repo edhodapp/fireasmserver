@@ -169,6 +169,19 @@ if ! grep -qE '^READY$' "$SERIAL"; then
 fi
 echo "READY observed — PASS"
 
+# D060 step 4.2 success marker. boot.S emits "LAYOUT-OK\n" immediately
+# after init_memory_layout returns; the function halts internally on
+# overflow per its contract, so reaching the marker proves the
+# allocator pass landed cleanly. All 4 cells emit it; required on
+# every cell.
+if ! grep -qE '^LAYOUT-OK$' "$SERIAL"; then
+    echo "FAIL: LAYOUT-OK not observed (init_memory_layout did not return cleanly?)"
+    echo "=== serial.log ==="
+    sed 's/^/    /' "$SERIAL"
+    exit 1
+fi
+echo "LAYOUT-OK observed — D060 step 4.2 allocator pass verified"
+
 # x86_64/firecracker additionally probes the virtio-MMIO MagicValue
 # register at the first device slot (VIO-Q-001 per docs/l2/REQUIREMENTS.md,
 # Virtio 1.2 §4.2.2). boot.S emits VIRTIO:OK on match, VIRTIO:FAIL on
