@@ -53,26 +53,37 @@ SECTIONS
     __bootstrap_stack_top  = ALIGN(_image_end + 0x10000, 16);
 
     /*
-     * Stage-1 boot identity-map page tables (D062). Three 4 KiB
-     * pages, 4 KiB-aligned, immediately past the bootstrap stack:
-     *   __boot_pml4 — 1 entry used (PML4[0] → PDPT)
-     *   __boot_pdpt — 1 entry used (PDPT[0] → PD)
-     *   __boot_pd   — 512 entries: identity-map low 1 GiB with
-     *                 2 MiB pages
-     * boot.S zeroes all three pages on entry and populates them
-     * before the 32→64 mode switch. VMM-zeroed guest RAM makes
-     * the zeroing belt-and-suspenders today, but the spec doesn't
-     * mandate zero-init so we don't rely on it.
+     * Stage-1 boot identity-map page tables (D063, supersedes
+     * D062's coverage clause: low 4 GiB instead of low 1 GiB).
+     * 4 KiB-aligned, immediately past the bootstrap stack:
+     *   __boot_pml4 — 4 KiB.  1 entry used (PML4[0] → PDPT)
+     *   __boot_pdpt — 4 KiB.  4 entries used (PDPT[0..3] →
+     *                 PD[0..3], one PDPTE per GiB)
+     *   __boot_pd   — 16 KiB. 4 contiguous PD pages, 2048 entries
+     *                 total: identity-map low 4 GiB with 2 MiB
+     *                 pages each carrying
+     *                 (addr | PRESENT | WRITABLE | PAGE_SIZE)
+     * boot.S zeroes all three reservations on entry and populates
+     * them before the 32→64 mode switch. VMM-zeroed guest RAM
+     * makes the zeroing belt-and-suspenders today, but the spec
+     * doesn't mandate zero-init so we don't rely on it.
+     *
+     * Why low 4 GiB (D063): firecracker's VIRTIO_MMIO_BASE =
+     * 0xC0001000 sits at 3 GiB + 4 KiB. D062's low-1-GiB
+     * coverage would page-fault on first MMIO read after the
+     * mode switch. Low 4 GiB also covers any future Firecracker
+     * or QEMU MMIO movement within the 32-bit phys-addr window
+     * with no per-platform map customization.
      *
      * Reservation only: symbol assignments don't advance the
      * location counter, parallel to __bootstrap_stack_top above.
-     * The 12 KiB of page-table space is "implicitly reserved" by
+     * The 24 KiB of page-table space is "implicitly reserved" by
      * advancing __heap_start past it — the bump allocator never
      * sees these addresses, so nothing else can land here.
      *
      * Stage-1 only — does not bind kernel virtual-memory policy
-     * (per D062). The kernel may rebuild tables at any virtual
-     * shape it chooses post-allocator.
+     * (per D062 + D063). The kernel may rebuild tables at any
+     * virtual shape it chooses post-allocator.
      */
     __boot_pml4 = ALIGN(__bootstrap_stack_top, 0x1000);
     __boot_pdpt = __boot_pml4 + 0x1000;
@@ -86,7 +97,7 @@ SECTIONS
      * Firecracker's default --vcpu-count and --mem-size envelope
      * and free of the MMIO regions Firecracker maps above 3 GiB.
      */
-    __heap_start = ALIGN(__boot_pd + 0x1000, 0x1000);
+    __heap_start = ALIGN(__boot_pd + 0x4000, 0x1000);
     __ram_top    = 0x40000000;
 }
 
@@ -95,12 +106,13 @@ SECTIONS
    truncate a >4GiB symbol value. Catch that at link time. */
 ASSERT(_start < 0x100000000, "PVH entry point must fit in 32 bits")
 
-/* D062 stage-1 boot page tables must be 4 KiB aligned (CR3 hardware
-   requirement) and must fit within guest RAM. Aligned by construction
-   (ALIGN(..., 0x1000) + 0x1000 increments), but a future change to
-   the offsets could silently break alignment; CR3 with a misaligned
-   PML4 base faults at the long-mode jump. Image growth could push the
-   reservation past __ram_top with no diagnostic. Cheap link-time
-   check for both. */
+/* D062/D063 stage-1 boot page tables must be 4 KiB aligned (CR3
+   hardware requirement) and must fit within guest RAM. Aligned by
+   construction (ALIGN(..., 0x1000) + 0x1000 increments), but a future
+   change to the offsets could silently break alignment; CR3 with a
+   misaligned PML4 base faults at the long-mode jump. Image growth
+   could push the reservation past __ram_top with no diagnostic. Cheap
+   link-time check for both. The 0x4000 term reflects D063's PD growth
+   from 4 KiB to 16 KiB. */
 ASSERT((__boot_pml4 & 0xFFF) == 0, "boot PML4 must be 4 KiB aligned")
-ASSERT(__boot_pd + 0x1000 <= __ram_top, "boot page tables overflow guest RAM")
+ASSERT(__boot_pd + 0x4000 <= __ram_top, "boot page tables overflow guest RAM")
