@@ -78,18 +78,18 @@ _start:
 
     ; Emit READY — observable by the tracer-bullet harness as the
     ; "boot reached the kernel image" marker. Lives in [bits 32]
-    ; because emit_bytes uses 32-bit addressing and INs/OUTs that
-    ; would need full retooling under [bits 64]; LAYOUT-OK (task #7)
-    ; will emit from a separate [bits 64] writer post-mode-switch.
+    ; because mode-switch comes next; LAYOUT-OK is emitted post-
+    ; mode-switch from kernel_main_64 via emit_bytes (the [bits 64]
+    ; sibling).
     lea esi, [ready_msg]
     mov ecx, ready_len
-    call emit_bytes
+    call emit_bytes_32
 
     ; Hand off to the shared mode-switch body. JMP not CALL: the
     ; mode switch invalidates the 32-bit return address, so we
     ; never return to this stack frame. Control reaches
     ; kernel_main_64 in [bits 64], which calls init_memory_layout
-    ; and halts.
+    ; and emits LAYOUT-OK before halting.
     jmp mode_switch_to_long_mode
 
 .multiboot_fail:
@@ -97,25 +97,22 @@ _start:
     ; the cell manually can see what went wrong, then cli/hlt.
     lea esi, [multiboot_fail_msg]
     mov ecx, multiboot_fail_len
-    call emit_bytes
+    call emit_bytes_32
     cli
 .halt:
     hlt
     jmp .halt
 
-; --- emit_bytes: write <ecx> bytes from <esi> to COM1 in <dx> ---
-; Polls 16550 LSR for THRE (bit 5) before each write. Same contract
-; as the firecracker stub's emit_bytes. Mirrored here rather than
-; factored to a shared include: at 20 instructions it's cheaper to
-; duplicate than to add build-time include plumbing for two divergent
-; ELF classes (ELF32 here, ELF64 on firecracker).
+; --- emit_bytes_32: [bits 32] LSR-polled serial writer ---
+; Used only by the Multiboot1 prologue (READY emit + MULTIBOOT:FAIL
+; emit). Same contract as the [bits 64] emit_bytes sibling below.
+; Mirrors firecracker's prologue/post-switch split: bit-mode boundary
+; can't be crossed by a shared include, so we duplicate.
 ;
-; Return signalling via the carry flag:
-;   CF=0 on full success.
-;   CF=1 on timeout (UART never asserted THRE within the budget).
-;
-; Clobbers: eax, ecx, esi, edi, flags. Preserves: dx, ebx, ebp, esp.
-emit_bytes:
+;   In:  ESI = source ptr, ECX = byte count, DX = COM1_PORT.
+;   Out: CF = 0 on full success, CF = 1 on UART timeout.
+;   Clobbers: eax, ecx, esi, edi, flags. Preserves: dx, ebx, ebp, esp.
+emit_bytes_32:
     test ecx, ecx
     jz .done
 .next:
@@ -127,8 +124,6 @@ emit_bytes:
     jnz .have_thre
     dec edi
     jnz .wait_thre
-    ; Timeout: UART wedged. Restore dx, signal failure via CF=1,
-    ; return so the guest halts cleanly instead of hanging.
     sub dx, COM1_LSR_OFFSET
     stc
     ret
@@ -149,25 +144,70 @@ ready_len  equ $ - ready_msg
 multiboot_fail_msg: db 'MULTIBOOT:FAIL bad magic', 10
 multiboot_fail_len  equ $ - multiboot_fail_msg
 
+layout_ok_msg: db 'LAYOUT-OK', 10
+layout_ok_len  equ $ - layout_ok_msg
+
 
 ; ================================================================
 ; kernel_main_64 — [bits 64] entry, reached only via
 ; mode_switch_to_long_mode's tail jump.
 ; ================================================================
-; Calls init_memory_layout (D060 step 4.2's wire-up) and halts.
-; QEMU's tracer-bullet harness only observes READY (which was
-; emitted in [bits 32] before the mode switch); LAYOUT-OK
-; emission post-allocator is task #7's job and lands separately.
+; Calls init_memory_layout (D060 step 4.2's wire-up), emits the
+; LAYOUT-OK success marker on COM1, then halts.
 ;
-; Per-platform residence: each platform's boot.S provides its
-; own kernel_main_64. mode_switch.S declares it extern. QEMU's
-; copy halts; Firecracker's runs the [bits 64]-ported virtio-net
-; init.
+; Per-platform residence: each platform's boot.S provides its own
+; kernel_main_64. QEMU's halts after LAYOUT-OK; Firecracker's
+; runs the full [bits 64]-ported virtio-net init.
 
 [bits 64]
 global kernel_main_64
 kernel_main_64:
     call init_memory_layout
+
+    ; UART base for the LAYOUT-OK emit. Pinned across emit_bytes.
+    mov dx, COM1_PORT
+
+    ; Emit "LAYOUT-OK\n" — D060 step 4.2 success marker.
+    lea rsi, [rel layout_ok_msg]
+    mov ecx, layout_ok_len
+    call emit_bytes
+
 .halt:
     hlt
     jmp .halt
+
+; --- emit_bytes: [bits 64] LSR-polled serial writer ---
+; Same contract as emit_bytes_32 above, in long mode. Identical
+; semantics to firecracker's [bits 64] emit_bytes. `in/out` and
+; the LSR poll work the same in long mode as in protected mode.
+;
+;   In:  RSI = source ptr, ECX = byte count, DX = COM1_PORT.
+;   Out: CF = 0 on full success, CF = 1 on UART timeout.
+;   Clobbers: eax, ecx, esi/rsi, edi, flags. Preserves: dx, rbx, rbp, rsp.
+
+[bits 64]
+emit_bytes:
+    test ecx, ecx
+    jz .done
+.next:
+    add dx, COM1_LSR_OFFSET
+    mov edi, UART_POLL_TIMEOUT
+.wait_thre:
+    in  al, dx
+    test al, UART_LSR_THRE
+    jnz .have_thre
+    dec edi
+    jnz .wait_thre
+    sub dx, COM1_LSR_OFFSET
+    stc
+    ret
+.have_thre:
+    sub dx, COM1_LSR_OFFSET
+    mov al, [rsi]
+    out dx, al
+    inc rsi
+    dec ecx
+    jnz .next
+.done:
+    clc
+    ret

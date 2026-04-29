@@ -54,6 +54,11 @@ _entry:
     ldr     x5, =__bootstrap_stack_top
     mov     sp, x5
 
+    // PL011 base in x0 (QEMU virt default), preserved across
+    // emit_bytes calls. Set BEFORE bl init_memory_layout so we can
+    // emit LAYOUT-OK immediately on return.
+    movz    x0, #0x0900, lsl #16
+
     // Run the init-time static memory allocator (D060 step 4.2).
     // Returns immediately today (.memreq is empty); wire-up
     // exists so the call site stops being a no-op the moment a
@@ -61,30 +66,16 @@ _entry:
     // platform.
     bl      init_memory_layout
 
-    // PL011 base in x0 (QEMU virt default).
-    movz    x0, #0x0900, lsl #16
+    // Emit "LAYOUT-OK\n" — D060 step 4.2 success marker.
+    adr     x1, layout_ok_msg
+    mov     w2, #(layout_ok_msg_end - layout_ok_msg)
+    bl      emit_bytes
 
+    // Emit "READY\n".
     adr     x1, ready_msg
     mov     w2, #(ready_msg_end - ready_msg)
+    bl      emit_bytes
 
-.Lwrite:
-    cbz     w2, .Lflush
-
-    // PL011 FR register at offset 0x18, bit 5 = TXFF
-    // (1 = TX FIFO full; wait while set).
-.Lwait:
-    yield
-    ldr     w3, [x0, #0x18]
-    tbnz    w3, #5, .Lwait
-
-    // Write one byte to DR at offset 0x00. PL011 DR is 32-bit; the
-    // low 8 bits are the transmit data. strb matches ldrb width.
-    ldrb    w4, [x1], #1
-    strb    w4, [x0]
-    sub     w2, w2, #1
-    b       .Lwrite
-
-.Lflush:
     dsb     sy
 
 .Ldone:
@@ -97,7 +88,28 @@ _entry:
     wfe
     b       .Ldone
 
+// emit_bytes: write w2 bytes from [x1] to PL011 at x0.
+//   In:  x0 = PL011 base, x1 = source ptr, w2 = byte count.
+//   Clobbers: w3, w4, w2, x1. Preserves: x0 and all other GPRs.
+emit_bytes:
+    cbz     w2, .Lemit_done
+.Lemit_loop:
+    yield
+    // PL011 FR register at offset 0x18, bit 5 = TXFF (1 = full).
+    ldr     w3, [x0, #0x18]
+    tbnz    w3, #5, .Lemit_loop
+    ldrb    w4, [x1], #1
+    strb    w4, [x0]                 // DR at offset 0
+    subs    w2, w2, #1
+    b.ne    .Lemit_loop
+.Lemit_done:
+    ret
+
 .section .rodata, "a"
+layout_ok_msg:
+    .ascii  "LAYOUT-OK\n"
+layout_ok_msg_end:
+
 ready_msg:
     .ascii  "READY\n"
 ready_msg_end:

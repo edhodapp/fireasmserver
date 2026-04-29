@@ -317,6 +317,19 @@ kernel_main_64:
     ; declares a region (step 5).
     call init_memory_layout
 
+    ; UART base for all emit_bytes / emit_hex32 calls. Set BEFORE
+    ; the LAYOUT-OK emit below so the marker can land immediately
+    ; on init_memory_layout's return.
+    mov dx, COM1_PORT
+
+    ; Emit "LAYOUT-OK\n" — D060 step 4.2 success marker. Reached
+    ; only when init_memory_layout returned cleanly (it halts
+    ; internally on overflow per its contract). Tracer-bullet
+    ; harness can assert on this to know the allocator pass landed.
+    lea rsi, [rel layout_ok_msg]
+    mov ecx, layout_ok_len
+    call emit_bytes
+
     ; Pin VIRTIO_MMIO_BASE in r12 for the rest of the function.
     ; The 32-bit-dest form `mov r12d, imm32` zero-extends to r12,
     ; which is what we want — `mov r12, imm32` would sign-extend
@@ -324,9 +337,6 @@ kernel_main_64:
     ; saved here vs movabs r64,imm64 is 4 bytes, but correctness
     ; is the actual reason for the form.
     mov r12d, VIRTIO_MMIO_BASE
-
-    ; UART base for all emit_bytes / emit_hex32 calls.
-    mov dx, COM1_PORT
 
     ; --- Probe virtio-MMIO MagicValue register ---
     ; Virtio 1.2 §4.2.2: barrier before/after MMIO. x86 TSO:
@@ -998,6 +1008,9 @@ emit_hex32:
 
 ready_msg:       db 'READY', 10
 ready_len        equ $ - ready_msg
+
+layout_ok_msg:   db 'LAYOUT-OK', 10
+layout_ok_len    equ $ - layout_ok_msg
 
 pvh_fail_msg:    db 'PVH:FAIL bad magic', 10
 pvh_fail_len     equ $ - pvh_fail_msg

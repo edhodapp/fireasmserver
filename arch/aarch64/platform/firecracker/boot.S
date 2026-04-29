@@ -273,11 +273,23 @@ _entry:
     // the wire-up exists so the call site stops being a no-op the
     // moment a module declares a region (step 5). Symmetric to the
     // x86_64 platforms once D062's mode switch lands.
-    bl      init_memory_layout
-
     // UART base in x0, preserved across emit_bytes / emit_hex32 calls.
+    // Set BEFORE bl init_memory_layout so we can emit LAYOUT-OK
+    // immediately on return (D060 step 4.2 success signal). emit_bytes
+    // doesn't write x0; init_memory_layout doesn't either (preserves
+    // its callers' state by contract).
     movz    x0, #0x4000, lsl #16
     movk    x0, #0x2000              // x0 = UART_BASE
+
+    bl      init_memory_layout
+
+    // Emit "LAYOUT-OK\n" — D060 step 4.2 success marker. Reached only
+    // when init_memory_layout returned cleanly; the function halts
+    // internally on overflow per its contract. Tracer-bullet harness
+    // can assert on this to know the allocator pass landed.
+    adr     x1, layout_ok_msg
+    mov     w2, #(layout_ok_msg_end - layout_ok_msg)
+    bl      emit_bytes
 
     // Emit "READY\n".
     adr     x1, ready_msg
@@ -836,6 +848,10 @@ emit_hex32:
 // Kept out of .text so a branch-coverage disassembler doesn't have to
 // decode the string bytes as instructions. The stub's `adr` loads the
 // address regardless of section; the linker resolves across sections.
+layout_ok_msg:
+    .ascii  "LAYOUT-OK\n"
+layout_ok_msg_end:
+
 ready_msg:
     .ascii  "READY\n"
 ready_msg_end:
