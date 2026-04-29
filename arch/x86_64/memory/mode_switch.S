@@ -47,7 +47,14 @@ extern __boot_pml4
 extern __boot_pdpt
 extern __boot_pd
 extern __bootstrap_stack_top
-extern init_memory_layout
+
+; kernel_main_64 is provided per-platform: each platform's boot.S
+; defines it with whatever post-allocator behavior that platform
+; needs. QEMU halts (no further bring-up at stage 1); Firecracker
+; calls init_memory_layout then runs the virtio-net init in
+; [bits 64]. Declaring extern (not global) keeps mode_switch.S
+; arch-shared and platform-agnostic.
+extern kernel_main_64
 
 ; --- Page-table entry flag bits (Intel SDM Vol 3A §4.5) ---
 PAGE_PRESENT  equ 1 << 0
@@ -201,32 +208,9 @@ mode_switch_to_long_mode:
     mov rsp, qword __bootstrap_stack_top
 
     ; ----- Step 11: hand off to kernel_main_64 -----
+    ; Each platform's boot.S provides its own kernel_main_64
+    ; symbol; this module is platform-agnostic.
     jmp kernel_main_64
-
-
-; ================================================================
-; kernel_main_64 — [bits 64] kernel entry, post-mode-switch.
-; ================================================================
-; Reached only via mode_switch_to_long_mode's tail jump. Calls the
-; init-time static memory allocator (D060 step 4.2's wire-up) and
-; halts. Successor tasks expand the body:
-;   - Task #7: emit LAYOUT-OK on serial after init_memory_layout
-;     returns; LAYOUT-FAIL on a non-zero rc (when the contract
-;     starts returning rc).
-;   - Task #14: jump past the halt into the [bits 64]-ported
-;     firecracker virtio-net init. QEMU stays at halt.
-;
-; The current contract for init_memory_layout is "void f(void),
-; halt-on-fail" — see arch/x86_64/memory/init_memory_layout.S. So
-; no return-code check at the call site today.
-
-[bits 64]
-global kernel_main_64
-kernel_main_64:
-    call init_memory_layout
-.halt:
-    hlt
-    jmp .halt
 
 
 ; ================================================================

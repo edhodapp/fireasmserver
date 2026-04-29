@@ -31,6 +31,7 @@ MB_CHECKSUM       equ -(MB_MAGIC + MB_FLAGS)
 MB_BOOTLOADER_EAX equ 0x2BADB002   ; loader-handed magic at _start
 
 extern mode_switch_to_long_mode
+extern init_memory_layout
 
 section .multiboot alloc align=4
     dd MB_MAGIC
@@ -147,3 +148,26 @@ ready_len  equ $ - ready_msg
 
 multiboot_fail_msg: db 'MULTIBOOT:FAIL bad magic', 10
 multiboot_fail_len  equ $ - multiboot_fail_msg
+
+
+; ================================================================
+; kernel_main_64 — [bits 64] entry, reached only via
+; mode_switch_to_long_mode's tail jump.
+; ================================================================
+; Calls init_memory_layout (D060 step 4.2's wire-up) and halts.
+; QEMU's tracer-bullet harness only observes READY (which was
+; emitted in [bits 32] before the mode switch); LAYOUT-OK
+; emission post-allocator is task #7's job and lands separately.
+;
+; Per-platform residence: each platform's boot.S provides its
+; own kernel_main_64. mode_switch.S declares it extern. QEMU's
+; copy halts; Firecracker's runs the [bits 64]-ported virtio-net
+; init.
+
+[bits 64]
+global kernel_main_64
+kernel_main_64:
+    call init_memory_layout
+.halt:
+    hlt
+    jmp .halt

@@ -1273,3 +1273,25 @@ driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
 
 newline:         db 10
+
+
+; ================================================================
+; kernel_main_64 — [bits 64] entry, reached only via
+; mode_switch_to_long_mode's tail jump.
+; ================================================================
+; STAGE-1 STUB: today this is a halt loop, unreachable because
+; firecracker's _start above runs entirely in [bits 32] and never
+; calls mode_switch_to_long_mode. The full [bits 64]-ported virtio
+; init lands in task #14, replacing this stub. Defined now so
+; mode_switch.S's `extern kernel_main_64` resolves at link time
+; and the module is co-linked into the firecracker image.
+
+extern init_memory_layout
+
+[bits 64]
+global kernel_main_64
+kernel_main_64:
+    call init_memory_layout
+.halt:
+    hlt
+    jmp .halt
