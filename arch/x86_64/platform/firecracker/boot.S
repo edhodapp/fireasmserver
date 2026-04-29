@@ -1,43 +1,41 @@
 ; SPDX-License-Identifier: AGPL-3.0-or-later
 ; Copyright (c) 2026 Ed Hodapp
 ;
-; x86_64 Firecracker guest — initial driver path for the L2
-; virtio-net bring-up. This IS the real driver in its first
-; iteration ("tracer bullet" in Hunt & Thomas's sense: the
-; foundational end-to-end skeleton that real features slot into),
-; not a throwaway diagnostic. The `READY` and `VIRTIO:OK` markers
-; stay as the permanent L2-init handshake for the pre-push
-; integration tests.
+; x86_64 Firecracker guest — Shape-B boot path per D062 + D063.
 ;
-; PVH boot entry lands here in 32-bit protected mode with paging off
-; and interrupts off (Xen PVH spec). We establish a stack at 2 MiB,
-; clear the direction flag, then run through the init sequence.
+; Boot sequence:
+;   1. PVH _start lands in [bits 32]: validate start_info magic at
+;      [ebx], establish ESP, emit READY, jmp mode_switch_to_long_mode.
+;   2. mode_switch_to_long_mode (arch/x86_64/memory/mode_switch.S)
+;      enters long mode with low 4 GiB identity-mapped at 2 MiB
+;      granularity and tail-jumps to kernel_main_64.
+;   3. kernel_main_64 [bits 64]: calls init_memory_layout (D060
+;      step 4.2's wire-up, returns immediately while .memreq is
+;      empty), then runs the full virtio-net init through TX:RECLAIMED.
 ;
-; Sequence:
-;   1. Establish ESP, clear DF.
-;   2. Emit "READY\n" on COM1 with LSR-polled UART writes (16550 THRE
-;      gate, see `emit_bytes`). LSR polling has a ~1M-iteration timeout
-;      so a wedged UART emulator doesn't hang the guest.
-;   3. Probe the virtio-MMIO MagicValue register at the first virtio
-;      device slot with the memory barriers Virtio 1.2 §4.2.2 mandates.
-;      Per Firecracker v1.15.1 x86_64 layout:
-;        MMIO32_MEM_START  = FIRST_ADDR_PAST_32BITS - 1 GiB = 0xC0000000
-;        MEM_32BIT_DEVICES = MMIO32_MEM_START + MMIO_LEN    = 0xC0001000
-;      (source: Firecracker src/vmm/src/arch/x86_64/layout.rs)
-;      The register value MUST be 0x74726976 ("virt" little-endian)
-;      per Virtio 1.2 §4.2.2. This is VIO-Q-001/§2.7 territory and the
-;      first observable cross-check with the device.
-;   4. Emit "VIRTIO:OK\n" on match, or "VIRTIO:FAIL magic=XXXXXXXX\n"
-;      on mismatch — printing the actual magic is the first thing a
-;      debugger reaches for, so it goes in now.
-;   5. Halt.
+; The marker chain — READY → VIRTIO:OK → STATUS:DRIVER → FEATURES:OK →
+; QUEUES:RX/TX → QUEUES:READY → DRIVER_OK → RX:POPULATED → RX:FRAME →
+; RX:RETURNED → TX:SUBMITTED → TX:RECLAIMED — is the L2-init handshake
+; observed by the tracer-bullet harness in tooling/tracer_bullet/run_local.sh.
 ;
-; Assumes the Firecracker JSON config includes a network-interface
-; entry (host_dev_name=tap0). If not, the MMIO read at 0xC0001000
-; produces a "MissingAddressRange" bus error and Firecracker kills
-; the guest — readable in its log, caught by the timeout.
+; Per Shape B (chosen 2026-04-29): the entire post-mode-switch path
+; runs in long mode, replacing the prior single-mode [bits 32] design
+; that worked in the absence of paging. D063 amended D062 with low-
+; 4-GiB identity coverage so the virtio-MMIO at 0xC0001000 is
+; reachable post-mode-switch.
+;
+; PVH boot entry state (Xen PVH spec):
+;   CS = flat 32-bit code segment (loader-handed)
+;   DS, ES, FS, GS, SS = flat 32-bit data segments
+;   ESP undefined — we establish our own
+;   EFLAGS.DF undefined — we cld it ourselves
+;   EBX = 32-bit phys ptr to hvm_start_info struct (first u32 = magic)
+;   IF = 0
+;   Paging: off
 ;
 ; NASM per D048.
+
+; ----- Constants -----
 
 XEN_ELFNOTE_PHYS32_ENTRY equ 18
 COM1_PORT                equ 0x3F8
@@ -47,11 +45,11 @@ UART_POLL_TIMEOUT        equ 1 << 20      ; ~1 ms at modern CPU speeds
 VIRTIO_MMIO_BASE         equ 0xC0001000
 VIRTIO_MAGIC             equ 0x74726976   ; "virt" little-endian
 
+; PVH start_info magic (Xen "PVH boot protocol" — first u32 of the
+; struct EBX points at on entry). Catches non-PVH entry early.
+PVH_START_INFO_MAGIC     equ 0x336EC578   ; "xEn3" little-endian
+
 ; Virtio-MMIO register offsets (Virtio 1.2 §4.2.2, Table 4.1).
-; Full layout isn't needed yet — only the registers touched by the
-; init prefix (VIO-001..003) and feature negotiation (VIO-004..006).
-; Virtqueue registers (QueueSel, QueueDesc*, QueueDriver*, QueueDevice*,
-; QueueReady, QueueNotify) land with VIO-007.
 VIRTIO_MMIO_DEVICE_FEATURES     equ 0x010
 VIRTIO_MMIO_DEVICE_FEATURES_SEL equ 0x014
 VIRTIO_MMIO_DRIVER_FEATURES     equ 0x020
@@ -69,75 +67,49 @@ VIRTIO_MMIO_QUEUE_DRIVER_HIGH   equ 0x094
 VIRTIO_MMIO_QUEUE_DEVICE_LOW    equ 0x0A0
 VIRTIO_MMIO_QUEUE_DEVICE_HIGH   equ 0x0A4
 
-; Virtqueue memory region. 12 KiB per queue — page-aligned slots
-; for descriptor table (4 KiB), available ring (4 KiB), used ring
-; (4 KiB). Actual spec-required sizes at queue_size=256 are
-; ~4 KiB / ~518 B / ~2054 B; page alignment costs ~5 KiB per
-; queue against 128 MiB of guest RAM (negligible) and simplifies
-; every address computation to a base + page-offset.
-;
-; Location: 4 MiB, well above the stack at 2 MiB and the .text
-; segment (loaded at 1 MiB, runs out long before 2 MiB).
-; Firecracker zero-initializes guest RAM, so ``idx = 0``,
-; ``flags = 0`` across every ring at boot — which is exactly
-; the "uninhabited queue" state the spec requires at QueueReady
-; time.
+; Virtqueue layout — 12 KiB per queue (page-aligned slots for desc,
+; avail, used). 4 MiB base, well above the loaded image at 1 MiB.
+; Firecracker zero-initializes guest RAM, so all rings are idx=0,
+; flags=0 at boot — exactly the "uninhabited queue" state the spec
+; requires at QueueReady time.
 VIRTQ_BASE          equ 0x400000
-VIRTQ_STRIDE        equ 0x3000   ; 12 KiB per queue
+VIRTQ_STRIDE        equ 0x3000
 VIRTQ_OFF_DESC      equ 0x0000
 VIRTQ_OFF_AVAIL     equ 0x1000
 VIRTQ_OFF_USED      equ 0x2000
 
-; Largest queue size this layout supports: 256 descriptors at
-; 16 B each = 4096 B exactly, filling the descriptor-table page.
-; A device reporting ``QueueNumMax > 256`` is spec-allowed to
-; offer that size; the driver clamps to the size it can back
-; with allocated memory (Virtio 1.2 §4.1.4.3 permits any queue
-; size that is a power of 2 ≤ QueueNumMax). Today Firecracker
-; reports exactly 256; the clamp protects a future device or
-; VMM change from silently overflowing into the available-ring
-; page.
-VIRTQ_MAX_SIZE      equ 0x100    ; 256 descriptors
+VIRTQ_MAX_SIZE      equ 0x100    ; 256 descriptors max
 RX_QUEUE_BASE       equ VIRTQ_BASE + 0 * VIRTQ_STRIDE
 TX_QUEUE_BASE       equ VIRTQ_BASE + 1 * VIRTQ_STRIDE
 
-; Virtqueue descriptor flag bits (Virtio 1.2 §2.7.5.1).
-VIRTQ_DESC_F_NEXT     equ 1    ; buffer continues via next field
-VIRTQ_DESC_F_WRITE    equ 2    ; device may write to this buffer (RX)
-VIRTQ_DESC_F_INDIRECT equ 4    ; buffer contains a descriptor chain
+VIRTQ_DESC_F_NEXT     equ 1
+VIRTQ_DESC_F_WRITE    equ 2
+VIRTQ_DESC_F_INDIRECT equ 4
 
-; RX buffer pool. 256 buffers × 2 KiB each = 512 KiB total, living
-; directly above the virtqueue pages (virtqueues end at
-; VIRTQ_BASE + 2*VIRTQ_STRIDE = 0x406000). 2 KiB per buffer
-; comfortably holds the 12-byte virtio_net_hdr + a max-size tagged
-; Ethernet frame (1522 B incl. VLAN, FCS stripped by host) with
-; slack. One buffer per descriptor — no descriptor chaining
-; (VIRTIO_NET_F_MRG_RXBUF wasn't negotiated under the VIO-F-001
-; MVP subset, so every RX completion fits in a single descriptor).
+; RX buffer pool. 256 buffers × 2 KiB each = 512 KiB total, above the
+; virtqueue pages (which end at 0x406000). 2 KiB per buffer fits a
+; 12 B virtio_net_hdr + max-size tagged Ethernet frame with slack.
 RX_BUFFER_BASE      equ 0x500000
-RX_BUFFER_SIZE      equ 0x800    ; 2 KiB
+RX_BUFFER_SIZE      equ 0x800
 
-; Device Status bit values (Virtio 1.2 §2.1, "Device Status Field").
-; Bit-position numbering in the REQUIREMENTS.md VIO table is the
-; bit index; the MMIO Status register is written with OR-ed values.
-VIRTIO_STATUS_ACKNOWLEDGE equ 1    ; bit 0 — driver found the device
-VIRTIO_STATUS_DRIVER      equ 2    ; bit 1 — driver knows how to use it
-VIRTIO_STATUS_DRIVER_OK   equ 4    ; bit 2 — device is live (VIO-008)
-VIRTIO_STATUS_FEATURES_OK equ 8    ; bit 3 — feature subset accepted
-VIRTIO_STATUS_FAILED      equ 0x80 ; bit 7 — driver has given up (VIO-009)
+; Device Status (Virtio 1.2 §2.1).
+VIRTIO_STATUS_ACKNOWLEDGE equ 1
+VIRTIO_STATUS_DRIVER      equ 2
+VIRTIO_STATUS_DRIVER_OK   equ 4
+VIRTIO_STATUS_FEATURES_OK equ 8
+VIRTIO_STATUS_FAILED      equ 0x80
 
-; Feature bits (Virtio 1.2 §6 — transport + device-specific). Bits
-; are 64-wide; MMIO exposes them via two 32-bit pages selected by
-; DeviceFeaturesSel / DriverFeaturesSel (0=bits 0-31, 1=bits 32-63).
-; VIRTIO_F_VERSION_1 is bit 32 globally → bit 0 of the high page.
-; MVP policy: accept VERSION_1 only. MAC, STATUS, MQ, CSUM, GSO,
-; EVENT_IDX stay off until the code paths that consume them land
-; (see VIO-F-001..007 in docs/l2/REQUIREMENTS.md §4.2).
-VIRTIO_F_VERSION_1_HIBIT  equ 1   ; bit 32 == 1 in the high page
+; Feature bit (Virtio 1.2 §6 — VIRTIO_F_VERSION_1 is bit 32 globally,
+; bit 0 of the high page). MVP accepts VERSION_1 only.
+VIRTIO_F_VERSION_1_HIBIT  equ 1
 
-; PVH ELF note. namesz=4 covers "Xen\0"; descsz=4 is the entry
-; address that follows. NASM's `note` section-type directive emits
-; SHT_NOTE directly, no ld name-heuristics needed.
+; ----- External symbols (resolved by linker) -----
+
+extern mode_switch_to_long_mode
+extern init_memory_layout
+
+; ----- PVH ELF note -----
+
 section .note.Xen note alloc align=4
     dd 4
     dd 4
@@ -147,165 +119,241 @@ section .note.Xen note alloc align=4
     dd _start
 
 section .text
+
+; ================================================================
+; [bits 32] PVH prologue
+; ================================================================
+; Validates the loader-handed state, emits READY (observable even
+; if the mode switch faults), and tail-jumps to the shared mode
+; switch. emit_bytes_32 is the [bits 32] LSR-polled serial writer
+; used pre-mode-switch.
+
 [bits 32]
 
-; Per-queue programming macro used by VIO-007 Slice 2. Selects
-; the queue, reads QueueNumMax and writes it back as QueueNum,
-; programs physical addresses for descriptor / available / used
-; rings, toggles QueueReady to 1, and read-backs to confirm it
-; stuck. On read-back mismatch, jumps to ``.queue_ready_fail``
-; (which halts through .set_failed per VIO-009).
+global _start
+_start:
+    ; Defensive: PVH spec leaves IF=0 and DF undefined. cli is
+    ; insurance against a non-compliant loader; cld ensures rep
+    ; movs / lodsb wouldn't be surprised by a bad direction (the
+    ; current prologue doesn't use string ops, but mode_switch.S
+    ; runs `rep stosd` at entry).
+    cli
+
+    ; ESP at 2 MiB — well above the loaded image and below the
+    ; bootstrap stack mode_switch.S reloads RSP from after long
+    ; mode entry. Required because PVH leaves ESP undefined and
+    ; the call/ret pairs in emit_bytes_32 below need a valid stack.
+    mov esp, 0x200000
+
+    cld
+
+    ; UART base for emit_bytes_32 / failure paths.
+    mov dx, COM1_PORT
+
+    ; Validate PVH start_info pointer. EBX = phys ptr to
+    ; hvm_start_info per Xen PVH boot protocol; first u32 of the
+    ; struct is magic = 0x336EC578 ("xEn3" little-endian). Any
+    ; mismatch means we were entered by something other than a
+    ; PVH-compliant loader and the rest of the boot contract is
+    ; void. EBX == 0 is also a fail (some misconfigured firmware
+    ; might leave it cleared).
+    test ebx, ebx
+    jz .pvh_fail
+    cmp dword [ebx], PVH_START_INFO_MAGIC
+    jne .pvh_fail
+
+    ; Emit READY in [bits 32] before the mode switch. Two reasons:
+    ;   1. emit_bytes uses `in al, dx` / `out dx, al` which require
+    ;      a current stack frame for `call/ret`. The mode switch
+    ;      doesn't preserve [bits 32] return addresses, so emitting
+    ;      AFTER the switch from [bits 64] code requires a separate
+    ;      [bits 64] writer (we have one — see emit_bytes below).
+    ;   2. If the mode switch faults (triple-fault → silent reset),
+    ;      READY having reached the harness lets a developer locate
+    ;      the failure: "READY observed → fault is post-mode-switch"
+    ;      vs "READY missing → fault is in the [bits 32] prologue
+    ;      or mode-switch body itself."
+    lea esi, [ready_msg]
+    mov ecx, ready_len
+    call emit_bytes_32
+
+    ; Hand off to the shared mode-switch body. JMP not CALL — the
+    ; mode switch invalidates this stack frame's [bits 32] return
+    ; address. Control reaches kernel_main_64 in [bits 64], which
+    ; does its own work and never returns here.
+    jmp mode_switch_to_long_mode
+
+.pvh_fail:
+    ; PVH_START_INFO_MAGIC mismatch (or EBX = 0). Emit a marker so
+    ; a developer running the cell manually can see the failure
+    ; mode, then halt. We don't dump the observed magic in hex
+    ; (would need a [bits 32] hex-emit helper not currently in
+    ; this file); the static marker is sufficient for the rare
+    ; "loader handed wrong magic" case.
+    lea esi, [pvh_fail_msg]
+    mov ecx, pvh_fail_len
+    call emit_bytes_32
+    cli
+.pvh_halt:
+    hlt
+    jmp .pvh_halt
+
+; emit_bytes_32 — [bits 32] LSR-polled serial writer.
+; Used only by the PVH prologue above (READY emit + PVH:FAIL
+; emit). Same contract as the [bits 64] emit_bytes used post-
+; mode-switch. Mirroring rather than factoring because the bit-
+; mode difference is what we're crossing — a shared include can't
+; be assembled twice in different bit modes from a single source.
 ;
-; Barrier envelope: lfence around loads, mfence around stores —
-; the pattern already set by VIO-001..006 up-file.
+;   In:  ESI = source ptr, ECX = byte count, DX = COM1_PORT.
+;   Out: CF = 0 on full success, CF = 1 on UART timeout.
+;   Clobbers: eax, ecx, esi, edi, flags. Preserves: dx, ebx, ebp, esp.
+emit_bytes_32:
+    test ecx, ecx
+    jz .done
+.next:
+    add dx, COM1_LSR_OFFSET
+    mov edi, UART_POLL_TIMEOUT
+.wait_thre:
+    in  al, dx
+    test al, UART_LSR_THRE
+    jnz .have_thre
+    dec edi
+    jnz .wait_thre
+    sub dx, COM1_LSR_OFFSET
+    stc
+    ret
+.have_thre:
+    sub dx, COM1_LSR_OFFSET
+    mov al, [esi]
+    out dx, al
+    inc esi
+    dec ecx
+    jnz .next
+.done:
+    clc
+    ret
+
+
+; ================================================================
+; [bits 64] kernel main — full virtio-net init in long mode
+; ================================================================
+; Reached only via mode_switch_to_long_mode's tail jump. State on
+; entry: long mode, paging on with low 4 GiB identity-mapped (D063),
+; RSP = __bootstrap_stack_top (D060 step 4.1), null DS/ES/FS/GS,
+; SS = DATA64_SEL.
+;
+; Calling/register conventions in this file:
+;   r12 — VIRTIO_MMIO_BASE pinned for the entire kernel_main_64.
+;         Never written by emit_bytes / emit_hex32; the [r12 + off]
+;         addressing pattern works around the fact that
+;         VIRTIO_MMIO_BASE = 0xC0001000 sign-extends *negative* as a
+;         32-bit displacement and so cannot be used directly as
+;         absolute disp32 in [bits 64]. RAM addresses (VIRTQ_BASE,
+;         RX_BUFFER_BASE) are < 2 GiB and use direct disp32.
+;   dx  — COM1_PORT pinned across emit_bytes calls.
+;   eax/ebx/ecx/edx/esi/edi/ebp — same roles as the prior [bits 32]
+;         code; long-mode auto-zero-extends 32-bit writes to the
+;         full 64-bit register. Pointer ops use rax/rbx/rsi/rdi/rbp.
+
+; Per-queue programming macro — [bits 64] form using r12 indirect.
+; Same logic as the prior [bits 32] macro; only the addressing
+; mode changed.
 ;
 ; Parameters:
-;   %1 = queue index (0 = RX, 1 = TX) — written to QueueSel
-;   %2 = descriptor table physical address (u32)
-;   %3 = available ring physical address (u32)
-;   %4 = used ring physical address (u32)
-;   %5 = fail-path label — the caller passes the label (e.g.
-;        ``.queue_ready_fail``) that control flow should reach
-;        when QueueReady read-back fails. Threading it as a
-;        parameter, rather than having the macro body reference
-;        a file-scope label directly, removes the hidden coupling
-;        between the macro's expansion scope and where the fail
-;        label happens to be defined. The caller owns the label;
-;        the macro owns the body. Note: if the caller passes a
-;        local-style ``.label``, NASM still resolves it against
-;        the caller's most-recent non-local label at the
-;        expansion site — the macro argument is a text token,
-;        not a fully-resolved address. Pass a global label if
-;        the caller's scope might shift.
-; Clobbers: eax, flags. Preserves: everything else.
+;   %1 = queue index (0 = RX, 1 = TX)
+;   %2 = descriptor table physical address (u32 immediate)
+;   %3 = available ring physical address (u32 immediate)
+;   %4 = used ring physical address (u32 immediate)
+;   %5 = fail-path label (target on QueueReady read-back mismatch)
+; Clobbers: eax, flags, MMIO at [r12 + ...], avail+used ring headers
+;           at [%3] / [%4]. Preserves all GPRs except eax (and dx
+;           explicitly).
 %macro program_queue 5
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], %1
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_SEL], %1
     mfence
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
+    mov eax, [r12 + VIRTIO_MMIO_QUEUE_NUM_MAX]
     lfence
-    ; Clamp to VIRTQ_MAX_SIZE — the allocated 4 KiB descriptor-
-    ; table page holds at most 256 entries. A larger QueueNumMax
-    ; would overflow into the available-ring page on the device
-    ; side.
     cmp eax, VIRTQ_MAX_SIZE
     jbe %%size_ok
     mov eax, VIRTQ_MAX_SIZE
 %%size_ok:
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM], eax
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_NUM], eax
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DESC_LOW], %2
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DESC_LOW], %2
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DESC_HIGH], 0
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DESC_HIGH], 0
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DRIVER_LOW], %3
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DRIVER_LOW], %3
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DRIVER_HIGH], 0
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DRIVER_HIGH], 0
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DEVICE_LOW], %4
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DEVICE_LOW], %4
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_DEVICE_HIGH], 0
-    ; Explicitly zero the Avail + Used ring headers (u16 flags +
-    ; u16 idx, 4 bytes each) before QueueReady flips to 1. The
-    ; ring-population path (VIO-R-002 for RX; TX's future work
-    ; for TX) writes idx after filling slots, but the device
-    ; begins observing these headers the moment QueueReady = 1.
-    ; Firecracker zero-inits guest RAM today so this is belt-and-
-    ; suspenders; spec (§2.7.11) doesn't guarantee the VMM does.
-    mov dword [%3], 0                    ; avail: flags=0, idx=0
-    mov dword [%4], 0                    ; used:  flags=0, idx=0
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DEVICE_HIGH], 0
+    ; Avail/Used ring header zero (belt-and-suspenders; Firecracker
+    ; zero-inits but spec doesn't mandate it).
+    mov dword [%3], 0
+    mov dword [%4], 0
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_READY], 1
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_READY], 1
     mfence
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_READY]
+    mov eax, [r12 + VIRTIO_MMIO_QUEUE_READY]
     lfence
     cmp eax, 1
     jne %5
 %endmacro
 
-global _start
-_start:
-    ; PVH spec leaves ESP undefined on entry. Point it at 2 MiB, well
-    ; above .text (ends < 0x100200) and inside the 128 MiB guest RAM,
-    ; so our call/ret pairs have somewhere valid to push return
-    ; addresses. Without this, the first CALL pushes to [0xfffffffc]
-    ; (ESP=0 wraps) — MMIO space past guest RAM — and RET then reads
-    ; garbage back.
-    mov esp, 0x200000
+[bits 64]
+global kernel_main_64
+kernel_main_64:
+    ; Step 4.2: D060 init-time static memory allocator. Returns
+    ; immediately today (.memreq is empty); the wire-up exists so
+    ; the call site stops being a no-op the moment a module
+    ; declares a region (step 5).
+    call init_memory_layout
 
-    ; Clear DF. The x86-64 ABI expects DF=0 on entry to any function,
-    ; and future edits that add `rep movs` / `lodsb` must not be
-    ; surprised by an unexpected direction.
-    cld
+    ; Pin VIRTIO_MMIO_BASE in r12 for the rest of the function.
+    ; The 32-bit-dest form `mov r12d, imm32` zero-extends to r12,
+    ; which is what we want — `mov r12, imm32` would sign-extend
+    ; (turning 0xC0001000 into 0xFFFFFFFFC0001000). The encoding
+    ; saved here vs movabs r64,imm64 is 4 bytes, but correctness
+    ; is the actual reason for the form.
+    mov r12d, VIRTIO_MMIO_BASE
 
+    ; UART base for all emit_bytes / emit_hex32 calls.
     mov dx, COM1_PORT
 
-    ; --- Emit "READY\n" ---
-    lea esi, [ready_msg]
-    mov ecx, ready_len
-    call emit_bytes
-
     ; --- Probe virtio-MMIO MagicValue register ---
-    ; Virtio 1.2 §4.2.2: "The driver MUST use a memory barrier before
-    ; and after each MMIO register access." On x86 TSO `lfence` is
-    ; sufficient around a pure load — stores need `mfence`, loads need
-    ; `lfence`. We only read here, so `lfence` satisfies the spec
-    ; without the store-ordering cost `mfence` carries. When ring-ops
-    ; (descriptor writes) land, the barrier choice becomes `mfence`
-    ; at each store+load boundary; handle case-by-case.
+    ; Virtio 1.2 §4.2.2: barrier before/after MMIO. x86 TSO:
+    ; lfence around loads, mfence around stores.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE]
+    mov eax, [r12]                  ; MagicValue
     lfence
     cmp eax, VIRTIO_MAGIC
     jne .virtio_fail
 
-    ; Match — announce.
-    lea esi, [virtio_ok_msg]
+    lea rsi, [rel virtio_ok_msg]
     mov ecx, virtio_ok_len
     call emit_bytes
 
     ; --- Device-status init prefix (VIO-001, VIO-002, VIO-003) ---
-    ; Virtio 1.2 §2.1.2 steps 1-3: the driver (a) resets the device by
-    ; writing 0 to Status, (b) sets ACKNOWLEDGE, (c) sets DRIVER.
-    ; Later steps (features, FEATURES_OK, virtqueue init, DRIVER_OK)
-    ; live in follow-up commits — see docs/l2/REQUIREMENTS.md §4.1
-    ; VIO-004..009.
-    ;
-    ; §2.1 "Device Status only supports setting bits, not clearing
-    ; them; clearing can be done only by resetting the device" — so
-    ; the ACK/DRIVER steps are read-modify-write with OR, not blind
-    ; stores that would trash other (spurious) bits.
-    ;
-    ; §4.2.2.2 mandates a memory barrier before and after each MMIO
-    ; register access. The existing MagicValue probe above (lines
-    ; 93-102) documents the x86-TSO barrier choice: lfence for
-    ; loads, mfence for stores. This block follows the same pattern.
-    ; The mfence between a register-only `or` and the subsequent
-    ; store is redundant on x86 TSO — the preceding lfence already
-    ; serializes the prior load — but keeping it matches the literal
-    ; "before AND after each MMIO access" spec phrasing and the
-    ; MagicValue probe's style. Cost is zero on this init-only path.
+    ; Virtio 1.2 §2.1.2 steps 1-3.
 
-    ; VIO-001: reset device (write 0 to Status).
+    ; VIO-001: reset device.
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], 0
+    mov dword [r12 + VIRTIO_MMIO_STATUS], 0
     mfence
 
-    ; Virtio 1.2 §4.2.4: after writing 0 to Status the driver
-    ; MUST wait until a read returns 0 before re-initializing.
-    ; Firecracker's MMIO is synchronous today so the first read
-    ; succeeds, but polling matches the spec and surfaces if a
-    ; future VMM ever goes async. Bounded iteration count
-    ; survives a wedged device; on timeout we fall through and
-    ; let the subsequent VIO-002 RMW catch the anomaly via
-    ; .status_fail's equality-compare.
+    ; §4.2.4 reset wait — bounded.
     mov ecx, 0x100000
 .reset_wait:
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     test eax, eax
     jz  .reset_done
@@ -313,128 +361,96 @@ _start:
     jnz .reset_wait
 .reset_done:
 
-    ; VIO-002: read-modify-write ACKNOWLEDGE.
+    ; VIO-002: RMW ACKNOWLEDGE.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     or  eax, VIRTIO_STATUS_ACKNOWLEDGE
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mov dword [r12 + VIRTIO_MMIO_STATUS], eax
     mfence
 
-    ; VIO-003: read-modify-write DRIVER.
+    ; VIO-003: RMW DRIVER.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     or  eax, VIRTIO_STATUS_DRIVER
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mov dword [r12 + VIRTIO_MMIO_STATUS], eax
     mfence
 
-    ; Confirm both bits stuck and nothing else crept in. Direct
-    ; equality compare (not a masked one) catches FAILED (§2.1.2
-    ; lists it as an error signal the driver must honor) and any
-    ; other bit the device set unexpectedly mid-RMW.
+    ; Cross-check: ACK | DRIVER, no other bits.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     cmp eax, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER
     jne .status_fail
 
-    lea esi, [status_driver_msg]
+    lea rsi, [rel status_driver_msg]
     mov ecx, status_driver_len
     call emit_bytes
 
-    ; --- Feature negotiation (VIO-004, VIO-005, VIO-006) ---
-    ; Virtio 1.2 §2.1.2 steps 4-6. MVP policy (documented with the
-    ; VIRTIO_F_VERSION_1_HIBIT constant near the top): accept
-    ; VERSION_1 only; everything else waits for its consuming code
-    ; to land. Bits 0-31 are left unselected; bits 32-63 get exactly
-    ; one bit — VERSION_1.
-    ;
-    ; Both feature pages are read. We accept nothing from the low
-    ; page in MVP, but the value is saved in ebx (preserved across
-    ; emit_bytes / emit_hex32) so failure diagnostics can show what
-    ; the device actually offered. When MAC / STATUS / CTRL_VQ land
-    ; in follow-up commits, the read stays; only the low-page
-    ; driver-features write gains bits.
+    ; --- Feature negotiation (VIO-004..006) ---
 
-    ; VIO-004 part 1a: read low-page offered features, save for diag.
+    ; VIO-004 part 1a: read low-page offered features (saved in ebx
+    ; for diagnostic dump on no-v1 fail; preserved across emit_bytes).
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 0
+    mov dword [r12 + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 0
     mfence
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES]
+    mov eax, [r12 + VIRTIO_MMIO_DEVICE_FEATURES]
     lfence
     mov ebx, eax
 
-    ; VIO-004 part 1b: check VERSION_1 is offered (high page bit 0).
+    ; VIO-004 part 1b: check VERSION_1 in high page.
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 1
+    mov dword [r12 + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 1
     mfence
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DEVICE_FEATURES]
+    mov eax, [r12 + VIRTIO_MMIO_DEVICE_FEATURES]
     lfence
     test eax, VIRTIO_F_VERSION_1_HIBIT
     jz .features_fail_no_v1
 
-    ; VIO-004 part 2: write driver features. Low page = 0 (we accept
-    ; nothing bits 0-31), high page = VERSION_1 only.
+    ; VIO-004 part 2: write driver features. Low page = 0; high = VERSION_1.
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 0
+    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 0
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES], 0
+    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES], 0
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 1
+    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 1
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_DRIVER_FEATURES], VIRTIO_F_VERSION_1_HIBIT
+    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES], VIRTIO_F_VERSION_1_HIBIT
     mfence
 
-    ; VIO-005: set FEATURES_OK in status (RMW).
+    ; VIO-005: RMW FEATURES_OK.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     or  eax, VIRTIO_STATUS_FEATURES_OK
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mov dword [r12 + VIRTIO_MMIO_STATUS], eax
     mfence
 
-    ; VIO-006: re-read Status. If FEATURES_OK cleared, the device
-    ; rejected our subset and we MUST abort init. Equality compare
-    ; against the expected full status value (ACK|DRIVER|FEATURES_OK)
-    ; also catches FAILED and any unexpected stray bits, consistent
-    ; with the VIO-003 cross-check above.
+    ; VIO-006: re-read Status. Must be ACK|DRIVER|FEATURES_OK.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     cmp eax, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK
     jne .features_fail_rejected
 
-    lea esi, [features_ok_msg]
+    lea rsi, [rel features_ok_msg]
     mov ecx, features_ok_len
     call emit_bytes
 
-    ; --- Virtqueue discovery (VIO-007, part 1: QueueNumMax) ---
-    ; Virtio 1.2 §4.2.2: QueueSel selects a queue; QueueNumMax
-    ; returns the device's max supported queue size, or 0 if the
-    ; queue index is unsupported. For virtio-net with no CTRL_VQ
-    ; and no MQ (the only features MVP accepts):
-    ;   queue 0 = RX (receiveq), per §5.1.2
-    ;   queue 1 = TX (transmitq)
-    ; Both must be supported and non-zero to proceed.
-    ;
-    ; This commit is discovery-only. Memory allocation, QueueNum
-    ; write, QueueDesc/Driver/Device physical-address programming,
-    ; and the QueueReady toggle land in the follow-up commit that
-    ; completes VIO-007. The marker here advances as each stage
-    ; does.
+    ; --- Virtqueue discovery (VIO-007 part 1) ---
 
     ; Read QueueNumMax for queue 0 (RX).
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], 0
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_SEL], 0
     mfence
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
+    mov eax, [r12 + VIRTIO_MMIO_QUEUE_NUM_MAX]
     lfence
     test eax, eax
     jz .queue_fail_rx
@@ -442,39 +458,31 @@ _start:
 
     ; Read QueueNumMax for queue 1 (TX).
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_SEL], 1
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_SEL], 1
     mfence
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NUM_MAX]
+    mov eax, [r12 + VIRTIO_MMIO_QUEUE_NUM_MAX]
     lfence
     test eax, eax
     jz .queue_fail_tx
 
     ; Emit: QUEUES:RX=XXXXXXXX TX=XXXXXXXX
-    push eax                        ; preserve TX across emit_bytes
-    lea esi, [queues_rx_prefix_msg]
+    push rax                        ; preserve TX across emit_bytes
+    lea rsi, [rel queues_rx_prefix_msg]
     mov ecx, queues_rx_prefix_len
     call emit_bytes
     mov eax, ebx                    ; RX max → hex
     call emit_hex32
-    lea esi, [queues_tx_sep_msg]
+    lea rsi, [rel queues_tx_sep_msg]
     mov ecx, queues_tx_sep_len
     call emit_bytes
-    pop eax                         ; restore TX
+    pop rax                         ; restore TX (low 32 bits)
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
 
     ; --- VIO-007 Slice 2: initialize virtqueues ---
-    ; Program QueueNum, descriptor/avail/used physical addresses,
-    ; and QueueReady for each queue. Per Virtio 1.2 §2.1.2 step 7
-    ; + §4.2.2 register semantics. Memory bases are compile-time
-    ; constants anchored at ``VIRTQ_BASE`` with page-aligned
-    ; slots per queue (desc / avail / used). No descriptor
-    ; population yet — that's L2 RX/TX plumbing in a later
-    ; commit. Slice 2 proves the plumbing and flips VIO-007 to
-    ; ``implemented``.
     program_queue 0, \
         RX_QUEUE_BASE + VIRTQ_OFF_DESC, \
         RX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
@@ -486,135 +494,77 @@ _start:
         TX_QUEUE_BASE + VIRTQ_OFF_USED, \
         .queue_ready_fail
 
-    lea esi, [queues_ready_msg]
+    lea rsi, [rel queues_ready_msg]
     mov ecx, queues_ready_len
     call emit_bytes
 
-    ; --- VIO-008: set DRIVER_OK (bit 2) in Status ---
-    ; Virtio 1.2 §2.1.2 step 8 — final bit in the init sequence.
-    ; After this write, the device is "live": the virtqueues
-    ; programmed above become consumable, the device can start
-    ; filling the RX used-ring from any buffers the driver later
-    ; posts, and interrupts (if enabled) start firing. Slice 2
-    ; didn't post any buffers yet, so the ring stays idle until
-    ; L2 RX/TX plumbing lands in a later commit — the live
-    ; transition here is still the right step to complete init
-    ; cleanly.
+    ; --- VIO-008: set DRIVER_OK ---
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     or  eax, VIRTIO_STATUS_DRIVER_OK
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mov dword [r12 + VIRTIO_MMIO_STATUS], eax
     mfence
 
-    ; Read-back: full expected state is
-    ;   ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK = 0x0F.
-    ; Equality compare catches both DRIVER_OK-didn't-stick and any
-    ; stray bit (including FAILED) that crept in during init,
-    ; consistent with the VIO-003 / VIO-006 cross-checks above.
+    ; Cross-check full expected state ACK|DRIVER|FEATURES_OK|DRIVER_OK = 0x0F.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     cmp eax, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK
     jne .driver_ok_fail
 
-    lea esi, [driver_ok_msg]
+    lea rsi, [rel driver_ok_msg]
     mov ecx, driver_ok_len
     call emit_bytes
 
-    ; --- VIO-R-002: pre-populate RX queue with WRITE-flagged buffers ---
-    ; Virtio 1.2 §5.1.6.3 — the driver populates the RX queue with
-    ; descriptors marked WRITE before the device has anything to
-    ; deposit. With DRIVER_OK already asserted above, the device is
-    ; live and will begin using these descriptors as soon as it sees
-    ; them on the Available Ring.
-    ;
-    ; All 256 RX descriptor slots get filled here. Each descriptor
-    ; points at a distinct 2 KiB buffer in the pool at
-    ; RX_BUFFER_BASE; each buffer fits the 12-byte virtio_net_hdr
-    ; plus a max-size tagged Ethernet frame. No descriptor chaining
-    ; (VIRTIO_NET_F_MRG_RXBUF not negotiated — see VIO-F-001 / the
-    ; VIRTIO_F_VERSION_1-only MVP subset).
-    ;
-    ; Order enforced by §2.7.13 / §2.7.11:
-    ;   1. Write descriptor table entries
-    ;   2. Write Available Ring slots 0..N-1 with descriptor indices
-    ;   3. mfence — descriptor/ring stores drain before idx bump
-    ;   4. Publish AvailRing.idx = N
-    ;   5. mfence — idx bump drains before QueueNotify write
-    ;   6. QueueNotify = 0 (kick the RX queue)
-    ; Register use in this block: edi = loop counter (0..255);
-    ; eax = per-iteration scratch (desc offset, then buffer addr);
-    ; ebx = current descriptor-entry pointer. All three are
-    ; clobber-safe — the block ends at emit_bytes (which preserves
-    ; ebx but clobbers eax/ecx/esi/edi), and no subsequent code
-    ; reads any of them before they're re-initialized.
+    ; --- VIO-R-002: pre-populate RX with 256 WRITE-flagged buffers ---
+    ; rdi = loop counter (0..255), rax = scratch, rbx = desc-entry pointer.
     xor edi, edi
 .rx_fill_loop:
-    ; Descriptor table entry at desc_base + i * 16.
+    ; Descriptor table entry at desc_base + i*16.
     mov eax, edi
     shl eax, 4
-    lea ebx, [RX_QUEUE_BASE + VIRTQ_OFF_DESC + eax]
+    lea rbx, [rax + RX_QUEUE_BASE + VIRTQ_OFF_DESC]
 
-    ; Buffer address: RX_BUFFER_BASE + i * 2 KiB. Low 32 bits go
-    ; into addr_lo; addr_hi stays 0 (pool is well under 4 GiB).
+    ; Buffer addr: RX_BUFFER_BASE + i*2048. Stays < 4 GiB so addr_hi=0.
     mov eax, edi
     shl eax, 11
     add eax, RX_BUFFER_BASE
 
-    mov dword [ebx + 0],  eax                   ; addr low
-    mov dword [ebx + 4],  0                     ; addr high
-    mov dword [ebx + 8],  RX_BUFFER_SIZE        ; len
-    mov word  [ebx + 12], VIRTQ_DESC_F_WRITE    ; flags (device may write)
-    mov word  [ebx + 14], 0                     ; next (unused, no chain)
+    mov dword [rbx + 0],  eax
+    mov dword [rbx + 4],  0
+    mov dword [rbx + 8],  RX_BUFFER_SIZE
+    mov word  [rbx + 12], VIRTQ_DESC_F_WRITE
+    mov word  [rbx + 14], 0
 
-    ; Available Ring slot i holds descriptor index i. Ring slots
-    ; start at AvailRing offset 4 (after the u16 flags + u16 idx
-    ; header).
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + edi*2], di
+    ; AvailRing.ring[i] = i. Ring slots start past the u16 flags + u16 idx
+    ; header at offset +4. RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 = 0x401004,
+    ; well within disp32 sign-extended range.
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rdi*2], di
 
     inc edi
     cmp edi, VIRTQ_MAX_SIZE
     jl  .rx_fill_loop
 
-    ; Step 3: drain the descriptor/ring stores.
+    ; Drain descriptor/ring stores before idx bump.
     mfence
 
-    ; Step 4: publish idx = 256. Firecracker zero-inits guest RAM
-    ; so idx was 0 before this write; after it, the device sees all
-    ; 256 slots as available.
+    ; Publish AvailRing.idx = 256.
     mov word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], VIRTQ_MAX_SIZE
 
-    ; Step 5: idx bump drains before the kick.
+    ; Drain idx bump before kick.
     mfence
 
-    ; Step 6: QueueNotify(0) kicks the RX queue. The register is
-    ; write-only per spec; no read-back check is possible. If the
-    ; device doesn't see this write, RX stalls forever — but that
-    ; would also manifest as zero completions when we start reading
-    ; the Used Ring in a follow-up commit.
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY], 0
+    ; QueueNotify(0) — kick RX. Write-only register.
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 0
     mfence
 
-    lea esi, [rx_populated_msg]
+    lea rsi, [rel rx_populated_msg]
     mov ecx, rx_populated_len
     call emit_bytes
 
     ; --- VIO-R-003/004: poll Used Ring for first RX completion ---
-    ; UsedRing layout (Virtio 1.2 §2.7.8):
-    ;   u16 flags                   offset 0
-    ;   u16 idx                     offset 2  (device-written)
-    ;   virtq_used_elem ring[N]     offset 4
-    ;     u32 id                    — descriptor index consumed
-    ;     u32 len                   — bytes device wrote
-    ;
-    ; Firecracker zero-inits guest RAM so idx starts at 0; the
-    ; device advances it on every completion. Poll until idx != 0,
-    ; then read ring[0] for the first consumed descriptor and its
-    ; byte-count. Timeout at ~1 s (~100M iterations) so a silent
-    ; test environment still halts cleanly rather than spinning
-    ; forever; a future commit wires deliberate traffic injection.
     mov ecx, 100000000
 .rx_wait_loop:
     lfence
@@ -625,209 +575,132 @@ _start:
     dec ecx
     jnz .rx_wait_loop
 
-    ; Timeout path — polling loop exhausted. Emit RX:TIMEOUT so
-    ; the tracer bullet can distinguish "polling code executed but
-    ; no frame arrived" from "polling code never started."
-    lea esi, [rx_timeout_msg]
+    lea rsi, [rel rx_timeout_msg]
     mov ecx, rx_timeout_len
     call emit_bytes
     jmp .halt
 
 .rx_received:
-    ; Load ring[0]: (id, len). edi ← id, ebx ← len.
+    ; ring[0]: id (u32 @ +4), len (u32 @ +8). edi ← id, ebx ← len.
     lfence
-    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]    ; id
-    mov ebx, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 8]    ; len
+    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]
+    mov ebx, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 8]
     lfence
 
-    ; Bounds-check id before we dereference. Only ids 0..255 are
-    ; valid — the descriptor table has exactly VIRTQ_MAX_SIZE
-    ; slots, and the buffer pool has VIRTQ_MAX_SIZE * 2048 bytes
-    ; at RX_BUFFER_BASE. A device bug or malicious VMM returning
-    ; id >= 256 would, without this check, compute a read
-    ; address outside the pool (potentially into MMIO space or
-    ; wrapping the 32-bit address space). Fail hard.
+    ; Bounds check id < VIRTQ_MAX_SIZE.
     cmp edi, VIRTQ_MAX_SIZE
     jae .rx_bad_id_fail
 
-    ; Compute buffer address from id: RX_BUFFER_BASE + id * 2048.
+    ; Buffer addr: RX_BUFFER_BASE + id*2048.
     mov eax, edi
     shl eax, 11
     add eax, RX_BUFFER_BASE
 
-    ; virtio_net_hdr layout (Virtio 1.2 §5.1.6.1, VERSION_1 always
-    ; includes num_buffers → 12 bytes):
-    ;   u8  flags        offset 0
-    ;   u8  gso_type     offset 1
-    ;   u16 hdr_len      offset 2
-    ;   u16 gso_size     offset 4
-    ;   u16 csum_start   offset 6
-    ;   u16 csum_offset  offset 8
-    ;   u16 num_buffers  offset 10
-    ;
-    ; VIO-R-004 requires we read num_buffers at minimum. We also
-    ; dump hdr_len (the asserted-by-device header length) so
-    ; diagnostics surface if the host negotiated a different
-    ; hdr size than we expect.
+    ; Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
+    ; eax holds the buffer's 32-bit physical address; long-mode auto-
+    ; zero-extends to rax for the address calculation.
     lfence
-    movzx esi, word [eax + 2]                        ; hdr_len
-    movzx ebp, word [eax + 10]                       ; num_buffers
+    movzx esi, word [rax + 2]                        ; hdr_len
+    movzx ebp, word [rax + 10]                       ; num_buffers
     lfence
 
-    ; Validate num_buffers == 1. Under the VIO-F-001 MVP subset
-    ; (VIRTIO_F_VERSION_1 only, no VIRTIO_NET_F_MRG_RXBUF), the
-    ; device MUST pack every frame into a single descriptor; §5.1.6.3.1
-    ; explicitly forbids the device from setting num_buffers > 1
-    ; when MRG_RXBUF wasn't negotiated. A value other than 1 is a
-    ; device spec violation; silently processing only the first
-    ; buffer would corrupt any later driver assumption that the
-    ; whole frame is contiguous. Fail hard.
+    ; Validate num_buffers == 1 under MVP no-MRG_RXBUF policy.
     cmp ebp, 1
     jne .rx_num_bufs_fail
 
-    ; Emit: RX:FRAME id=XXXXXXXX hdr_len=XXXXXXXX num_bufs=XXXXXXXX used_len=XXXXXXXX\n
-    ; Stash fields across emit_bytes calls (which preserve
-    ; ebx/ebp/esp/dx but clobber eax/ecx/esi/edi). Push order:
-    ; used_len, num_bufs, hdr_len, id so the first pop yields id.
-    push ebx                                         ; used_len
-    push ebp                                         ; num_buffers
-    push esi                                         ; hdr_len
-    push edi                                         ; id
+    ; Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
+    ; Push order: used_len, num_bufs, hdr_len, id (last → first pop = id).
+    push rbx                                         ; used_len
+    push rbp                                         ; num_buffers
+    push rsi                                         ; hdr_len
+    push rdi                                         ; id
 
-    lea esi, [rx_frame_prefix_msg]
+    lea rsi, [rel rx_frame_prefix_msg]
     mov ecx, rx_frame_prefix_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
 
-    lea esi, [rx_frame_hdr_len_msg]
+    lea rsi, [rel rx_frame_hdr_len_msg]
     mov ecx, rx_frame_hdr_len_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
 
-    lea esi, [rx_frame_num_bufs_msg]
+    lea rsi, [rel rx_frame_num_bufs_msg]
     mov ecx, rx_frame_num_bufs_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
 
-    lea esi, [rx_frame_used_len_msg]
+    lea rsi, [rel rx_frame_used_len_msg]
     mov ecx, rx_frame_used_len_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
 
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
 
     ; --- VIO-R-006/007: return consumed descriptor + notify ---
-    ; Close the receive cycle by recycling the descriptor we just
-    ; pulled off the Used Ring. Under §2.7.13, the driver returns
-    ; a consumed descriptor by writing its index into the next
-    ; Available Ring slot and bumping AvailRing.idx; §2.7.12 then
-    ; requires a Queue Notify (unless VIRTIO_F_EVENT_IDX suppresses
-    ; it, which VIO-F-007 doesn't negotiate in MVP).
-    ;
-    ; After VIO-R-002, AvailRing.idx = 256 and ring[0..255] hold
-    ; descriptors 0..255. To recycle the descriptor we consumed,
-    ; write its id into ring[idx % 256] = ring[0], advance idx
-    ; to 257. The device reads idx = 257, sees one new
-    ; available entry beyond its last-consumed position, picks
-    ; up the re-published descriptor.
-    ;
-    ; edi was clobbered by the emit_hex32 chain; re-read id from
-    ; ring[0].id. The used-ring element stays at offset +4 until
-    ; the device advances its own producer index and overwrites
-    ; the slot — which won't happen until we also advance our
-    ; consumer index, which we don't track in this one-shot
-    ; MVP. Safe to re-read here.
+    ; rdi is clobbered by the emit_hex32 chain above; re-read id from
+    ; ring[0].id. Safe in this one-shot MVP — the device's consumer
+    ; index advances only when we advance our consumer-shadow, which
+    ; we don't track here.
     lfence
-    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]    ; id
+    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]
     lfence
 
-    ; Current AvailRing.idx (driver-owned, in guest RAM). The
-    ; re-read-from-shared-ring pattern works here because we're
-    ; the sole writer (§2.7.13) AND this one-shot MVP never
-    ; loops through more than one return. A multi-frame RX loop
-    ; MUST replace this re-read with a driver-private shadow
-    ; copy of next_avail_idx — the shared ring is the wrong
-    ; state if anything (device, future driver path) could
-    ; conceivably touch it.
+    ; Current AvailRing.idx (u16). The shared-ring re-read pattern
+    ; works here because we're the sole writer (§2.7.13) and this
+    ; one-shot MVP returns one descriptor only. A multi-frame loop
+    ; MUST replace this with a driver-private shadow (task #17).
     movzx eax, word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2]
 
-    ; Slot index = idx mod VIRTQ_MAX_SIZE. VIRTQ_MAX_SIZE is
-    ; 256 (power of 2), so AND with 0xFF.
+    ; Slot index = idx mod 256 = idx & 0xFF.
     mov ebx, eax
     and ebx, VIRTQ_MAX_SIZE - 1
 
-    ; Write descriptor id into ring[slot]. Ring slots start at
-    ; offset 4 after flags + idx.
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + ebx*2], di
+    ; ring[slot] = id.
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rbx*2], di
 
-    ; Barrier before idx bump — the descriptor-id write must be
-    ; globally visible before the idx advance per §2.7.11.
+    ; Barrier before idx bump.
     mfence
 
-    ; Advance AvailRing.idx by 1 (u16, wraps naturally at 65536).
+    ; idx += 1.
     inc eax
     mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], ax
 
-    ; Barrier before QueueNotify so the idx advance is globally
-    ; visible before the device reads the kick.
+    ; Barrier before notify.
     mfence
 
-    ; Kick the device — queue index 0 (RX).
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY], 0
+    ; Kick RX (queue 0).
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 0
     mfence
 
-    lea esi, [rx_returned_msg]
+    lea rsi, [rel rx_returned_msg]
     mov ecx, rx_returned_len
     call emit_bytes
 
-    ; --- VIO-T-002/003/004/005: submit one canary Ethernet frame ---
-    ; Single-descriptor TX: hdr + payload concatenated in one
-    ; buffer, no chaining. Spec (§5.1.6.2) permits either a
-    ; chain (hdr, payload, ...) or a single descriptor covering
-    ; both. Single keeps the MVP-proof minimal.
-    ;
-    ; Frame layout at ``tx_test_pkt``:
-    ;   virtio_net_hdr (12 B, all zero):
-    ;     flags=0     — no NEEDS_CSUM (VIO-T-003 respects the
-    ;                   VIO-F-006 CSUM-not-negotiated posture).
-    ;     gso_type=0  — GSO_NONE (VIO-T-004).
-    ;     hdr_len/gso_size/csum_*/num_buffers — driver writes 0;
-    ;                   device ignores on TX (§5.1.6.2).
-    ;   Ethernet II frame (60 B — minimum-size untagged):
-    ;     dst = FF:FF:FF:FF:FF:FF (broadcast).
-    ;     src = 02:00:00:00:00:01 (locally administered unicast;
-    ;           satisfies ETH-015 + ETH-016).
-    ;     type = 0x88B5 (IEEE 802 local experimental, RFC 5342 —
-    ;           chosen to avoid collision with real traffic).
-    ;     payload = 46 × 0xAB (canary byte).
+    ; --- VIO-T-002..005: submit one canary Ethernet frame ---
+    lea rbx, [TX_QUEUE_BASE + VIRTQ_OFF_DESC]
+    ; addr_lo = tx_test_pkt absolute address. NASM in [bits 64]
+    ; with `mov dword [...], imm32` writes a sign-extended-to-64
+    ; immediate; tx_test_pkt's address is < 4 GiB so the 32-bit
+    ; immediate is correct as a phys address. Stays valid only
+    ; while paging identity-maps low 4 GiB (D063); a future non-
+    ; identity layout would need a phys-frame translation here.
+    mov dword [rbx + 0],  tx_test_pkt
+    mov dword [rbx + 4],  0
+    mov dword [rbx + 8],  tx_test_pkt_len
+    mov word  [rbx + 12], 0
+    mov word  [rbx + 14], 0
 
-    ; TX descriptor[0] = (addr=tx_test_pkt, len=72, flags=0, next=0).
-    ; flags=0 means NEITHER NEXT (no chain) NOR WRITE (device
-    ; reads, doesn't write — TX direction).
-    ;
-    ; addr_lo = tx_test_pkt — the linker's 32-bit address of the
-    ; symbol, used directly as a physical address. Safe while
-    ; PVH identity-maps guest VA == PA (today's regime); the
-    ; moment paging gets introduced with non-identity mappings,
-    ; this must convert to the physical frame the symbol backs.
-    ; Flagged here rather than hidden in an implicit assumption.
-    lea ebx, [TX_QUEUE_BASE + VIRTQ_OFF_DESC]
-    mov dword [ebx + 0],  tx_test_pkt                 ; addr low
-    mov dword [ebx + 4],  0                           ; addr high
-    mov dword [ebx + 8],  tx_test_pkt_len             ; len
-    mov word  [ebx + 12], 0                           ; flags
-    mov word  [ebx + 14], 0                           ; next
-
-    ; TX AvailRing.ring[0] = 0 (head descriptor of the chain).
+    ; AvailRing.ring[0] = 0 (head descriptor of single-desc TX).
     mov word [TX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4], 0
 
-    ; Barrier before idx bump (§2.7.11).
+    ; Barrier before idx bump.
     mfence
 
     ; Publish AvailRing.idx = 1.
@@ -836,29 +709,15 @@ _start:
     ; Barrier before notify.
     mfence
 
-    ; Kick TX queue — queue index 1 (VIO-T-001).
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_QUEUE_NOTIFY], 1
+    ; Kick TX (queue 1).
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 1
     mfence
 
-    lea esi, [tx_submitted_msg]
+    lea rsi, [rel tx_submitted_msg]
     mov ecx, tx_submitted_len
     call emit_bytes
 
     ; --- VIO-T-006: poll TX Used Ring for completion ---
-    ; Device marks the descriptor USED once it has pulled the
-    ; buffer out for wire transmission — completion is typically
-    ; near-immediate (no wire-level ack-gated delay like
-    ; receive). A TIMEOUT here would indicate the device didn't
-    ; process our kick, which would be a device/VMM bug.
-    ;
-    ; FIRST-USE-ONLY check: `test ax, ax` detects "used.idx !=
-    ; 0", which works because Firecracker zero-inits the ring
-    ; AND program_queue explicitly zeroes it (defense-in-depth).
-    ; A real multi-TX path cannot use this pattern — by the
-    ; second submit, idx is already non-zero from the first
-    ; completion and the loop would fall through on stale state.
-    ; Future TX loop MUST maintain a driver-private last-seen-idx
-    ; shadow and compare against it.
     mov ecx, 100000000
 .tx_wait_loop:
     lfence
@@ -869,226 +728,181 @@ _start:
     dec ecx
     jnz .tx_wait_loop
 
-    lea esi, [tx_timeout_msg]
+    lea rsi, [rel tx_timeout_msg]
     mov ecx, tx_timeout_len
     call emit_bytes
     jmp .halt
 
 .tx_reclaimed:
-    ; TX ring[0]: (id, len) — device writes the head descriptor
-    ; index and the total bytes consumed from the chain.
     lfence
-    mov edi, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 4]     ; id
-    mov ebx, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 8]     ; len
+    mov edi, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 4]    ; id
+    mov ebx, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 8]    ; len
     lfence
 
-    ; Bounds-check the returned id as we did for RX (VIO-R defensive
-    ; discipline applied symmetrically). Only desc 0 should come
-    ; back from our single-submit, but a buggy device could return
-    ; anything; reject id >= VIRTQ_MAX_SIZE before we log it as
-    ; hex (the offset-into-descriptor-table doesn't apply on TX
-    ; since we don't dereference, but bounds-check preserves the
-    ; invariant for any future tx-specific buffer pool).
+    ; Bounds-check id symmetrically with RX.
     cmp edi, VIRTQ_MAX_SIZE
     jae .tx_bad_id_fail
 
-    ; Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX\n
-    ; Push order: used_len first, id second — first pop yields id.
-    push ebx
-    push edi
+    ; Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX
+    push rbx                                         ; used_len
+    push rdi                                         ; id
 
-    lea esi, [tx_reclaimed_prefix_msg]
+    lea rsi, [rel tx_reclaimed_prefix_msg]
     mov ecx, tx_reclaimed_prefix_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
 
-    lea esi, [tx_used_len_msg]
+    lea rsi, [rel tx_used_len_msg]
     mov ecx, tx_used_len_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
 
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .halt
 
 .driver_ok_fail:
-    ; eax holds the observed status. Dump it for diagnostics
-    ; and halt via the VIO-009 FAILED-bit path.
-    push eax
-    lea esi, [driver_ok_fail_msg]
+    push rax
+    lea rsi, [rel driver_ok_fail_msg]
     mov ecx, driver_ok_fail_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .rx_bad_id_fail:
-    ; Device returned a used-ring id outside 0..255. edi holds
-    ; the bogus id. Emit RX:FAIL bad_id=<hex> and route through
-    ; VIO-009 FAILED.
-    push edi
-    lea esi, [rx_bad_id_msg]
+    push rdi
+    lea rsi, [rel rx_bad_id_msg]
     mov ecx, rx_bad_id_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .rx_num_bufs_fail:
-    ; Device asserted num_buffers != 1 without VIRTIO_NET_F_MRG_RXBUF
-    ; negotiated — spec violation (§5.1.6.3.1). ebp holds the
-    ; observed num_buffers. Emit RX:FAIL num_bufs=<hex> and route
-    ; through VIO-009 FAILED.
-    push ebp
-    lea esi, [rx_num_bufs_msg]
+    push rbp
+    lea rsi, [rel rx_num_bufs_msg]
     mov ecx, rx_num_bufs_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .tx_bad_id_fail:
-    ; Device returned a TX used-ring id outside 0..255. edi holds
-    ; the bogus id. Emit TX:FAIL bad_id=<hex> and route through
-    ; VIO-009 FAILED.
-    push edi
-    lea esi, [tx_bad_id_msg]
+    push rdi
+    lea rsi, [rel tx_bad_id_msg]
     mov ecx, tx_bad_id_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .queue_ready_fail:
-    ; QueueReady didn't read back as 1 after we wrote it — the
-    ; device rejected the programming for some reason (bad
-    ; address alignment, unsupported queue size, ...). Dump and
-    ; halt through the VIO-009 FAILED path.
-    lea esi, [queues_ready_fail_msg]
+    lea rsi, [rel queues_ready_fail_msg]
     mov ecx, queues_ready_fail_len
     call emit_bytes
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .queue_fail_rx:
-    ; QueueSel=0 returned QueueNumMax=0 — device does not support
-    ; the RX queue. Fatal: MVP needs both queues. Emit the marker
-    ; and route through .set_failed (VIO-009).
-    lea esi, [queues_fail_rx_msg]
+    lea rsi, [rel queues_fail_rx_msg]
     mov ecx, queues_fail_rx_len
     call emit_bytes
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .queue_fail_tx:
-    ; QueueSel=1 returned QueueNumMax=0 — device does not support
-    ; the TX queue. Fatal (same reason as .queue_fail_rx).
-    lea esi, [queues_fail_tx_msg]
+    lea rsi, [rel queues_fail_tx_msg]
     mov ecx, queues_fail_tx_len
     call emit_bytes
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .features_fail_no_v1:
-    ; Device did not offer VIRTIO_F_VERSION_1. ebx=dev_lo, eax=dev_hi.
-    ; Emit: FEATURES:FAIL no-v1 dev_lo=XXXXXXXX dev_hi=XXXXXXXX
-    push eax                        ; preserve dev_hi across emit_bytes
-    lea esi, [features_no_v1_prefix_msg]
+    push rax                        ; preserve dev_hi
+    lea rsi, [rel features_no_v1_prefix_msg]
     mov ecx, features_no_v1_prefix_len
     call emit_bytes
     mov eax, ebx                    ; dev_lo → hex
     call emit_hex32
-    lea esi, [features_hi_sep_msg]
+    lea rsi, [rel features_hi_sep_msg]
     mov ecx, features_hi_sep_len
     call emit_bytes
-    pop eax                         ; restore dev_hi
+    pop rax                         ; restore dev_hi
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .features_fail_rejected:
-    ; Device cleared FEATURES_OK after we set it (or set an unexpected
-    ; bit). eax holds the observed status; dump it.
-    push eax
-    lea esi, [features_rejected_msg]
+    push rax
+    lea rsi, [rel features_rejected_msg]
     mov ecx, features_rejected_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .status_fail:
-    ; eax holds the observed status value. Emit the marker and the
-    ; value so a debugger sees exactly what the device reported.
-    push eax
-    lea esi, [status_fail_msg]
+    push rax
+    lea rsi, [rel status_fail_msg]
     mov ecx, status_fail_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .set_failed
 
 .virtio_fail:
-    ; eax holds the actual magic value. Print "VIRTIO:FAIL magic=" then
-    ; the eight hex digits, then "\n". Saves a lot of time versus
-    ; having to bisect from the VMM log that the address was wrong.
-    ; Skips .set_failed — if magic didn't match, the device's register
-    ; layout is unverified and a Status write to offset 0x70 would
+    ; eax holds the bogus magic. Skip .set_failed because the
+    ; device's register layout is unverified — a Status write would
     ; be blind.
-    push eax                        ; preserve magic across emit_bytes
-    lea esi, [virtio_fail_msg]
+    push rax
+    lea rsi, [rel virtio_fail_msg]
     mov ecx, virtio_fail_len
     call emit_bytes
-    pop eax
+    pop rax
     call emit_hex32
-    lea esi, [newline]
+    lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
     jmp .halt
 
 .set_failed:
-    ; VIO-009: signal the device that the driver has given up. Any
-    ; fatal init error downstream of the MagicValue probe routes
-    ; here before halt. RMW preserves whatever Status bits are
-    ; already set (ACK / DRIVER / FEATURES_OK in various combinations
-    ; depending on which stage failed). Only entered after the probe
-    ; matched — .virtio_fail skips this step for the reason noted
-    ; above.
+    ; VIO-009: signal the device that the driver gave up.
     lfence
-    mov eax, [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS]
+    mov eax, [r12 + VIRTIO_MMIO_STATUS]
     lfence
     or  eax, VIRTIO_STATUS_FAILED
     mfence
-    mov dword [VIRTIO_MMIO_BASE + VIRTIO_MMIO_STATUS], eax
+    mov dword [r12 + VIRTIO_MMIO_STATUS], eax
     mfence
     ; fall through
 
@@ -1098,30 +912,26 @@ _start:
     hlt
     jmp .halt_loop
 
-; --- emit_bytes: write <ecx> bytes from <esi> to COM1 in <dx> ---
-; Polls the 16550 Line Status Register for THRE (Transmit Holding
-; Register Empty, bit 5) before each write, with a ~1M-iteration
-; timeout so a wedged UART doesn't hang the guest. On timeout,
-; abandons the remaining stream. `dx` holds COM1 THR on entry and
-; is restored to COM1 THR before return so subsequent callers can
-; reuse it.
+
+; ================================================================
+; emit_bytes — [bits 64] LSR-polled serial writer
+; ================================================================
+; Same contract as the [bits 32] emit_bytes_32 above, just running
+; in long mode. Used by all post-mode-switch serial output in
+; kernel_main_64. `in/out` work identically in long mode (port I/O
+; is unchanged across protected / long modes).
 ;
-; Return signalling via the carry flag:
-;   CF=0 on full success (all <ecx> bytes written, or ecx==0).
-;   CF=1 on timeout (UART never asserted THRE within the budget).
-; Callers can `jc .error_path` immediately after the ret to branch
-; on UART failure. Current callers don't consume the signal (a
-; wedged UART during boot is unrecoverable anyway and we halt), but
-; the signal is cheap to emit and future callers — a full L2 RX
-; path that recovers from transient UART issues — can consume it
-; without a helper rewrite.
-;
-; Clobbers: eax, ecx, esi, edi, flags. Preserves: dx, ebx, ebp, esp.
+;   In:  RSI = source ptr, ECX = byte count, DX = COM1_PORT.
+;   Out: CF = 0 on full success, CF = 1 on UART timeout.
+;   Clobbers: eax, ecx, esi/rsi, edi, flags.
+;   Preserves: dx, rbx, rbp, rsp, r12 (and all other callee-saved).
+
+[bits 64]
 emit_bytes:
     test ecx, ecx
     jz .done
 .next:
-    add dx, COM1_LSR_OFFSET   ; dx = LSR port
+    add dx, COM1_LSR_OFFSET
     mov edi, UART_POLL_TIMEOUT
 .wait_thre:
     in  al, dx
@@ -1129,55 +939,68 @@ emit_bytes:
     jnz .have_thre
     dec edi
     jnz .wait_thre
-    ; Timeout. Restore dx, signal failure via CF=1, return.
     sub dx, COM1_LSR_OFFSET
     stc
     ret
 .have_thre:
-    sub dx, COM1_LSR_OFFSET   ; dx = THR port (== COM1_PORT)
-    mov al, [esi]
+    sub dx, COM1_LSR_OFFSET
+    mov al, [rsi]
     out dx, al
-    inc esi
+    inc rsi
     dec ecx
     jnz .next
 .done:
     clc
     ret
 
-; --- emit_hex32: write eax as 8 uppercase hex digits to COM1 in dx ---
-; Uses an 8-byte stack scratch buffer so the emit_bytes LSR-polling
-; helper can do the actual serialization without duplication.
-; Preserves dx (caller's COM1_PORT) and ebx (which we use internally
-; and save on entry).
-; Clobbers: eax, ecx, esi, edi. Preserves: dx, ebx.
+; ================================================================
+; emit_hex32 — [bits 64] hex-emit helper
+; ================================================================
+; Renders eax as 8 uppercase hex digits via emit_bytes. 8-byte
+; stack scratch. Preserves dx (caller's COM1_PORT) and rbx (saved
+; on entry); the caller's r12 is preserved because emit_bytes does.
+;   In:  EAX = 32-bit value to render.
+;   Clobbers: eax, ecx, esi/rsi, edi.
+;   Preserves: dx, rbx, rbp, rsp, r12.
+
 emit_hex32:
-    push ebx
-    sub esp, 8                    ; 8-byte scratch buffer
-    mov ebx, eax                  ; keep source across the rotate loop
-    lea esi, [esp]
+    push rbx
+    sub rsp, 16                   ; 8 bytes scratch + 8 bytes stack alignment
+    mov ebx, eax                  ; preserve source across rotate loop
+    lea rsi, [rsp]
     mov ecx, 8
 .digit:
-    rol ebx, 4                    ; top nibble → low 4 bits of ebx
+    rol ebx, 4                    ; top nibble → low 4 bits
     mov eax, ebx
     and eax, 0x0F
     cmp al, 10
     jb .num
-    add al, 'A' - '0' - 10        ; 'A'..'F'
+    add al, 'A' - '0' - 10
 .num:
-    add al, '0'                   ; '0'..'9' (or adjusted above for hex)
-    mov [esi], al
-    inc esi
+    add al, '0'
+    mov [rsi], al
+    inc rsi
     dec ecx
     jnz .digit
-    lea esi, [esp]
+    lea rsi, [rsp]
     mov ecx, 8
     call emit_bytes
-    add esp, 8
-    pop ebx
+    add rsp, 16
+    pop rbx
     ret
+
+
+; ================================================================
+; Strings + TX canary packet
+; ================================================================
+; Same content as the prior [bits 32] data — only their addressing
+; mode (RIP-relative via `lea rsi, [rel label]`) changed.
 
 ready_msg:       db 'READY', 10
 ready_len        equ $ - ready_msg
+
+pvh_fail_msg:    db 'PVH:FAIL bad magic', 10
+pvh_fail_len     equ $ - pvh_fail_msg
 
 virtio_ok_msg:   db 'VIRTIO:OK', 10
 virtio_ok_len    equ $ - virtio_ok_msg
@@ -1258,9 +1081,6 @@ tx_used_len_len        equ $ - tx_used_len_msg
 tx_bad_id_msg:         db 'TX:FAIL bad_id='
 tx_bad_id_len          equ $ - tx_bad_id_msg
 
-; TX canary-packet template. Linker places this in .text; the
-; virtio device reads from its absolute physical address via
-; DMA. 72 bytes total = 12 B virtio_net_hdr + 60 B Ethernet.
 tx_test_pkt:
     times 12 db 0                                    ; virtio_net_hdr zero
     db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF            ; dst MAC broadcast
@@ -1273,25 +1093,3 @@ driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
 
 newline:         db 10
-
-
-; ================================================================
-; kernel_main_64 — [bits 64] entry, reached only via
-; mode_switch_to_long_mode's tail jump.
-; ================================================================
-; STAGE-1 STUB: today this is a halt loop, unreachable because
-; firecracker's _start above runs entirely in [bits 32] and never
-; calls mode_switch_to_long_mode. The full [bits 64]-ported virtio
-; init lands in task #14, replacing this stub. Defined now so
-; mode_switch.S's `extern kernel_main_64` resolves at link time
-; and the module is co-linked into the firecracker image.
-
-extern init_memory_layout
-
-[bits 64]
-global kernel_main_64
-kernel_main_64:
-    call init_memory_layout
-.halt:
-    hlt
-    jmp .halt
