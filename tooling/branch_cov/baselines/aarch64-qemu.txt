@@ -19,22 +19,24 @@
 # address in this file. Regenerate wholesale rather than trying to
 # patch in place.
 
-# ---- boot.S: single-vCPU + non-blocking serial (always present) ----
+# ---- boot.S: dead branches in the always-present code paths ----
 #
 # cbnz x5, .Ldone — secondary-CPU entry. vcpu_count=1 in our config,
 #   so the primary always falls through. Only "taken" is missing.
-# tbnz w3, #5, .Lwait — wait-while-FIFO-full. QEMU's PL011 emulation
-#   drains instantly, so TXFF==1 never observed during this boot.
+# cbz w2, .Lemit_done — emit_bytes early-return for empty buffers.
+#   All call sites pass a non-empty buffer, so only "taken" is missing.
+# tbnz w3, #5, .Lemit_loop — wait-while-FIFO-full. QEMU's PL011
+#   emulation drains instantly, so TXFF==1 never observed.
 #   Only "taken" is missing.
 
 # ---- memlayout VM + allocator dead-code branches -------------------
 #
 # arch/aarch64/memory/bytecode_vm.S (D060 step 3A) and
 # arch/aarch64/memory/allocator.S (step 3B) are linked into the
-# kernel image and now reachable via D060 step 4.2's wire-up
+# kernel image and reachable via D060 step 4.2's wire-up
 # (boot.S → init_memory_layout). However init_memory_layout is
-# still a return-immediately stub (the .memreq section is empty
-# until step 5 declares regions), so the bytecode VM and allocator
+# still a return-immediately stub (.memreq section is empty until
+# step 5 declares regions), so the bytecode VM and allocator
 # bodies stay dead at tracer-bullet runtime. Will close in step 5
 # once a module declares a region. The ratchet will then notice
 # the closed gaps, fail, and force a re-baseline — exactly the
@@ -45,52 +47,48 @@
 # diff.py, which exercise every opcode + every two-pass allocator
 # path under user-mode QEMU.
 
-0x108 not_taken
-0x108 taken
-0x110 not_taken
-0x110 taken
+0x114 not_taken
+0x114 taken
 0x120 not_taken
 0x120 taken
-0x134 not_taken
-0x134 taken
-0x13c not_taken
-0x13c taken
-0x148 not_taken
-0x148 taken
-0x150 not_taken
-0x150 taken
+0x128 not_taken
+0x128 taken
+0x138 not_taken
+0x138 taken
+0x14c not_taken
+0x14c taken
+0x154 not_taken
+0x154 taken
 0x160 not_taken
 0x160 taken
 0x168 not_taken
 0x168 taken
-0x188 not_taken
-0x188 taken
-0x194 not_taken
-0x194 taken
-0x1a4 not_taken
-0x1a4 taken
-0x1b8 not_taken
-0x1b8 taken
-0x1c0 not_taken
-0x1c0 taken
-0x1cc not_taken
-0x1cc taken
-0x1d4 not_taken
-0x1d4 taken
-0x1e8 not_taken
-0x1e8 taken
-0x2c8 not_taken
-0x2c8 taken
-0x2cc not_taken
-0x2cc taken
-0x2f4 not_taken
-0x2f4 taken
-0x304 not_taken
-0x304 taken
+0x178 not_taken
+0x178 taken
+0x180 not_taken
+0x180 taken
+0x1a0 not_taken
+0x1a0 taken
+0x1ac not_taken
+0x1ac taken
+0x1bc not_taken
+0x1bc taken
+0x1d0 not_taken
+0x1d0 taken
+0x1d8 not_taken
+0x1d8 taken
+0x1e4 not_taken
+0x1e4 taken
+0x1ec not_taken
+0x1ec taken
+0x200 not_taken
+0x200 taken
+0x2e0 not_taken
+0x2e0 taken
+0x2e4 not_taken
+0x2e4 taken
 0x30c not_taken
 0x30c taken
-0x314 not_taken
-0x314 taken
 0x31c not_taken
 0x31c taken
 0x324 not_taken
@@ -101,59 +99,64 @@
 0x334 taken
 0x33c not_taken
 0x33c taken
+0x344 not_taken
+0x344 taken
+0x34c not_taken
+0x34c taken
 0x354 not_taken
 0x354 taken
-0x38c not_taken
-0x38c taken
-0x3b0 not_taken
-0x3b0 taken
-0x3c0 not_taken
-0x3c0 taken
-0x3cc not_taken
-0x3cc taken
-0x3f0 not_taken
-0x3f0 taken
-0x400 not_taken
-0x400 taken
-0x40c not_taken
-0x40c taken
-0x428 not_taken
-0x428 taken
-0x444 not_taken
-0x444 taken
-0x468 not_taken
-0x468 taken
-0x470 not_taken
-0x470 taken
+0x36c not_taken
+0x36c taken
+0x3a4 not_taken
+0x3a4 taken
+0x3c8 not_taken
+0x3c8 taken
+0x3d8 not_taken
+0x3d8 taken
+0x3e4 not_taken
+0x3e4 taken
+0x408 not_taken
+0x408 taken
+0x418 not_taken
+0x418 taken
+0x424 not_taken
+0x424 taken
+0x440 not_taken
+0x440 taken
+0x45c not_taken
+0x45c taken
+0x480 not_taken
+0x480 taken
+0x488 not_taken
+0x488 taken
 0x48 taken
-0x494 not_taken
-0x494 taken
-0x4a0 not_taken
-0x4a0 taken
-0x4a4 not_taken
-0x4a4 taken
-0x4c8 not_taken
-0x4c8 taken
-0x4e4 not_taken
-0x4e4 taken
-0x500 not_taken
-0x500 taken
-0x51c not_taken
-0x51c taken
-0x528 not_taken
-0x528 taken
+0x4ac not_taken
+0x4ac taken
+0x4b8 not_taken
+0x4b8 taken
+0x4bc not_taken
+0x4bc taken
+0x4e0 not_taken
+0x4e0 taken
+0x4fc not_taken
+0x4fc taken
+0x518 not_taken
+0x518 taken
 0x534 not_taken
 0x534 taken
-0x544 not_taken
-0x544 taken
-0x56c not_taken
-0x56c taken
-0x578 not_taken
-0x578 taken
-0x580 not_taken
-0x580 taken
-0x70 taken
-0xc4 not_taken
-0xc4 taken
-0xfc not_taken
-0xfc taken
+0x540 not_taken
+0x540 taken
+0x54c not_taken
+0x54c taken
+0x55c not_taken
+0x55c taken
+0x584 not_taken
+0x584 taken
+0x590 not_taken
+0x590 taken
+0x598 not_taken
+0x598 taken
+0x80 taken
+0x8c taken
+0xdc not_taken
+0xdc taken
