@@ -113,6 +113,15 @@ ASSERT(_start < 0x100000000, "PVH entry point must fit in 32 bits")
    misaligned PML4 base faults at the long-mode jump. Image growth
    could push the reservation past __ram_top with no diagnostic. Cheap
    link-time check for both. The 0x4000 term reflects D063's PD growth
-   from 4 KiB to 16 KiB. */
+   from 4 KiB to 16 KiB.
+
+   The "contiguous 24 KiB" ASSERTs pin the layout that mode_switch.S's
+   single rep-stosd zero-pass depends on (it zeroes 24 KiB starting
+   at __boot_pml4 in one shot). A future layout change that gaps the
+   regions or reorders them would silently leak non-zero memory into
+   live page tables. */
 ASSERT((__boot_pml4 & 0xFFF) == 0, "boot PML4 must be 4 KiB aligned")
 ASSERT(__boot_pd + 0x4000 <= __ram_top, "boot page tables overflow guest RAM")
+ASSERT(__boot_pdpt - __boot_pml4 == 0x1000, "boot PDPT must be contiguous with PML4")
+ASSERT(__boot_pd - __boot_pdpt == 0x1000, "boot PD must be contiguous with PDPT")
+ASSERT(__heap_start - __boot_pd >= 0x4000, "heap must clear the 16 KiB PD reservation")

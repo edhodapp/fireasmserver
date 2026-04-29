@@ -70,6 +70,11 @@ SECTIONS
 /* D062/D063 stage-1 boot page tables must be 4 KiB aligned (CR3
    hardware requirement) and must fit within guest RAM. See
    firecracker/linker.ld for the full annotation. The 0x4000 term
-   reflects D063's PD growth from 4 KiB to 16 KiB. */
+   reflects D063's PD growth from 4 KiB to 16 KiB. The contiguous-
+   layout ASSERTs pin the shape mode_switch.S's wholesale zero-pass
+   depends on. */
 ASSERT((__boot_pml4 & 0xFFF) == 0, "boot PML4 must be 4 KiB aligned")
 ASSERT(__boot_pd + 0x4000 <= __ram_top, "boot page tables overflow guest RAM")
+ASSERT(__boot_pdpt - __boot_pml4 == 0x1000, "boot PDPT must be contiguous with PML4")
+ASSERT(__boot_pd - __boot_pdpt == 0x1000, "boot PD must be contiguous with PDPT")
+ASSERT(__heap_start - __boot_pd >= 0x4000, "heap must clear the 16 KiB PD reservation")
