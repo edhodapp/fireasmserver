@@ -3420,6 +3420,94 @@ surfaced (1a 1 GiB pages, 1b 2 MiB pages low 4 GiB); 1b chosen
 for shape continuity and CPUID-dependency avoidance.
 
 
+## 2026-04-30
+
+### D064: EFER.NXE enabled at stage 1 alongside EFER.LME
+
+**Context.** D062 + D063 specify the stage-1 mode-switch sequence
+in `arch/x86_64/memory/mode_switch.S`: zero page tables, populate
+identity map (low 4 GiB, 2 MiB pages), `lgdt`, `CR4.PAE`, `CR3`,
+`EFER.LME`, `CR0.PE | CR0.PG`, far jump, reload data segs, set
+RSP, jmp kernel_main_64. Subagent review of mode_switch.S (commit
+`1594b19`, 2026-04-29) flagged that EFER.NXE was not enabled
+alongside EFER.LME in step 6. D062 and D063 are silent on NXE —
+neither says it should be on, neither says it should be off.
+
+**The forward-looking footgun.** With NXE = 0, bit 63 of every
+page-table entry is reserved-must-be-zero. Any future PTE that
+sets bit 63 (NX — execute disable) faults with #GP because the
+CPU treats bit 63 as an architectural reserved bit when NXE = 0.
+Stage-2 paging policy work (per-task page tables, executable vs
+data permission split, anything that would naturally use NX) MUST
+remember to set NXE first; if forgotten, the failure is a silent
+#GP at first boot of code that does. That's exactly the
+"untested-error-path-runs-first-when-something-is-actually-wrong"
+shape the project's discipline avoids.
+
+**Decision (2026-04-30):** Stage-1 mode-switch enables EFER.NXE
+alongside EFER.LME in step 6. Cost is one extra `or eax, ...` bit
+(or 4 extra bytes if NASM emits the wider immediate). The change
+does NOT cause any PTE to set NX — D063's stage-1 identity-map
+PD entries remain `(addr | PRESENT | WRITABLE | PAGE_SIZE)`,
+exactly as before. Setting NXE merely makes bit 63 a valid
+permission control instead of a reserved bit. Stage-2 paging
+policy work can use NX freely without first having to remember
+to enable NXE.
+
+**Why now and not when stage-2 lands.** Three reasons:
+1. **Eliminates a class of "did you remember to set NXE first?"
+   bugs by construction.** Stage-2 work is design-heavy enough
+   without dragging in a one-bit footgun that's silent on
+   first failure.
+2. **Stage-1 *is* the canonical-CPU-state phase.** boot.S's job
+   is to take loader-handed state to canonical kernel state.
+   On modern x86_64 with paging on, NXE-enabled is the more
+   canonical state. Off is the legacy 32-bit-PAE-with-no-NX
+   state.
+3. **Cost is zero today.** Setting NXE doesn't change behavior
+   while no PTE has bit 63 set. The decision is effectively
+   "make a feature available" not "use a feature." The opposite
+   default would force an eventual code change at a less-
+   convenient moment.
+
+**Why this isn't future-proofing.** The "don't future-proof,
+don't future-kill" feedback rule applies to *building* for
+hypothetical future requirements. NXE-on isn't building anything
+— it's making a CPU bit available. The choice is symmetric to
+enabling CR4.PAE in step 4 (we don't use 64-bit virtual addresses
+at stage 1 either, but we need PAE on to enable long mode at all).
+NXE is the same flavor of "stage-1 sets the canonical CPU envelope
+the kernel runs in," not "stage-1 implements a feature kernel-
+proper might use later."
+
+**What this does NOT change.**
+- Stage-1 identity-map shape unchanged (D063 carries forward
+  verbatim).
+- No PTE in stage-1 sets bit 63.
+- D062's "stage-1 only — does not bind kernel virtual-memory
+  policy" framing carries forward unchanged. Stage-2 policy
+  remains free to use NX or not, set per-page permissions or
+  not.
+- No supersession of D062 or D063. D064 amends step 6's MSR
+  write within the existing mode-switch sequence; the rest is
+  untouched.
+
+**Implementation:** in `arch/x86_64/memory/mode_switch.S` step 6,
+the existing `or eax, EFER_LME` becomes `or eax, EFER_LME |
+EFER_NXE`. The new constant `EFER_NXE equ 1 << 11` lands in the
+file's MSR-bits block.
+
+**Cross-refs:**
+
+- `D062` — boot.S as the home of x86_64 mode switch. Unchanged.
+- `D063` — low-4-GiB stage-1 coverage. Unchanged.
+- `D060` — layered tuning model. Stage-2 paging policy lives
+  here; D064 enables NXE so that stage-2 work can use NX
+  permissions naturally without first re-amending step 6.
+- Subagent review of `1594b19` (2026-04-29) — surfaced this as
+  a MEDIUM finding; deferred to a D-class call (this entry).
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
