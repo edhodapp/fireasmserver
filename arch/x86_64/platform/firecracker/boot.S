@@ -464,7 +464,22 @@ kernel_main_64:
     lfence
     test eax, eax
     jz .queue_fail_rx
-    mov ebx, eax                    ; save RX max across next probe
+    mov ebx, eax                    ; save RX max (raw) for diag emit
+
+    ; Pin clamped RX queue size in r13 for the populate loop and for
+    ; the AvailRing.idx publish. The program_queue macro clamps the
+    ; QueueNum the device sees to MIN(QueueNumMax, VIRTQ_MAX_SIZE);
+    ; the driver-side population MUST match or it would write past
+    ; the avail-ring end. Without this, a device reporting
+    ; QueueNumMax < 256 would corrupt memory at populate. Firecracker
+    ; reports 256 today (seen in the trace as QUEUES:RX=00000100), so
+    ; the clamp is a no-op in production — the protection is for any
+    ; future VMM with smaller queues.
+    cmp eax, VIRTQ_MAX_SIZE
+    jbe .Lrx_max_clamped
+    mov eax, VIRTQ_MAX_SIZE
+.Lrx_max_clamped:
+    mov r13d, eax                   ; r13 = clamped RX queue size = N
 
     ; Read QueueNumMax for queue 1 (TX).
     mfence
@@ -554,14 +569,26 @@ kernel_main_64:
     mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rdi*2], di
 
     inc edi
-    cmp edi, VIRTQ_MAX_SIZE
+    cmp edi, r13d
     jl  .rx_fill_loop
 
     ; Drain descriptor/ring stores before idx bump.
     mfence
 
-    ; Publish AvailRing.idx = 256.
-    mov word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], VIRTQ_MAX_SIZE
+    ; Publish AvailRing.idx = N (clamped queue size). Today N = 256
+    ; (Firecracker), so the wire form is identical to the prior
+    ; hardcoded VIRTQ_MAX_SIZE. The r13 plumbing protects against a
+    ; future VMM with a smaller power-of-2 queue size.
+    mov word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], r13w
+
+    ; Pin driver-private next-avail shadow in r14. After RX populate
+    ; idx == N, so next_avail = N. The shadow replaces the prior
+    ; pattern of re-reading AvailRing.idx from shared memory in the
+    ; return path — the field is driver-owned (Virtio §2.7.13), but
+    ; trusting device-readable shared memory for our own state is
+    ; the kind of pattern that turns into a security incident the
+    ; first time a malicious or buggy VMM tampers with it.
+    mov r14d, r13d
 
     ; Drain idx bump before kick.
     mfence
@@ -662,25 +689,24 @@ kernel_main_64:
     mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]
     lfence
 
-    ; Current AvailRing.idx (u16). The shared-ring re-read pattern
-    ; works here because we're the sole writer (§2.7.13) and this
-    ; one-shot MVP returns one descriptor only. A multi-frame loop
-    ; MUST replace this with a driver-private shadow (task #17).
-    movzx eax, word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2]
-
-    ; Slot index = idx mod 256 = idx & 0xFF.
-    mov ebx, eax
-    and ebx, VIRTQ_MAX_SIZE - 1
+    ; Use the driver-private next-avail shadow (r14, initialized to
+    ; N after RX populate). Computes slot = next_avail mod N where
+    ; mask = N - 1 (valid because Virtio §4.1.4.3 mandates queue
+    ; size be a power of 2). Replaces the prior pattern of re-
+    ; reading AvailRing.idx from shared memory.
+    mov eax, r14d                   ; eax = next_avail
+    lea ebx, [r13d - 1]              ; ebx = mask = N - 1
+    and eax, ebx                    ; eax = next_avail mod N
 
     ; ring[slot] = id.
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rbx*2], di
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rax*2], di
 
     ; Barrier before idx bump.
     mfence
 
-    ; idx += 1.
-    inc eax
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], ax
+    ; Advance shadow + publish.
+    inc r14d
+    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], r14w
 
     ; Barrier before notify.
     mfence
