@@ -29,7 +29,7 @@
 ;   3.  lgdt the boot-time GDT.
 ;   4.  CR4.PAE := 1.
 ;   5.  CR3 := __boot_pml4.
-;   6.  EFER.LME := 1 (wrmsr to MSR 0xC0000080).
+;   6.  EFER.LME | EFER.NXE := 1 (wrmsr to MSR 0xC0000080; NXE per D064).
 ;   7.  CR0.PE | CR0.PG := 1.
 ;   8.  Far jump CS:label_64 to land in [bits 64].
 ;   9.  Reload DS/ES/SS/FS/GS to null selectors.
@@ -67,6 +67,7 @@ CR0_PE        equ 1 << 0
 CR0_PG        equ 1 << 31
 EFER_MSR      equ 0xC0000080
 EFER_LME      equ 1 << 8
+EFER_NXE      equ 1 << 11   ; NX-bit enable (D064)
 
 ; --- GDT segment selectors ---
 ;   index << 3 | TI=0 (GDT) | RPL=0 (kernel)
@@ -153,12 +154,20 @@ mode_switch_to_long_mode:
     mov eax, __boot_pml4
     mov cr3, eax
 
-    ; ----- Step 6: EFER.LME := 1 -----
+    ; ----- Step 6: EFER.LME | EFER.NXE := 1 -----
     ; wrmsr expects ECX = MSR index, EDX:EAX = value. rdmsr first to
-    ; preserve any other EFER bits the loader may have set (NXE, etc.).
+    ; preserve any other EFER bits the loader may have set.
+    ;
+    ; NXE (bit 11) is set per D064: with NXE=0, bit 63 of every PTE
+    ; is reserved-must-be-zero, and any future PTE that sets it
+    ; (stage-2 paging policy with executable/data permission split)
+    ; would silent-#GP. Setting NXE here is a one-bit footgun
+    ; eliminator — D063 stage-1 PD entries don't set bit 63, so the
+    ; behavior of the stage-1 boot is unchanged. See D064 for the
+    ; full rationale.
     mov ecx, EFER_MSR
     rdmsr
-    or  eax, EFER_LME
+    or  eax, EFER_LME | EFER_NXE
     wrmsr
 
     ; ----- Step 7: CR0.PE | CR0.PG := 1 -----
