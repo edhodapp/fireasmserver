@@ -87,6 +87,18 @@ SECTIONS
     __bootstrap_stack_top  = ALIGN(_image_end + (0x80000000 + 0x80000) + 0x10000, 16);
 
     /*
+     * Advance . (file-offset domain) past the bootstrap-stack
+     * reservation so any future input section the linker places
+     * here can't accidentally land inside the stack body. Without
+     * this, GNU ld's symbol assignments don't move ., and a future
+     * .bss / .data input section could collide with the stack.
+     * Subtracting (RAM_BASE + text_offset) converts the runtime-
+     * address __bootstrap_stack_top back into the file-offset
+     * domain that . tracks under this script's . = 0x0 convention.
+     */
+    . = __bootstrap_stack_top - (0x80000000 + 0x80000);
+
+    /*
      * Layout contract symbols for the init-time bump allocator
      * (D059 + D060). __heap_start is the first 4-KiB-aligned byte
      * past the bootstrap stack; __ram_top is the inclusive-exclusive
@@ -105,3 +117,10 @@ SECTIONS
         *(.ARM.attributes)
     }
 }
+
+/* Invariant ASSERTs. Cheap link-time checks for layout violations
+   that would otherwise manifest as silent runtime corruption. */
+ASSERT(__heap_start <= __ram_top,
+       "heap_start past __ram_top — image too large or __ram_top set too low")
+ASSERT(__bootstrap_stack_top - __bootstrap_stack_size >= _image_end + (0x80000000 + 0x80000),
+       "bootstrap stack body collides with the loaded image — _image_end grew past the slack budget")

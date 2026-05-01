@@ -52,6 +52,13 @@ SECTIONS
     __bootstrap_stack_top  = ALIGN(_image_end + (0x40000000 + 0x80000) + 0x10000, 16);
 
     /*
+     * Advance . past the bootstrap-stack reservation so a future
+     * input section can't accidentally land inside the stack body.
+     * See the firecracker linker.ld for the full annotation.
+     */
+    . = __bootstrap_stack_top - (0x40000000 + 0x80000);
+
+    /*
      * Layout contract symbols. QEMU -M virt places the image at
      * RAM_BASE (0x40000000) + text_offset (0x80000); guest RAM is
      * configurable but defaults to 128 MiB, so the inclusive-
@@ -66,3 +73,9 @@ SECTIONS
         *(.ARM.attributes)
     }
 }
+
+/* Invariant ASSERTs. See firecracker/linker.ld for the rationale. */
+ASSERT(__heap_start <= __ram_top,
+       "heap_start past __ram_top — image too large or __ram_top set too low")
+ASSERT(__bootstrap_stack_top - __bootstrap_stack_size >= _image_end + (0x40000000 + 0x80000),
+       "bootstrap stack body collides with the loaded image — _image_end grew past the slack budget")

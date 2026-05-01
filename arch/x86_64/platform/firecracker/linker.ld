@@ -90,6 +90,17 @@ SECTIONS
     __boot_pd   = __boot_pdpt + 0x1000;
 
     /*
+     * Advance . past the bootstrap-stack + page-table reservations
+     * so a future input section can't accidentally land inside any
+     * of them. GNU ld symbol assignments don't advance the location
+     * counter on their own; without this, the reservations are
+     * "implicit" and depend on no other section claiming the same
+     * range. With this, the linker sees the reserved range as
+     * occupied and refuses to place anything there.
+     */
+    . = __boot_pd + 0x4000;
+
+    /*
      * Layout contract symbols. Firecracker's x86_64 default guest
      * RAM goes up to ~0xc0000000 (3 GiB) before the MMIO gap;
      * conservative bound for the bump allocator's reverse-from-
@@ -97,7 +108,7 @@ SECTIONS
      * Firecracker's default --vcpu-count and --mem-size envelope
      * and free of the MMIO regions Firecracker maps above 3 GiB.
      */
-    __heap_start = ALIGN(__boot_pd + 0x4000, 0x1000);
+    __heap_start = ALIGN(., 0x1000);
     __ram_top    = 0x40000000;
 }
 
@@ -125,3 +136,7 @@ ASSERT(__boot_pd + 0x4000 <= __ram_top, "boot page tables overflow guest RAM")
 ASSERT(__boot_pdpt - __boot_pml4 == 0x1000, "boot PDPT must be contiguous with PML4")
 ASSERT(__boot_pd - __boot_pdpt == 0x1000, "boot PD must be contiguous with PDPT")
 ASSERT(__heap_start - __boot_pd >= 0x4000, "heap must clear the 16 KiB PD reservation")
+ASSERT(__bootstrap_stack_top - __bootstrap_stack_size >= _image_end,
+       "bootstrap stack body collides with the loaded image — _image_end grew past the slack budget")
+ASSERT(__heap_start <= __ram_top,
+       "heap_start past __ram_top — image too large or __ram_top set too low")

@@ -60,10 +60,17 @@ SECTIONS
     __boot_pdpt = __boot_pml4 + 0x1000;
     __boot_pd   = __boot_pdpt + 0x1000;
 
+    /*
+     * Advance . past the bootstrap-stack + page-table reservations
+     * so a future input section can't accidentally land inside any
+     * of them. See firecracker/linker.ld for the full annotation.
+     */
+    . = __boot_pd + 0x4000;
+
     /* Layout contract symbols. QEMU -machine pc default RAM is
      * 128 MiB; conservative bound for stack reverse-bump is the
      * 128 MiB ceiling (0x8000000). */
-    __heap_start = ALIGN(__boot_pd + 0x4000, 0x1000);
+    __heap_start = ALIGN(., 0x1000);
     __ram_top    = 0x8000000;
 }
 
@@ -78,3 +85,7 @@ ASSERT(__boot_pd + 0x4000 <= __ram_top, "boot page tables overflow guest RAM")
 ASSERT(__boot_pdpt - __boot_pml4 == 0x1000, "boot PDPT must be contiguous with PML4")
 ASSERT(__boot_pd - __boot_pdpt == 0x1000, "boot PD must be contiguous with PDPT")
 ASSERT(__heap_start - __boot_pd >= 0x4000, "heap must clear the 16 KiB PD reservation")
+ASSERT(__bootstrap_stack_top - __bootstrap_stack_size >= _image_end,
+       "bootstrap stack body collides with the loaded image — _image_end grew past the slack budget")
+ASSERT(__heap_start <= __ram_top,
+       "heap_start past __ram_top — image too large or __ram_top set too low")
