@@ -3508,6 +3508,404 @@ file's MSR-bits block.
   a MEDIUM finding; deferred to a D-class call (this entry).
 
 
+## 2026-05-01
+
+### D065: `.memreq` macro shape, Python codegen, hot/cold tier system
+
+**Context.** D059 established init-time static memory layout —
+modules declare regions via `.memreq` records; init-code assigns
+addresses; the layout is then frozen. D060 layered the tuning
+model on top: ISA invariants (layer 0), runtime CPU intrinsics
+(layer 1), build-time deployment-tuning parameters (layer 2),
+and init-time-evaluated bytecode expressions (layer 3) that bind
+size/alignment of each region against L1 + L2 inputs.
+
+D060's bytecode VM (`arch/<isa>/memory/bytecode_vm.S` per arch)
+is already implemented and exhaustively tested via the
+differential harness in `tooling/memlayout_diffharness/` — 62
+pytest cases, 100% statement + branch coverage. The init-time
+allocator (`arch/<isa>/memory/{allocator,init_memory_layout}.S`)
+iterates `.memreq` records, evaluates bytecode, and bump-
+assigns addresses. Today the `.memreq` section is empty; the
+allocator iterates a zero-length range and returns immediately
+— D060 step 4.2's wire-up landed in commit `ffeeb25` /
+`176a634` (per-arch boot.S → `init_memory_layout`).
+
+D065 specifies the shape of `.memreq` declarations:
+
+- The macro surface (what programmers write).
+- The record format on disk (what the allocator reads).
+- The codegen path (how declarations become records and
+  function prologues).
+- The register-pinning convention for cache-sensitive accesses.
+- The non-migration set (what stays as linker reservations or
+  hardware-constant `.equ`).
+- The first-migration rollout sequence.
+
+Six design questions (Q-A through Q-F) were resolved through
+discussion 2026-04-30 → 2026-05-01.
+
+---
+
+**Q-A — macro signature: independent tier × lifetime
+dimensions.**
+
+```
+.memreq <name>, <tier>, <lifetime>, <size_expr>, <align_expr>
+```
+
+`<tier>` ∈ `hot | cold | init`. `<lifetime>` ∈ `runtime | stack`
+(per D060 layer 3's two-bucket allocator). `<size_expr>` and
+`<align_expr>` are D060 bytecode expressions (LIT, MUL, DIV_LIT,
+CPU(<id>), TUNING(<id>), HALT-terminated).
+
+Tier and lifetime are KEPT INDEPENDENT — they answer different
+questions at different times. *Lifetime* is read at allocator
+time; the bump allocator uses it to choose forward-bump (heap)
+vs reverse-bump (stack) per D059. *Tier* is read at function-
+prologue / call-site time; the codegen uses it to decide
+register pinning vs lookup-on-demand. Folding them into one
+tag (Q-A option b) was rejected — cartesian-product tags grow
+manually as either axis extends. Decoupling per-callsite (Q-A
+option c) was rejected — auditability suffers when tier
+information lives distributed across call sites instead of in
+the central declaration table.
+
+---
+
+**Q-B — register convention: per-arch hot-tier budget, strict
+declaration-order assignment.**
+
+Hot-tier regions are pinned in callee-saved registers at
+function entry so per-access cost is zero in hot loops (matches
+the existing manual r12 = VIRTIO_MMIO_BASE pattern). Per-arch
+budgets:
+
+- **x86_64**: hot-tier slot pool = `r15` (1 slot). The other
+  callee-saved GPRs (rbx, rbp, r12-r14) are RESERVED for
+  manual purposes outside the memreq convention. Specifically
+  in `kernel_main_64`: r12 = VIRTIO_MMIO_BASE, r13 = clamped
+  RX queue size N, r14 = AvailRing.idx shadow. These are
+  scalars / runtime-computed values, not regions; not folded
+  into the memreq convention.
+
+- **aarch64**: hot-tier slot pool = `x19-x25` (7 slots).
+  `x26-x28` reserved for future memreq or non-memreq scratch.
+
+Assignment is strict declaration-order: the first hot region
+declared takes the first slot in its arch's pool, the second
+takes the second, etc. The Python codegen tool (Q-D) computes
+this at build time and emits the corresponding `mov` /
+`ldr` instructions in the function prologue.
+
+Compile-time error if declared hot count exceeds the budget.
+Forces the architect to make a deliberate decision (rework
+existing pins, demote to cold, or extend the convention) rather
+than silently reuse a register.
+
+---
+
+**Q-C — record format: 48 bytes per record, contiguous in the
+`.memreq` section, in-place mutation by allocator.**
+
+```
+struct memreq_record {
+    uint64_t name;            // 8 — pointer to .rodata string
+    uint64_t assigned_addr;   // 8 — written by allocator
+    uint32_t assigned_size;   // 4 — written by allocator
+    uint8_t  tier;            // 1 — hot/cold/init enum
+    uint8_t  lifetime;        // 1 — runtime/stack enum
+    uint8_t  reserved[2];     // 2 — padding to 8-byte boundary
+    uint8_t  size_bytecode[16];  // 16 — D060 bytecode, HALT-terminated
+    uint8_t  align_bytecode[8];  // 8 — D060 bytecode, HALT-terminated
+};
+```
+
+Layout decisions:
+
+- `assigned_addr` at fixed offset 8 — callers consume it via
+  `mov rax, [rel <name>_record + 8]` (or arch equivalent).
+  Stable, cacheable.
+- Bytecode at the end as a variable-content trailer that
+  doesn't perturb the fixed-field offsets above.
+- `tier` IS in the record (1 byte) for grep-friendly audit and
+  diagnostic dumps, even though the runtime allocator doesn't
+  consume it.
+- HALT-terminated bytecode (not length-prefixed) — matches
+  D060's bytecode VM design which already stops on HALT.
+- 16/8 asymmetric bytecode budget per D060 — sizes can be
+  complex (`MUL(LIT(N), CPU(line))`), alignments are typically
+  simple (`LIT(0x1000)`).
+- No version byte — if format ever changes, all records re-
+  emit. Versioning lands only when triggered (deferred per
+  task #33).
+
+Linker section flags: `.memreq` must resolve to alloc + write
+(allocator mutates `assigned_addr`). Verified at first build.
+
+---
+
+**Q-D revised — Python codegen on the kernel build path.**
+
+The macro/registry-via-preprocessor path (Q-D option d3) was
+initially chosen, then revised. The decisive consideration:
+implementing the registry + per-arch prologue generation in
+NASM macro magic and GNU as `.altmacro` / `.irp` plumbing was
+non-trivial (~30-50 lines of preprocessor code per arch),
+hard to audit, and brittle to debug. A Python tool can do
+the same job with real testability and validation.
+
+Source-of-truth: per-(arch, platform) YAML files at
+`arch/<isa>/platform/<vmm>/regions.yaml`.
+
+Build pipeline:
+
+```
+arch/<isa>/platform/<vmm>/regions.yaml
+       ↓ (Makefile prerequisite)
+tooling/memreq_codegen/  (Python, project quality bar)
+       ↓
+arch/<isa>/build/<vmm>/memreq_records.inc       (db <bytes>)
+arch/<isa>/build/<vmm>/memreq_pin_hot.inc       (mov / ldr)
+       ↓ (boot.S %includes both at correct points)
+guest.elf
+```
+
+Boot.S `%include`s the generated `memreq_records.inc` inside
+the `.memreq` section and the `memreq_pin_hot.inc` at the top
+of `kernel_main_64` (or equivalent function-entry).
+
+Python validations at codegen time:
+
+- Bytecode opcode legality (matches the live bytecode VM's
+  opcode table).
+- Per-arch hot-tier budget (Q-B) — compile-time error on
+  exceedance.
+- Region name uniqueness within a platform.
+- Lifetime / tier enum membership.
+- Cross-platform consistency for shared regions (when Q-F's
+  Y1 structure expands to Y2 — deferred per task #32).
+
+Why Python on the build path (not committed `.inc` files):
+
+1. Always-fresh codegen eliminates the "did you forget to
+   regenerate?" failure mode that committed-output schemes
+   suffer.
+2. Python 3.11 is universally available among the project's
+   actual users. No identity / distribution tax.
+3. AGPL distribution requires only OUR Python source (the
+   `tooling/memreq_codegen/` package) — not the Python
+   interpreter, which is a System Library per AGPL §0.
+   No compliance complication.
+4. The kernel itself remains 100% assembly. The build TOOL
+   chain has a code generator; the artifact does not. Same
+   pattern as compilers written in higher-level languages
+   producing assembly output.
+
+The Python tool meets the project quality bar (per
+`feedback_tooling_quality_equals_product_quality`): flake8,
+pylint --rcfile=~/.claude/pylintrc, mypy --strict, pytest
+--cov-branch.
+
+---
+
+**Q-E — non-migration set: what NEVER becomes a `.memreq`
+record.**
+
+Two categories:
+
+1. **Pre-allocator necessities** (linker-script reservations
+   forever):
+   - Bootstrap stack (`__bootstrap_stack_top`): boot.S sets
+     SP from this BEFORE calling `init_memory_layout`. The
+     allocator runs ON this stack. Pure chicken-and-egg.
+   - x86_64 boot page tables (`__boot_pml4`, `__boot_pdpt`,
+     `__boot_pd`): mode-switch consumes them before the
+     allocator runs. Same chicken-and-egg.
+
+   These STAY as linker-script reservations indefinitely.
+   The handoff envisions per-core kernel stacks (allocator-
+   placed at boot, before secondary cores wake) and a stage-2
+   kernel page-table set (post-allocator paging policy) —
+   those CAN migrate, but they're DIFFERENT regions from the
+   bootstrap stack and boot tables.
+
+2. **Hardware constants** (stay as `.equ` in platform-specific
+   `.S` files):
+   - VIRTIO_MMIO_BASE (per-VMM device-imposed address, not
+     memory we own).
+   - COM1_PORT, UART_LSR_THRE, virtio register offsets, etc.
+
+   These aren't regions; they're addresses imposed by the
+   device or VMM. `.equ` is the right encoding — the macro
+   surface for `.memreq` is for ALLOCATOR-MANAGED memory,
+   not device-imposed addresses.
+
+D065 explicitly documents this as a non-goal so future readers
+don't try to migrate them (subject to future supersession via
+a new D-class entry if circumstances change).
+
+---
+
+**Q-F — first-migration rollout: three sub-steps with
+progressive validation.**
+
+Each sub-step lands as its own commit, with isolated failure
+mode if something goes wrong:
+
+- **Step 5a** (task #25): Python `memreq_codegen` tool +
+  Makefile wiring + ONE trivial test region (no consumer).
+  Validates the build pipeline plumbing without any kernel-
+  behavior coupling. Trivial region is iterated by the
+  allocator (now non-empty for the first time on a real
+  cell), placed at some `__heap_start` address, never
+  consumed by boot.S — pure smoke test.
+
+- **Step 5b** (task #26): First REAL region — `RX_BUFFER_BASE`
+  on firecracker x86_64, migrated as cold-tier. Two consumer
+  sites (RX populate loop, RX completion path) use the cold-
+  tier lookup pattern. Validates allocator address-assignment
+  + cold-tier lookup mechanism + Python's record-emission
+  bytecode.
+
+- **Step 5c** (task #27): First HOT-TIER region —
+  `VIRTQ_BASE` on firecracker x86_64. r15 pinned at
+  kernel_main_64 entry by the Python-emitted prologue.
+  Validates pin-load mechanism + Q-B α register convention
+  + r15 surviving across emit_bytes / emit_hex32 /
+  program_queue calls. RX_QUEUE_BASE / TX_QUEUE_BASE stay
+  as derived offsets `[r15 + 0]` / `[r15 + VIRTQ_STRIDE]`
+  rather than separate hot regions (no register budget for
+  more on x86_64; offset arithmetic is fine for derived
+  addresses).
+
+Tracer-bullet on x86_64/firecracker must observe all 12
+markers (READY → LAYOUT-OK → VIRTIO:OK → STATUS:DRIVER →
+FEATURES:OK → QUEUES:RX/TX → QUEUES:READY → DRIVER_OK →
+RX:POPULATED → RX:FRAME → RX:RETURNED → TX:SUBMITTED →
+TX:RECLAIMED) at each step.
+
+Bytecode encoding: literal-only (LIT) for both 5b and 5c.
+Non-literal demonstrations (CPU / TUNING references) deferred
+per task #28 — the bytecode VM's CPU/TUNING paths are already
+exhaustively tested via the diff harness; mixing them into
+the first-migration commits adds risk without design-validation
+gain.
+
+aarch64/firecracker replication deferred per task #29 — once
+x86_64 settles, port the same two regions using AAPCS64
+register conventions (Q-B α: x19 for first hot slot).
+
+QEMU cells (x86_64/qemu, aarch64/qemu) get NOTHING — they
+don't have virtio init today; their `.memreq` stays empty
+until they grow virtio content.
+
+---
+
+**Cache-performance rationale for the tier system.**
+
+The tier system exists specifically because of the cache-
+locality cost of record indirection. Naïve migration (every
+access loads `assigned_addr` from the record) adds 1-2 cache-
+line touches per access. For boot-time setup that's fine; for
+production hot paths (10 Gbps line-rate RX/TX = ~14 Mpps =
+~14M cache touches/sec, ~5-7% of a 3 GHz core if cache-cold)
+that's a real cost.
+
+Mitigation: the `hot` tier pins the `assigned_addr` in a
+register at function entry. Hot-loop access uses the register
+directly — zero per-access cost vs the prior compile-time
+constant. The cost shifts from per-access to one-time-at-
+prologue.
+
+Records themselves are cache-friendly by construction: 48
+bytes/record, contiguous in the `.memreq` section. A few
+records fit in one cache line; the whole table fits in L1
+even with hundreds of regions.
+
+The `cold` tier accepts per-access lookup cost for sporadic
+accesses. The `init` tier is for regions accessed once at
+boot, then unused — cost is irrelevant.
+
+---
+
+**What this decision doesn't bind.**
+
+- Specific YAML schema fields beyond the agreed minimum (name,
+  tier, lifetime, size, align, doc). Schema can grow
+  additively without a new D-class entry.
+- The exact NASM `db` / GNU as `.byte` syntax the Python tool
+  emits. Implementation-level.
+- The Python tool's internal architecture (parser, validator,
+  emitter modules). Implementation-level.
+
+---
+
+**Cross-refs:**
+
+- `D059` — init-time static memory layout (modules declare,
+  init-code assigns, then freeze). D065 is the realization
+  of that pattern; before D065 the `.memreq` section was
+  empty.
+- `D060` — layered tuning model + bytecode VM. D065 specifies
+  the macro/codegen front-end that emits records consumed by
+  D060's allocator + bytecode VM.
+- `D058` — actor model (no mutable state crosses core
+  boundaries). Per-function hot-tier budgets (deferred per
+  task #31) become relevant when multi-function actors arrive
+  — each actor function gets its own hot-pin set.
+- `feedback_tooling_quality_equals_product_quality` — Python
+  tool meets the project quality bar.
+- `project_ontology_dogfooding` — `regions.yaml` is the kind
+  of artifact the ontology should track. MemoryRegion entity
+  derivation from regions.yaml deferred per task #34.
+
+---
+
+**Deferrals tracked as standalone tasks.**
+
+Each future-work item has a clear trigger condition and a
+resolution path. They're tracked in the task list rather
+than buried in this entry so they're discoverable on demand:
+
+- `#28` — Non-literal bytecode demonstration (CPU / TUNING
+  references). Trigger: first migration that needs runtime-
+  CPU-dependent or runtime-tuning-dependent values.
+- `#29` — Replicate memreq migration to aarch64/firecracker.
+  Trigger: x86_64 path stabilized through step 5c.
+- `#30` — x86_64 hot-tier budget extension. Trigger: 2nd
+  hot region needed on x86_64 (Python emits a budget-
+  exceeded error).
+- `#31` — Per-function hot-tier budgets. Trigger: multi-
+  function actors (post-D058) wanting their own hot pin sets.
+- `#32` — Y2 YAML restructure (cross-platform unified
+  declaration). Trigger: cross-platform consistency becomes
+  a maintenance burden.
+- `#33` — Record format versioning. Trigger: any concrete
+  need for format change (bytecode budget exhaustion, new
+  metadata fields, etc.).
+- `#34` — Ontology integration (MemoryRegion entity from
+  regions.yaml). Trigger: step 5c stabilizes; then the YAML
+  becomes the ontology's source-of-truth for memory regions.
+
+When any deferred item triggers, its resolution may be
+implementation-level OR may warrant a new D-class entry —
+to be decided when triggered.
+
+---
+
+**Trigger event for this decision.** 2026-04-30 → 2026-05-01
+working session. Step 4.2 closed (init_memory_layout call
+sites wired across all 4 cells; LAYOUT-OK markers asserted).
+Step 5 (.memreq migration) was the natural next initiative.
+Cache-performance concern raised by Ed during initial design
+discussion led to the tier system. Six design questions
+sequenced and resolved one at a time; tasks #18-#23 capture
+the discussion. Deferral tracking (this entry's "Deferrals"
+section) added per Ed's directive to "track all design
+decisions, especially the ones we are deferring."
+
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
