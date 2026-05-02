@@ -16,3 +16,7 @@ arch/*/build/
 # DAG signing key
 tooling/.dag-key
 *.lock
+
+# Working notes (in-progress audits, scratch analyses, drafts).
+# Survive across sessions; never committed.
+notes/
