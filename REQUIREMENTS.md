@@ -115,10 +115,18 @@ any record exceeds 3.
 
 **Implementation refs:**
 
-- `tooling/src/memlayout/types.py:Lifetime` (IntEnum, 4 values)
-- `arch/x86_64/memory/allocator.S` (`LT_*` constants and lifetime
-  range check)
-- `arch/aarch64/memory/allocator.S` (same)
+- `tooling/src/memlayout/types.py:49` — `Lifetime(IntEnum)` with
+  4 values: `STEADY_STATE=0`, `INIT_ONLY=1`,
+  `IMMUTABLE_AFTER_INIT=2`, `STACK=3`
+- `arch/x86_64/memory/allocator.S:84-87` — `LT_STEADY=0`,
+  `LT_INIT_ONLY=1`, `LT_IMMUT=2`, `LT_STACK=3`; range halt at
+  `arch/x86_64/memory/allocator.S:140-143` (`cmp eax, LT_STACK`
+  / `ja .Lalloc_bad_lifetime`); halt body at line 297 stores
+  `MEMLAYOUT_ERR_BAD_LIFETIME`=102 into `rc_out`
+- `arch/aarch64/memory/allocator.S:88-91` — same constants;
+  range halt at `arch/aarch64/memory/allocator.S:142-145`
+  (`cmp w0, #LT_STACK` / `b.hi .Lalloc_bad_lifetime`); halt
+  body at line 296 sets `MEMLAYOUT_ERR_BAD_LIFETIME`=102
 
 **Verification refs:**
 
@@ -258,12 +266,15 @@ The `.memreq` ELF section shall be 8-byte aligned.
 
 **Implementation refs:**
 
-- `arch/x86_64/memory/memreq.inc` (layout commentary at lines
-  18-32)
-- `arch/aarch64/memory/memreq.inc`
-- `arch/x86_64/memory/allocator.S` (`MR_OFF_*` and
-  `MR_RECORD_BYTES` constants)
-- `arch/aarch64/memory/allocator.S`
+- `arch/x86_64/memory/memreq.inc:15-32` — layout commentary
+  block; macro definition at line 37 (`%macro memreq 7`)
+- `arch/aarch64/memory/memreq.inc` (mirror of the x86_64
+  layout)
+- `arch/x86_64/memory/allocator.S:54-60` — `MR_OFF_NAME_HASH`,
+  `MR_OFF_SIZE_BC`, `MR_OFF_ALIGN_BC`, `MR_OFF_LIFETIME`,
+  `MR_OFF_ASSIGNED_ADDR`, `MR_OFF_ASSIGNED_SIZE`,
+  `MR_RECORD_BYTES=48`
+- `arch/aarch64/memory/allocator.S:66-72` — same constant set
 
 **Verification refs:**
 
@@ -315,8 +326,9 @@ After `init_complete`, no allocator code shall execute.
 
 **Implementation refs:**
 
-- `arch/x86_64/memory/init_memory_layout.S`
-- `arch/aarch64/memory/init_memory_layout.S`
+- `arch/x86_64/memory/init_memory_layout.S:42-43` —
+  `init_memory_layout` entry; calls `memlayout_run_allocator`
+- `arch/aarch64/memory/init_memory_layout.S:28-31` — same role
 
 **Verification refs:**
 
@@ -350,9 +362,20 @@ pass crosses the reverse pass.
 
 **Implementation refs:**
 
-- `arch/x86_64/memory/allocator.S`
-- `arch/aarch64/memory/allocator.S`
-- `tooling/src/memlayout/reference.py:_pass_forward,_pass_reverse`
+- `arch/x86_64/memory/allocator.S:95-96` —
+  `memlayout_run_allocator` entry; pass-1 forward loop at lines
+  135-195 (`.Lalloc_pass1_loop` / `.Lalloc_pass1_skip` /
+  `.Lalloc_pass2_init`); pass-2 reverse loop at lines 197-251
+  (`.Lalloc_pass2_loop` / `.Lalloc_pass2_skip` / `.Lalloc_done`);
+  forward/reverse-cross overflow halt at line 184 (`ja
+  .Lalloc_overflow`)
+- `arch/aarch64/memory/allocator.S:98` —
+  `memlayout_run_allocator` entry; pass-1 at lines 137-190; pass-2
+  at lines 192-242
+- `tooling/src/memlayout/reference.py:98` — `_pass_forward`;
+  `tooling/src/memlayout/reference.py:121` — `_pass_reverse`;
+  `tooling/src/memlayout/reference.py:149` — `allocate` entry
+  driving both passes
 
 **Verification refs:**
 
@@ -388,18 +411,29 @@ set the `init_complete` flag (phase 3).
 
 **Implementation refs:**
 
-- `arch/x86_64/memory/allocator.S` (phases 0-2 partially)
-- `tooling/src/memlayout/reference.py`
+- `arch/x86_64/memory/allocator.S:95-253` — phase-2 walk over
+  `.memreq` records (forward + reverse passes per AL-002);
+  phase 0 (CPU detection) and phase 1 (profile copy/validate)
+  are not yet implemented in this file
+- `arch/aarch64/memory/allocator.S:98-242` — same role
+- `tooling/src/memlayout/reference.py:149` — `allocate`
+  reference driving phase 2
 
 **Verification refs:**
 
-- `tooling/memlayout_diffharness/`
+- `tooling/memlayout_diffharness/` (covers phase 2)
 
 **Status:** partial (phase 2 implemented; phases 0/1 and the
 `init_complete` fence are gaps)
 
 
 ### AL-004: Allocator pre-stack discipline
+
+**DEPRECATED 2026-05-02 03:52 UTC — superseded by AL-005.** The
+implementation_refs below name the wrong registers; the same
+defect that produced BC-002. The shall-clause itself (no memory
+stack required during allocator phases) is correct and is
+restated in AL-005 with corrected refs.
 
 The allocator shall not require a memory stack during phase 0
 or phase 2. The bytecode VM (per BC-NNN) shall execute on a
@@ -416,6 +450,39 @@ size or alignment expression depends on a pre-existing stack.
 **Verification refs:**
 
 - `tooling/memlayout_diffharness/` (bytecode differential)
+
+**Status:** implemented
+
+
+### AL-005: Allocator pre-stack discipline (corrected)
+
+**Supersedes:** AL-004 (deprecated 2026-05-02 03:52 UTC). The
+shall-clause itself was correct; only the implementation_refs
+needed correction (the registers named did not match the actual
+code, propagated from the same defect in BC-002).
+
+The allocator shall not require a memory stack during phase 0
+or phase 2. The bytecode VM (per BC-005) shall execute on a
+4-deep register-only stack so that no `.memreq` region's
+size or alignment expression depends on a pre-existing stack.
+
+**Derived from:** D059, D060.
+
+**Implementation refs:**
+
+- `arch/x86_64/memory/bytecode_vm.S` (4-deep stack in
+  `r11`/`r10`/`r9`/`r15`; `bcvm_push`/`bcvm_pop` macros at
+  lines 69, 79; entry/exit at `memlayout_run_bytecode`)
+- `arch/aarch64/memory/bytecode_vm.S` (4-deep stack in
+  `x10`/`x11`/`x12`/`x13`)
+
+**Verification refs:**
+
+- `tooling/memlayout_diffharness/` (bytecode differential —
+  Python reference and per-arch interpreter agree on every
+  operation; would diverge if either side touched a memory
+  stack)
+- `tooling/tests/test_memlayout_alloc_diff.py`
 
 **Status:** implemented
 
@@ -447,10 +514,13 @@ halt the allocator with a bytecode error.
 
 **Implementation refs:**
 
-- `tooling/src/memlayout/types.py:Opcode`
-- `arch/x86_64/memory/bytecode_vm.S` (`OP_*` constants and
-  dispatch)
-- `arch/aarch64/memory/bytecode_vm.S`
+- `tooling/src/memlayout/types.py:30` — `Opcode(IntEnum)`
+  defining `END=0`, `LIT=1`, `TUNING=2`, `CPU=3`, `MUL=4`,
+  `DIV_LIT=5`, `ALIGN_UP=6`, `CALL_THUNK=7`
+- `arch/x86_64/memory/bytecode_vm.S:92-99` — `OP_*` constants;
+  dispatch at lines 148-162 (`cmp eax, OP_*` + jump table)
+- `arch/aarch64/memory/bytecode_vm.S:86-93` — same constants;
+  dispatch at lines 141-155
 
 **Verification refs:**
 
@@ -461,6 +531,15 @@ halt the allocator with a bytecode error.
 
 
 ### BC-002: Stack-machine depth and register residency
+
+**DEPRECATED 2026-05-02 03:52 UTC — superseded by BC-005.** The
+register names listed below are wrong: on x86_64 the
+implementation must keep `rax` and `rdx` out of the stack because
+the `mul` and `div` instructions clobber them implicitly via
+ISA-mandated operand placement. The pre-bugfix design that
+matched this requirement actually corrupted state on every
+multiply. The original body is preserved below; the corrected
+shall-clause is in BC-005.
 
 The bytecode VM shall execute on a 4-deep stack machine whose
 slots reside in registers, not memory.
@@ -544,6 +623,60 @@ at audit time.
 
 **Status:** partial (positional addressing is implemented;
 reordering-detection audit is a gap)
+
+
+### BC-005: Bytecode VM register stack allocation (corrected)
+
+**Supersedes:** BC-002 (deprecated 2026-05-02 03:52 UTC). The
+original named the wrong registers; the implementation actively
+avoids `rax`/`rdx` because `mul`/`div` clobber them via
+ISA-mandated operand placement, and the pre-bugfix design that
+matched BC-002 corrupted state on every multiply.
+
+The bytecode VM shall execute on a 4-deep stack machine whose
+slots reside in registers, not memory.
+
+On x86_64, the VM stack slots shall not occupy `rax` or `rdx`,
+both of which the `mul` and `div` instructions clobber
+implicitly via ISA-mandated operand placement. The current
+allocation is `r11` (top), `r10`, `r9`, `r15` (bottom).
+
+On aarch64, the VM stack slots shall not collide with `x0`,
+which carries the call-struct pointer at function entry. The
+current allocation is `x10` (top), `x11`, `x12`, `x13`
+(bottom).
+
+Internal register choice within the VM body is otherwise
+unconstrained: the kernel runs without preemptive context
+switching (D058 actor model — one actor per core, no
+scheduler), so SysV (x86_64) and AAPCS64 (aarch64)
+callee-saved register discipline applies only at the
+external function-call boundary (preserved by the
+function-prologue push and function-epilogue pop), not
+internally.
+
+**Derived from:** D058, D060.
+
+**Implementation refs:**
+
+- `arch/x86_64/memory/bytecode_vm.S` (header at lines 24-28
+  documents the register map: `r11` top, `r10`, `r9`, `r15`
+  bottom; rationale at lines 38-46 explains the `mul`/`rdx`
+  clobber that drove the choice)
+- `arch/x86_64/memory/bytecode_vm.S:69-89` (`bcvm_push` /
+  `bcvm_pop` macros operate on the named registers)
+- `arch/aarch64/memory/bytecode_vm.S` (header at lines 22-25
+  documents the register map: `x10` top through `x13` bottom)
+
+**Verification refs:**
+
+- `tooling/memlayout_diffharness/` (per-arch interpreter +
+  Python reference agree on every opcode; a wrong register
+  allocation that corrupted `rdx` mid-stack would diverge)
+- `tooling/tests/test_memlayout_bytecode.py`
+- `tooling/tests/test_memlayout_diff.py`
+
+**Status:** implemented
 
 ---
 
@@ -660,9 +793,16 @@ The page-table reservations (`__boot_pml4`, `__boot_pdpt`,
 
 **Implementation refs:**
 
-- `arch/x86_64/platform/firecracker/linker.ld`
-- `arch/x86_64/platform/qemu/linker.ld`
-- `arch/x86_64/memory/mode_switch.S`
+- `arch/x86_64/platform/firecracker/linker.ld:88-101` —
+  `__boot_pml4`, `__boot_pdpt`, `__boot_pd` reservations
+  (4 KiB + 4 KiB + 16 KiB, contiguous, 4 KiB-aligned); ASSERT
+  guards at lines 134-138 enforce alignment, contiguity, and
+  RAM-fit
+- `arch/x86_64/platform/qemu/linker.ld:59-68` — same
+  reservations; ASSERT guards at lines 83-87
+- `arch/x86_64/memory/mode_switch.S` consumes the
+  reservations (PD population fills 2048 entries × 2 MiB =
+  4 GiB)
 
 **Verification refs:**
 
@@ -698,7 +838,14 @@ sequence in order before transferring control to
 
 **Implementation refs:**
 
-- `arch/x86_64/memory/mode_switch.S`
+- `arch/x86_64/memory/mode_switch.S:81` —
+  `mode_switch_to_long_mode` entry. The 13-step sequence:
+  CR-bit constants at lines 65-70 (`CR4_PAE`, `CR0_PE`,
+  `CR0_PG`, `EFER_LME`, `EFER_NXE`); CR4.PAE set at line 150
+  (step 4 in the source, step 6 in BS-002 numbering — the
+  source orders zero-tables / PML4-link / lgdt before
+  CR4/CR3/EFER); EFER.LME|NXE set at line 170;
+  CR0.PE|CR0.PG set at line 181
 
 **Verification refs:**
 
