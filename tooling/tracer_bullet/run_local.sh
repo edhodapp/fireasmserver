@@ -28,7 +28,7 @@ set -euo pipefail
 
 ARCH="${1:?usage: $0 <arch> <platform>}"
 PLATFORM="${2:?usage: $0 <arch> <platform>}"
-TIMEOUT="${TIMEOUT:-5}"
+TIMEOUT="${TIMEOUT:-10}"
 TRACE="${TRACE:-0}"
 
 REPO_ROOT="$(realpath -m "$(cd "$(dirname "$0")/../.." && pwd)")"

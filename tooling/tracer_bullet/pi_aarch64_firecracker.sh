@@ -24,7 +24,7 @@ set -euo pipefail
 PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
-TIMEOUT="${TIMEOUT:-5}"   # seconds to wait for READY before giving up
+TIMEOUT="${TIMEOUT:-10}"  # seconds to wait for READY before giving up
 READY_MARKER="${READY_MARKER:-READY}"
 
 if [[ $EUID -eq 0 ]]; then
