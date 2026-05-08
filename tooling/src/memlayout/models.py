@@ -61,6 +61,7 @@ class TuningProfile(BaseModel):
     worker_core_count: int = Field(ge=1, le=255)
 
 
+# DISCIPLINE-PRINT-START: memreq-pydantic-model
 class MemoryRegion(BaseModel):
     """One .memreq declaration. Mirrors the on-the-wire record.
 
@@ -79,6 +80,7 @@ class MemoryRegion(BaseModel):
     owner_id: int = Field(ge=0, le=0xFFFF)
     lifetime: Lifetime
     writable: bool
+# DISCIPLINE-PRINT-END: memreq-pydantic-model
 
 
 class AssignedRegion(BaseModel):

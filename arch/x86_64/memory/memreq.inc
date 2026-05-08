@@ -16,6 +16,7 @@
 ; the Python reference at tooling/src/memlayout/reference.py
 ; once that lands in step 2):
 ;
+; DISCIPLINE-PRINT-START: memreq-record-fields
 ;   offset  size  field
 ;   0       4     name_hash    fnv1a of region name (author-supplied,
 ;                              audit-verified per D060)
@@ -30,10 +31,12 @@
 ;   40      8     assigned_size   filled in by allocator at init
 ;
 ; Total: 48 bytes, 8-byte aligned.
+; DISCIPLINE-PRINT-END: memreq-record-fields
 
 %ifndef FIREASM_MEMREQ_INC
 %define FIREASM_MEMREQ_INC
 
+; DISCIPLINE-PRINT-START: memreq-macro-shape
 %macro memreq 7
     ; args: %1=region, %2=name_hash,
     ;       %3=size_bytecode_label, %4=align_bytecode_label,
@@ -68,5 +71,6 @@ __memreq_assigned__%1:
     global  __memreq_size__%1
     __memreq_size__%1 equ __memreq_assigned__%1 + 8
 %endmacro
+; DISCIPLINE-PRINT-END: memreq-macro-shape
 
 %endif  ; FIREASM_MEMREQ_INC

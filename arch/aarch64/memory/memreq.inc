@@ -15,6 +15,7 @@
 // Record layout (matches the Python reference at
 // tooling/src/memlayout/reference.py once that lands in step 2):
 //
+// DISCIPLINE-PRINT-START: memreq-record-fields
 //   offset  size  field
 //   0       4     name_hash    fnv1a of region name (author-supplied,
 //                              audit-verified per D060)
@@ -29,9 +30,11 @@
 //   40      8     assigned_size   filled in by allocator at init
 //
 // Total: 48 bytes, 8-byte aligned.
+// DISCIPLINE-PRINT-END: memreq-record-fields
 
 .altmacro
 
+// DISCIPLINE-PRINT-START: memreq-macro-shape
 .macro memreq region, name_hash, size_bc, align_bc, owner, lifetime, writable
     .pushsection .memreq, "a", %progbits
     .balign 8
@@ -60,3 +63,4 @@ __memreq_assigned__\region:
     .global __memreq_size__\region
     .set    __memreq_size__\region, __memreq_assigned__\region + 8
 .endm
+// DISCIPLINE-PRINT-END: memreq-macro-shape
