@@ -105,6 +105,22 @@ class TestFindEntry:
     def test_find_by_prefix_no_match(self) -> None:
         assert find_by_prefix(self._entries(), "ZZ-") == []
 
+    def test_find_by_prefix_include_deprecated(self) -> None:
+        text = (
+            "### MR-001: Active\n"
+            "alpha\n"
+            "### MR-002: Old\n"
+            "**DEPRECATED 2026-04-01 — superseded.** body\n"
+            "### MR-003: Active two\n"
+            "beta\n"
+        )
+        ids = [
+            e.entry_id for e in find_by_prefix(
+                parse_entries(text), "MR-", include_deprecated=True,
+            )
+        ]
+        assert ids == ["MR-001", "MR-002", "MR-003"]
+
 
 class TestEntryRender:
     """Render an entry back to source-form markdown."""

@@ -50,11 +50,20 @@ def find_entry(entries: list[Entry], entry_id: str) -> Entry | None:
 def find_by_prefix(
     entries: list[Entry],
     prefix: str,
+    *,
+    include_deprecated: bool = False,
 ) -> list[Entry]:
-    """Return active (non-deprecated) entries whose id starts with prefix."""
+    """Return entries whose id starts with prefix.
+
+    By default, deprecated entries are filtered out. Pass
+    `include_deprecated=True` when the caller wants to render its own
+    "deprecated; skipped" annotation alongside the active entries
+    (preserving traceability with the immutable decision-log).
+    """
     return [
         e for e in entries
-        if e.entry_id.startswith(prefix) and not e.deprecated
+        if e.entry_id.startswith(prefix)
+        and (include_deprecated or not e.deprecated)
     ]
 
 

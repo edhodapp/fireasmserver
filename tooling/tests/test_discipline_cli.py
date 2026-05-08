@@ -12,6 +12,7 @@ from discipline.cli import (
     main,
     parse_args,
     render_context,
+    render_full,
 )
 from discipline.relevance import BlockSpec, Domain
 
@@ -56,8 +57,14 @@ def _repo(tmp_path: Path) -> Path:
         "preface\n"
         "### D058: Actor model\n"
         "body of D058\n"
+        "### D059: Memreq sections\n"
+        "body of D059\n"
         "### D060: Bump allocator\n"
         "body of D060\n"
+        "### D063: Stage-1 mode switch\n"
+        "body of D063\n"
+        "### D064: NXE\n"
+        "body of D064\n"
         "### D065: Old\n"
         "**DEPRECATED 2026-05-01 — superseded by D066.** rationale\n"
         "### D999: Unrelated\n"
@@ -305,8 +312,32 @@ class TestRenderContext:
         assert "name_hash" not in out
 
 
+class TestRequirementsDeprecation:
+    """Symmetry with decisions: deprecated requirements get an annotation."""
+
+    def test_deprecated_requirement_gets_annotation(
+        self, repo: Path,
+    ) -> None:
+        (repo / "REQUIREMENTS.md").write_text(
+            "### MR-001: Active\n"
+            "shall clause for MR-001\n"
+            "### MR-002: Old\n"
+            "**DEPRECATED 2026-04-01 — superseded.** rationale\n"
+            "### MR-003: New\n"
+            "shall clause for MR-003\n",
+            encoding="utf-8",
+        )
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "shall clause for MR-001" in out
+        assert "shall clause for MR-003" in out
+        assert "requirement MR-002 is deprecated; skipped" in out
+        assert "rationale" not in out
+
+
 class TestMain:
-    """Process-level entry point — exit 0, stdout content."""
+    """Process-level entry point — exit codes, stdout content."""
 
     def test_main_returns_zero(
         self, repo: Path, capsys: pytest.CaptureFixture[str],
@@ -326,6 +357,120 @@ class TestMain:
         assert rc == 0
         captured = capsys.readouterr()
         assert "no canonical context" in captured.out
+
+
+class TestStrictMode:
+    """--strict makes inline error notes fail the run."""
+
+    def test_strict_zero_when_clean(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+            "--strict",
+        ])
+        assert rc == 0
+        capsys.readouterr()
+
+    def test_strict_zero_when_only_deprecated_skipped(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+            "--strict",
+        ])
+        assert rc == 0
+        capsys.readouterr()
+
+    def test_strict_nonzero_on_missing_decisions_file(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (repo / "DECISIONS.md").unlink()
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+            "--strict",
+        ])
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "file not found: DECISIONS.md" in captured.out
+
+    def test_strict_nonzero_on_marker_drift(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        bad = repo / "arch" / "aarch64" / "memory" / "memreq.inc"
+        bad.write_text("no markers here\n", encoding="utf-8")
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+            "--strict",
+        ])
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "marker error" in captured.out
+
+    def test_strict_nonzero_on_missing_decision_id(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        memreq_only = (
+            Domain(
+                name="memreq",
+                path_globs=("arch/*/memory/memreq.inc",),
+                decisions=("D777",),
+            ),
+        )
+        monkeypatch.setattr(
+            "discipline.cli.matching_domains",
+            lambda _: list(memreq_only),
+        )
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+            "--strict",
+        ])
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "D777 not found" in captured.out
+
+    def test_no_strict_returns_zero_even_with_errors(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (repo / "DECISIONS.md").unlink()
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "file not found: DECISIONS.md" in captured.out
+
+
+class TestRenderFull:
+    """render_full exposes errors alongside text for programmatic use."""
+
+    def test_clean_run_has_no_errors(self, repo: Path) -> None:
+        result = render_full(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert not result.errors
+        assert "memreq" in result.text
+
+    def test_marker_error_recorded(self, repo: Path) -> None:
+        bad = repo / "arch" / "aarch64" / "memory" / "memreq.inc"
+        bad.write_text("no markers here\n", encoding="utf-8")
+        result = render_full(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert any("marker error" in e for e in result.errors)
+
+    def test_deprecated_does_not_record_error(self, repo: Path) -> None:
+        result = render_full(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert all("deprecated" not in e for e in result.errors)
 
 
 class TestBlockSpecDefaults:

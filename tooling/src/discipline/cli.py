@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from discipline import decisions as dec_mod
@@ -40,6 +40,26 @@ class PrintOptions:
     show_decisions: bool
     show_requirements: bool
     cap_bytes: int
+
+
+@dataclass
+class RenderState:
+    """Mutable accumulator: inline-error sentinels emitted this pass.
+
+    Marker errors, missing files, and missing decision IDs all signal
+    canonical-context drift and land here. Deprecated entries are
+    expected and traced explicitly — they do NOT count as errors.
+    """
+
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RenderResult:
+    """Outcome of one render pass — text plus error sentinels."""
+
+    text: str
+    errors: tuple[str, ...]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -82,30 +102,51 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_CAP_BYTES,
         help=f"Per-section cap in bytes (default {DEFAULT_CAP_BYTES}).",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help=(
+            "Exit non-zero if any inline error note is emitted "
+            "(missing file, marker drift, or unknown decision ID). "
+            "Deprecated entries are not errors."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point. Always returns 0."""
+    """Entry point. Returns 0 by default; non-zero only with --strict."""
     ns = parse_args(argv)
     opts = _options_from_namespace(ns)
-    output = render_context(ns.path, opts)
-    sys.stdout.write(output)
+    result = render_full(ns.path, opts)
+    sys.stdout.write(result.text)
+    if ns.strict and result.errors:
+        return 1
     return 0
 
 
 def render_context(rel_path: str, opts: PrintOptions) -> str:
-    """Assemble the printed context for one touched path."""
+    """Assemble the printed context for one touched path (text only)."""
+    return render_full(rel_path, opts).text
+
+
+def render_full(rel_path: str, opts: PrintOptions) -> RenderResult:
+    """Assemble printed context plus the error sentinels emitted."""
     domains = matching_domains(rel_path)
     if not domains:
-        return (
-            f"# discipline-print: no canonical context for {rel_path}\n"
+        return RenderResult(
+            text=(
+                f"# discipline-print: no canonical context for "
+                f"{rel_path}\n"
+            ),
+            errors=(),
         )
+    state = RenderState()
     header = f"# discipline-print: canonical context for {rel_path}\n"
     sections: list[str] = [header]
     for domain in domains:
-        sections.append(_render_domain(domain, rel_path, opts))
-    return "\n".join(sections)
+        sections.append(_render_domain(domain, rel_path, opts, state))
+    return RenderResult(text="\n".join(sections), errors=tuple(state.errors))
 
 
 def _options_from_namespace(ns: argparse.Namespace) -> PrintOptions:
@@ -124,15 +165,16 @@ def _render_domain(
     domain: Domain,
     rel_path: str,
     opts: PrintOptions,
+    state: RenderState,
 ) -> str:
     """Render one domain's context (schemas + decisions + requirements)."""
     parts: list[str] = [f"\n## domain: {domain.name}\n"]
     if opts.show_schemas:
-        parts.append(_render_schemas(domain, rel_path, opts))
+        parts.append(_render_schemas(domain, rel_path, opts, state))
     if opts.show_decisions:
-        parts.append(_render_decisions(domain, opts))
+        parts.append(_render_decisions(domain, opts, state))
     if opts.show_requirements:
-        parts.append(_render_requirements(domain, opts))
+        parts.append(_render_requirements(domain, opts, state))
     return "".join(parts)
 
 
@@ -140,6 +182,7 @@ def _render_schemas(
     domain: Domain,
     rel_path: str,
     opts: PrintOptions,
+    state: RenderState,
 ) -> str:
     """Render every resolved schema block for the domain."""
     blocks = resolve_blocks(domain, rel_path)
@@ -147,35 +190,49 @@ def _render_schemas(
         return ""
     parts: list[str] = ["\n### schemas\n"]
     for block in blocks:
-        parts.append(_render_one_block(block, opts))
+        parts.append(_render_one_block(block, opts, state))
     return "".join(parts)
 
 
-def _render_one_block(block: ResolvedBlock, opts: PrintOptions) -> str:
+def _render_one_block(
+    block: ResolvedBlock,
+    opts: PrintOptions,
+    state: RenderState,
+) -> str:
     """Render one resolved schema block (or an inline error note)."""
     full = opts.repo_root / block.file
     header = f"\n#### {block.file} :: {block.block_name}\n"
     text = _read_text(full)
     if text is None:
+        state.errors.append(f"file not found: {block.file}")
         return header + f"(file not found: {block.file})\n"
     extracted = mk_mod.extract_block(text, block.block_name)
     if isinstance(extracted, mk_mod.MarkerError):
+        state.errors.append(
+            f"marker error in {block.file}::{block.block_name}: "
+            f"{extracted.reason}"
+        )
         return header + f"(marker error: {extracted.reason})\n"
     body = "\n".join(extracted) + "\n"
     return header + _cap_text(body, opts.cap_bytes, block.file)
 
 
-def _render_decisions(domain: Domain, opts: PrintOptions) -> str:
+def _render_decisions(
+    domain: Domain,
+    opts: PrintOptions,
+    state: RenderState,
+) -> str:
     """Render the requested decision entries from DECISIONS.md."""
     if not domain.decisions:
         return ""
     text = _read_text(opts.repo_root / _DECISIONS_FILE)
     if text is None:
+        state.errors.append(f"file not found: {_DECISIONS_FILE}")
         return f"\n### decisions\n(file not found: {_DECISIONS_FILE})\n"
     entries = dec_mod.parse_entries(text)
     parts: list[str] = ["\n### decisions\n"]
     for did in domain.decisions:
-        parts.append(_render_one_decision(entries, did, opts))
+        parts.append(_render_one_decision(entries, did, opts, state))
     return "".join(parts)
 
 
@@ -183,22 +240,31 @@ def _render_one_decision(
     entries: list[dec_mod.Entry],
     decision_id: str,
     opts: PrintOptions,
+    state: RenderState,
 ) -> str:
-    """Render one decision entry, or a not-found note."""
+    """Render one decision entry, or an inline note."""
     entry = dec_mod.find_entry(entries, decision_id)
     if entry is None:
+        state.errors.append(
+            f"decision {decision_id} not found in {_DECISIONS_FILE}"
+        )
         return f"\n(decision {decision_id} not found in DECISIONS.md)\n"
     if entry.deprecated:
         return f"\n(decision {decision_id} is deprecated; skipped)\n"
     return "\n" + _cap_text(entry.render(), opts.cap_bytes, _DECISIONS_FILE)
 
 
-def _render_requirements(domain: Domain, opts: PrintOptions) -> str:
+def _render_requirements(
+    domain: Domain,
+    opts: PrintOptions,
+    state: RenderState,
+) -> str:
     """Render every requirement matching the domain's prefix list."""
     if not domain.requirements_prefixes:
         return ""
     text = _read_text(opts.repo_root / _REQUIREMENTS_FILE)
     if text is None:
+        state.errors.append(f"file not found: {_REQUIREMENTS_FILE}")
         return (
             "\n### requirements\n"
             f"(file not found: {_REQUIREMENTS_FILE})\n"
@@ -206,16 +272,26 @@ def _render_requirements(domain: Domain, opts: PrintOptions) -> str:
     entries = dec_mod.parse_entries(text)
     parts: list[str] = ["\n### requirements\n"]
     for prefix in domain.requirements_prefixes:
-        matches = dec_mod.find_by_prefix(entries, prefix)
+        matches = dec_mod.find_by_prefix(
+            entries, prefix, include_deprecated=True,
+        )
         for entry in matches:
-            parts.append(
-                "\n" + _cap_text(
-                    entry.render(),
-                    opts.cap_bytes,
-                    _REQUIREMENTS_FILE,
-                )
-            )
+            parts.append(_render_one_requirement(entry, opts))
     return "".join(parts)
+
+
+def _render_one_requirement(
+    entry: dec_mod.Entry,
+    opts: PrintOptions,
+) -> str:
+    """Render one requirement entry; deprecated entries get an annotation."""
+    if entry.deprecated:
+        return (
+            f"\n(requirement {entry.entry_id} is deprecated; skipped)\n"
+        )
+    return "\n" + _cap_text(
+        entry.render(), opts.cap_bytes, _REQUIREMENTS_FILE,
+    )
 
 
 def _read_text(path: Path) -> str | None:
