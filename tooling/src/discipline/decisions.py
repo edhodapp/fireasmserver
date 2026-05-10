@@ -1,8 +1,14 @@
 """Parse DECISIONS.md and REQUIREMENTS.md into id-keyed entries.
 
-Both files use `### <id>:` heading conventions. An entry's body runs
-from one heading up to the next `### ` heading or end of file. An
-entry is "deprecated" when its body's first non-blank line begins
+Both files use `### <id>:` heading conventions, where `<id>` is an
+all-caps token ending in a digit (e.g. `D058`, `MR-007`, `BS-001`).
+An entry's body runs from one heading up to the next id-shaped
+heading or end of file. Non-id `### ` sub-headings inside a body
+(e.g. `### Memory model`, `### Examples:`) are intentionally NOT
+recognized as new entries — only the constrained id shape matches,
+so authors can use markdown sub-headings freely inside an entry.
+
+An entry is "deprecated" when its body's first non-blank line begins
 with `**DEPRECATED ` (the immutable bidirectional-annotation pattern
 required by the immutable decision-log convention).
 
@@ -15,7 +21,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-_HEADING = re.compile(r"^### (\S+?):")
+_HEADING = re.compile(r"^### ([A-Z][A-Z0-9-]*\d):")
 _DEPRECATED_PREFIX = "**DEPRECATED "
 
 

@@ -382,7 +382,8 @@ class TestStrictMode:
             "--strict",
         ])
         assert rc == 0
-        capsys.readouterr()
+        captured = capsys.readouterr()
+        assert "decision D065 is deprecated; skipped" in captured.out
 
     def test_strict_nonzero_on_missing_decisions_file(
         self, repo: Path, capsys: pytest.CaptureFixture[str],

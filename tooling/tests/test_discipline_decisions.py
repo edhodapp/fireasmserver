@@ -45,6 +45,33 @@ class TestParseEntries:
     def test_no_entries(self) -> None:
         assert parse_entries("just prose, no headings\n") == []
 
+    def test_non_id_subheadings_inside_body_not_promoted(self) -> None:
+        text = (
+            "### D001: Real entry\n"
+            "alpha\n"
+            "### Memory model\n"
+            "still part of D001 body\n"
+            "### Examples:\n"
+            "also part of D001 body\n"
+            "### D002: Next real entry\n"
+            "beta\n"
+        )
+        entries = parse_entries(text)
+        assert [e.entry_id for e in entries] == ["D001", "D002"]
+        assert "### Memory model" in entries[0].body_lines
+        assert "### Examples:" in entries[0].body_lines
+        assert entries[0].body_lines[-1] == "also part of D001 body"
+
+    def test_id_shapes_accepted(self) -> None:
+        text = (
+            "### D058: dec\nbody\n"
+            "### MR-001: req\nbody\n"
+            "### AL-005: req\nbody\n"
+            "### BS-002: req\nbody\n"
+        )
+        ids = [e.entry_id for e in parse_entries(text)]
+        assert ids == ["D058", "MR-001", "AL-005", "BS-002"]
+
     def test_deprecated_first_nonblank_marks_entry(self) -> None:
         text = (
             "### D003: Old call\n"
