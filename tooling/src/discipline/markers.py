@@ -11,6 +11,13 @@ Marker comment syntax (//, ;, #, etc.) is irrelevant — the scanner
 matches the literal `DISCIPLINE-PRINT-(START|END): <name>` token
 inside any line. Markers themselves are excluded from the extracted
 block.
+
+The block-name grammar is constrained: an ASCII letter followed by
+letters, digits, underscores, or hyphens, optionally trailed by
+whitespace to end-of-line. A typo like `: foo.` (trailing period)
+or `: foo bar` (embedded space) does NOT match — the marker will
+appear absent and `extract_block` raises a MarkerError, which is
+preferable to silently capturing the typo as the block name.
 """
 
 from __future__ import annotations
@@ -18,7 +25,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-_MARKER = re.compile(r"DISCIPLINE-PRINT-(START|END):\s*(\S+)")
+_MARKER = re.compile(
+    r"DISCIPLINE-PRINT-(START|END):\s*([A-Za-z][A-Za-z0-9_-]*)\s*$",
+)
 
 
 @dataclass(frozen=True)

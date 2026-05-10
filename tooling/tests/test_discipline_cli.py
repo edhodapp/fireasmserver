@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from discipline import cli as cli_mod
 from discipline.cli import (
     DEFAULT_CAP_BYTES,
     PrintOptions,
@@ -530,6 +531,99 @@ class TestPrefixDedup:
         )
         assert out.count("### MR-001:") == 1
         assert out.count("### MR-007:") == 1
+
+
+class TestPathNormalization:
+    """CLI normalizes absolute and `./`-prefixed paths against repo root."""
+
+    def test_main_handles_absolute_path(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        abs_path = str(repo / "arch" / "aarch64" / "memory" / "memreq.inc")
+        rc = main([abs_path, "--repo-root", str(repo)])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "arch/aarch64/memory/memreq.inc" in captured.out
+        assert abs_path not in captured.out
+
+    def test_main_handles_dot_slash_prefix(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = main([
+            "./arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "for arch/aarch64/memory/memreq.inc" in captured.out
+        assert "for ./arch" not in captured.out
+
+    def test_main_path_outside_repo_falls_back_to_input(
+        self, repo: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        outside = tmp_path / "outside.txt"
+        outside.write_text("not in repo", encoding="utf-8")
+        rc = main([str(outside), "--repo-root", str(repo)])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "no canonical context" in captured.out
+
+
+class TestCapTextBoundary:
+    """`_cap_text` truncates at the last newline ≤ cap."""
+
+    # pylint: disable=protected-access
+
+    def test_truncation_at_newline(self) -> None:
+        text = "line one\nline two\nline three\nline four\n"
+        # cap_bytes that lands in the middle of "line three"
+        out = cli_mod._cap_text(text, 20, "test")
+        assert out.startswith("line one\nline two\n")
+        assert "line three" not in out.split("[truncated;")[0]
+        assert "[truncated;" in out
+
+    def test_no_newline_falls_back_to_byte_cut(self) -> None:
+        text = "abcdefghij"
+        out = cli_mod._cap_text(text, 5, "test")
+        assert out.startswith("abcde")
+        assert "[truncated;" in out
+
+    def test_multibyte_not_split(self) -> None:
+        # Two-byte char: é → 0xC3 0xA9 in UTF-8. Cap mid-byte must not
+        # emit mojibake; the `errors="ignore"` plus newline-pref policy
+        # keeps the output clean.
+        text = "x\né"
+        out = cli_mod._cap_text(text, 2, "test")
+        assert "�" not in out  # no replacement chars
+        # Truncated at "\n", so output starts with "x\n"
+        assert out.startswith("x\n")
+
+
+class TestRenderStateCaching:
+    """Same file is read and parsed once per render."""
+
+    # pylint: disable=protected-access
+
+    def test_repeated_file_reads_collapse(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        reads: list[str] = []
+        real = cli_mod._read_text
+
+        def counting(path: Path) -> "str | OSError":
+            reads.append(str(path))
+            return real(path)
+
+        monkeypatch.setattr("discipline.cli._read_text", counting)
+        render_full(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        # The memreq domain has two schema blocks (record + macro)
+        # in the same .inc file; without caching, that file would be
+        # read twice. Caching collapses it to one.
+        memreq_reads = [r for r in reads if r.endswith("memreq.inc")]
+        assert len(memreq_reads) == 1
 
 
 class TestBlockSpecDefaults:

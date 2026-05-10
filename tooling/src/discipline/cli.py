@@ -46,14 +46,39 @@ class PrintOptions:
 
 @dataclass
 class RenderState:
-    """Mutable accumulator: inline-error sentinels emitted this pass.
+    """Mutable per-render scratch: error sentinels and file/parse caches.
 
     Marker errors, missing files, and missing decision IDs all signal
-    canonical-context drift and land here. Deprecated entries are
-    expected and traced explicitly — they do NOT count as errors.
+    canonical-context drift and land in `errors`. Deprecated entries
+    are expected and traced explicitly — they do NOT count as errors.
+
+    `read()` and `parsed_entries()` memoize results so the same file
+    is not re-opened or re-parsed when multiple domains or schema
+    blocks touch it within one render pass.
     """
 
     errors: list[str] = field(default_factory=list)
+    _text_cache: dict[Path, "str | OSError"] = field(default_factory=dict)
+    _entries_cache: dict[Path, "list[dec_mod.Entry]"] = field(
+        default_factory=dict,
+    )
+
+    def read(self, path: Path) -> "str | OSError":
+        """Read `path` once per render; subsequent calls hit the cache."""
+        if path not in self._text_cache:
+            self._text_cache[path] = _read_text(path)
+        return self._text_cache[path]
+
+    def parsed_entries(
+        self, path: Path,
+    ) -> "list[dec_mod.Entry] | OSError":
+        """Parse entries from `path`; subsequent calls hit the cache."""
+        text = self.read(path)
+        if isinstance(text, OSError):
+            return text
+        if path not in self._entries_cache:
+            self._entries_cache[path] = dec_mod.parse_entries(text)
+        return self._entries_cache[path]
 
 
 @dataclass(frozen=True)
@@ -120,7 +145,8 @@ def main(argv: list[str] | None = None) -> int:
     """Entry point. Returns 0 by default; non-zero only with --strict."""
     ns = parse_args(argv)
     opts = _options_from_namespace(ns)
-    result = render_full(ns.path, opts)
+    rel_path = _normalize_path(ns.path, opts.repo_root)
+    result = render_full(rel_path, opts)
     try:
         sys.stdout.write(result.text)
     except BrokenPipeError:
@@ -128,6 +154,27 @@ def main(argv: list[str] | None = None) -> int:
     if ns.strict and result.errors:
         return 1
     return 0
+
+
+def _normalize_path(raw_path: str, repo_root: Path) -> str:
+    """Normalize a touched-path argument to a repo-relative posix string.
+
+    Accepts absolute paths (made relative to `repo_root` when possible),
+    `./`-prefixed paths, and native separators. Falls back to the raw
+    input unchanged when the path is outside `repo_root` — relevance
+    matching will then return no domains and the caller emits a
+    "no canonical context" note, which is the desired observable.
+    """
+    p = Path(raw_path)
+    if p.is_absolute():
+        try:
+            p = p.relative_to(repo_root.resolve())
+        except ValueError:
+            return p.as_posix()
+    parts = [s for s in p.parts if s != "."]
+    if not parts:
+        return p.as_posix()
+    return Path(*parts).as_posix()
 
 
 def _silence_broken_pipe() -> None:
@@ -228,7 +275,7 @@ def _render_one_block(
     """Render one resolved schema block (or an inline error note)."""
     full = opts.repo_root / block.file
     header = f"\n#### {block.file} :: {block.block_name}\n"
-    text = _read_text(full)
+    text = state.read(full)
     if isinstance(text, OSError):
         msg = _io_msg(block.file, text)
         state.errors.append(msg)
@@ -252,12 +299,11 @@ def _render_decisions(
     """Render the requested decision entries from DECISIONS.md."""
     if not domain.decisions:
         return ""
-    text = _read_text(opts.repo_root / _DECISIONS_FILE)
-    if isinstance(text, OSError):
-        msg = _io_msg(_DECISIONS_FILE, text)
+    entries = state.parsed_entries(opts.repo_root / _DECISIONS_FILE)
+    if isinstance(entries, OSError):
+        msg = _io_msg(_DECISIONS_FILE, entries)
         state.errors.append(msg)
         return f"\n### decisions\n({msg})\n"
-    entries = dec_mod.parse_entries(text)
     parts: list[str] = ["\n### decisions\n"]
     for did in domain.decisions:
         parts.append(_render_one_decision(entries, did, opts, state))
@@ -296,12 +342,11 @@ def _render_requirements(
     """
     if not domain.requirements_prefixes:
         return ""
-    text = _read_text(opts.repo_root / _REQUIREMENTS_FILE)
-    if isinstance(text, OSError):
-        msg = _io_msg(_REQUIREMENTS_FILE, text)
+    entries = state.parsed_entries(opts.repo_root / _REQUIREMENTS_FILE)
+    if isinstance(entries, OSError):
+        msg = _io_msg(_REQUIREMENTS_FILE, entries)
         state.errors.append(msg)
         return f"\n### requirements\n({msg})\n"
-    entries = dec_mod.parse_entries(text)
     return _render_requirement_entries(entries, domain, opts)
 
 
@@ -362,11 +407,23 @@ def _io_msg(label: str, err: OSError) -> str:
 
 
 def _cap_text(text: str, cap_bytes: int, source_label: str) -> str:
-    """Truncate `text` to `cap_bytes`; append a pointer if truncated."""
+    """Truncate `text` to `cap_bytes`; append a pointer if truncated.
+
+    The cut point is the last newline at or before `cap_bytes` so the
+    truncated chunk ends on a clean line boundary; this also avoids
+    splitting a multi-byte UTF-8 character at the cap. If no newline
+    sits before the cap, fall back to a raw byte cut with
+    `errors="ignore"` so a partial multi-byte sequence is dropped
+    rather than rendered as mojibake.
+    """
     encoded = text.encode("utf-8")
     if len(encoded) <= cap_bytes:
         return text
-    truncated = encoded[:cap_bytes].decode("utf-8", errors="ignore")
+    cut = encoded.rfind(b"\n", 0, cap_bytes)
+    if cut < 0:
+        truncated = encoded[:cap_bytes].decode("utf-8", errors="ignore")
+    else:
+        truncated = encoded[: cut + 1].decode("utf-8", errors="ignore")
     pointer = f"\n... [truncated; see {source_label} for full text]\n"
     return truncated + pointer
 

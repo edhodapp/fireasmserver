@@ -85,3 +85,34 @@ class TestExtractBlock:
             "// DISCIPLINE-PRINT-END: foo\n"
         )
         assert extract_block(text, "foo") == []
+
+    def test_trailing_punctuation_rejected(self) -> None:
+        # Author typo: trailing period on the START marker. The
+        # regex's `\s*$` anchor refuses to match, so the START
+        # appears absent and extract_block reports MarkerError.
+        text = (
+            "// DISCIPLINE-PRINT-START: foo.\n"
+            "x\n"
+            "// DISCIPLINE-PRINT-END: foo\n"
+        )
+        result = extract_block(text, "foo")
+        assert isinstance(result, MarkerError)
+        assert "START" in result.reason or "0" in result.reason
+
+    def test_embedded_space_in_name_rejected(self) -> None:
+        text = (
+            "// DISCIPLINE-PRINT-START: foo bar\n"
+            "x\n"
+            "// DISCIPLINE-PRINT-END: foo bar\n"
+        )
+        result = extract_block(text, "foo bar")
+        assert isinstance(result, MarkerError)
+
+    def test_trailing_whitespace_after_name_ok(self) -> None:
+        # Trailing whitespace before EOL is allowed by \s*$.
+        text = (
+            "// DISCIPLINE-PRINT-START: foo   \n"
+            "x\n"
+            "// DISCIPLINE-PRINT-END: foo\t\n"
+        )
+        assert extract_block(text, "foo") == ["x"]
