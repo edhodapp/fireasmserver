@@ -569,6 +569,42 @@ class TestPathNormalization:
         captured = capsys.readouterr()
         assert "no canonical context" in captured.out
 
+    def test_main_handles_absolute_path_via_symlink(
+        self, repo: Path, tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        link = tmp_path / "repo_link"
+        link.symlink_to(repo)
+        rc = main([
+            str(link / "arch" / "aarch64" / "memory" / "memreq.inc"),
+            "--repo-root", str(repo),
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "for arch/aarch64/memory/memreq.inc" in captured.out
+
+    def test_main_handles_relative_dotdot_inside_repo(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = main([
+            "arch/aarch64/../aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "for arch/aarch64/memory/memreq.inc" in captured.out
+
+    def test_main_relative_dotdot_escapes_repo(
+        self, repo: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = main([
+            "../outside/file.txt",
+            "--repo-root", str(repo),
+        ])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "no canonical context" in captured.out
+
 
 class TestCapTextBoundary:
     """`_cap_text` truncates at the last newline ≤ cap."""

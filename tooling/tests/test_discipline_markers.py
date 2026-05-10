@@ -97,7 +97,7 @@ class TestExtractBlock:
         )
         result = extract_block(text, "foo")
         assert isinstance(result, MarkerError)
-        assert "START" in result.reason or "0" in result.reason
+        assert "found 0" in result.reason
 
     def test_embedded_space_in_name_rejected(self) -> None:
         text = (

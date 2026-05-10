@@ -159,22 +159,24 @@ def main(argv: list[str] | None = None) -> int:
 def _normalize_path(raw_path: str, repo_root: Path) -> str:
     """Normalize a touched-path argument to a repo-relative posix string.
 
-    Accepts absolute paths (made relative to `repo_root` when possible),
-    `./`-prefixed paths, and native separators. Falls back to the raw
-    input unchanged when the path is outside `repo_root` — relevance
-    matching will then return no domains and the caller emits a
-    "no canonical context" note, which is the desired observable.
+    Resolves both the touched path and `repo_root` so symlinks and
+    `..` segments are handled consistently. Accepts absolute paths,
+    `./`-prefixed paths, `..` segments, and native separators. When
+    the path resolves outside `repo_root`, falls back to the input
+    posix form (with `./` stripped) — relevance matching then returns
+    no domains and the caller emits a "no canonical context" note,
+    the desired observable.
     """
     p = Path(raw_path)
-    if p.is_absolute():
-        try:
-            p = p.relative_to(repo_root.resolve())
-        except ValueError:
+    candidate = p if p.is_absolute() else repo_root / p
+    try:
+        rel = candidate.resolve().relative_to(repo_root.resolve())
+        return rel.as_posix()
+    except ValueError:
+        parts = [s for s in p.parts if s != "."]
+        if not parts:
             return p.as_posix()
-    parts = [s for s in p.parts if s != "."]
-    if not parts:
-        return p.as_posix()
-    return Path(*parts).as_posix()
+        return Path(*parts).as_posix()
 
 
 def _silence_broken_pipe() -> None:
