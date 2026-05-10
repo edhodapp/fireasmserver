@@ -103,6 +103,22 @@ class TestResolveBlocks:
         assert len(blocks) == 1
         assert blocks[0].file == "lib/y.py"
 
+    def test_unrelated_braces_in_file_pass_through(self) -> None:
+        d = Domain(
+            name="t",
+            path_globs=("arch/*/memory/x.inc",),
+            schema_blocks=(
+                BlockSpec(
+                    file="arch/{arch}/v{version}/x.inc",
+                    block_name="b",
+                    arch_aware=True,
+                ),
+            ),
+        )
+        blocks = resolve_blocks(d, "arch/aarch64/memory/x.inc")
+        assert len(blocks) == 1
+        assert blocks[0].file == "arch/aarch64/v{version}/x.inc"
+
 
 class TestBundledMemreqDomain:
     """Sanity check on the shipped DOMAINS map."""

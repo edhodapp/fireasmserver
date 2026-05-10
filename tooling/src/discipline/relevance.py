@@ -116,17 +116,23 @@ def _resolve_one(
     spec: BlockSpec,
     arch: str | None,
 ) -> list[ResolvedBlock]:
-    """Expand one BlockSpec — single-arch, all-arches, or arch-agnostic."""
+    """Expand one BlockSpec — single-arch, all-arches, or arch-agnostic.
+
+    Uses `str.replace("{arch}", ...)` rather than `str.format(arch=...)`
+    so a path that happens to contain other curly-brace literals (e.g.
+    `path/v{version}/file.inc`) does not raise KeyError; only the
+    `{arch}` placeholder is honored by design.
+    """
     if not spec.arch_aware:
         return [ResolvedBlock(file=spec.file, block_name=spec.block_name)]
     if arch is not None:
         return [ResolvedBlock(
-            file=spec.file.format(arch=arch),
+            file=spec.file.replace("{arch}", arch),
             block_name=spec.block_name,
         )]
     return [
         ResolvedBlock(
-            file=spec.file.format(arch=a),
+            file=spec.file.replace("{arch}", a),
             block_name=spec.block_name,
         )
         for a in _SUPPORTED_ARCHES

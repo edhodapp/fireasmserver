@@ -38,21 +38,22 @@ def extract_block(
     Markers are excluded. Returns MarkerError on missing markers,
     duplicates, mis-ordering, or end-before-start.
     """
-    pair = _find_marker_pair(text, block_name)
+    lines = text.splitlines()
+    pair = _find_marker_pair(lines, block_name)
     if isinstance(pair, MarkerError):
         return pair
     start_idx, end_idx = pair
-    return text.splitlines()[start_idx + 1:end_idx]
+    return lines[start_idx + 1:end_idx]
 
 
 def _find_marker_pair(
-    text: str,
+    lines: list[str],
     block_name: str,
 ) -> tuple[int, int] | MarkerError:
     """Locate the (start, end) line indices for one named block."""
     starts: list[int] = []
     ends: list[int] = []
-    for i, line in enumerate(text.splitlines()):
+    for i, line in enumerate(lines):
         m = _MARKER.search(line)
         if m is None or m.group(2) != block_name:
             continue

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -245,6 +246,18 @@ class TestRenderContext:
         )
         assert "file not found: REQUIREMENTS.md" in out
 
+    def test_directory_at_schema_path_yields_unreadable_note(
+        self, repo: Path,
+    ) -> None:
+        inc = repo / "arch" / "aarch64" / "memory" / "memreq.inc"
+        inc.unlink()
+        inc.mkdir()
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "file unreadable" in out
+        assert "arch/aarch64/memory/memreq.inc" in out
+
     def test_per_section_truncation_appends_pointer(
         self, repo: Path,
     ) -> None:
@@ -472,6 +485,51 @@ class TestRenderFull:
             "arch/aarch64/memory/memreq.inc", _opts(repo),
         )
         assert all("deprecated" not in e for e in result.errors)
+
+
+class TestBrokenPipe:
+    """`discipline-print … | head` must not crash with BrokenPipeError."""
+
+    def test_main_survives_broken_pipe(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        def raise_broken_pipe(*_args: str) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        monkeypatch.setattr(sys.stdout, "write", raise_broken_pipe)
+        rc = main([
+            "arch/aarch64/memory/memreq.inc",
+            "--repo-root", str(repo),
+        ])
+        assert rc == 0
+        capsys.readouterr()
+
+
+class TestPrefixDedup:
+    """Overlapping requirement prefixes must not duplicate output."""
+
+    def test_overlapping_prefixes_dedupe_by_entry_id(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        overlap = (
+            Domain(
+                name="memreq",
+                path_globs=("arch/*/memory/memreq.inc",),
+                requirements_prefixes=("MR-", "MR-00"),
+            ),
+        )
+        monkeypatch.setattr(
+            "discipline.cli.matching_domains",
+            lambda _: list(overlap),
+        )
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert out.count("### MR-001:") == 1
+        assert out.count("### MR-007:") == 1
 
 
 class TestBlockSpecDefaults:

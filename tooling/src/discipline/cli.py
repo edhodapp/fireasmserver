@@ -13,6 +13,8 @@ output bounded; truncated sections emit a `... see <file>` pointer.
 from __future__ import annotations
 
 import argparse
+import io
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -119,10 +121,31 @@ def main(argv: list[str] | None = None) -> int:
     ns = parse_args(argv)
     opts = _options_from_namespace(ns)
     result = render_full(ns.path, opts)
-    sys.stdout.write(result.text)
+    try:
+        sys.stdout.write(result.text)
+    except BrokenPipeError:
+        _silence_broken_pipe()
     if ns.strict and result.errors:
         return 1
     return 0
+
+
+def _silence_broken_pipe() -> None:
+    """Redirect stdout to /dev/null after a BrokenPipeError.
+
+    Prevents the stdlib's "BrokenPipeError" message from being printed
+    during interpreter shutdown when stdout is piped to a consumer
+    that closes early (e.g., `discipline-print … | head`). Under
+    pytest capture or any wrapper that lacks an underlying fd, falls
+    back to swapping sys.stdout for an in-memory sink so subsequent
+    writes are absorbed silently.
+    """
+    try:
+        fd = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, fd)
+    except (AttributeError, io.UnsupportedOperation, OSError):
+        sys.stdout = io.StringIO()
 
 
 def render_context(rel_path: str, opts: PrintOptions) -> str:
@@ -203,9 +226,10 @@ def _render_one_block(
     full = opts.repo_root / block.file
     header = f"\n#### {block.file} :: {block.block_name}\n"
     text = _read_text(full)
-    if text is None:
-        state.errors.append(f"file not found: {block.file}")
-        return header + f"(file not found: {block.file})\n"
+    if isinstance(text, OSError):
+        msg = _io_msg(block.file, text)
+        state.errors.append(msg)
+        return header + f"({msg})\n"
     extracted = mk_mod.extract_block(text, block.block_name)
     if isinstance(extracted, mk_mod.MarkerError):
         state.errors.append(
@@ -226,9 +250,10 @@ def _render_decisions(
     if not domain.decisions:
         return ""
     text = _read_text(opts.repo_root / _DECISIONS_FILE)
-    if text is None:
-        state.errors.append(f"file not found: {_DECISIONS_FILE}")
-        return f"\n### decisions\n(file not found: {_DECISIONS_FILE})\n"
+    if isinstance(text, OSError):
+        msg = _io_msg(_DECISIONS_FILE, text)
+        state.errors.append(msg)
+        return f"\n### decisions\n({msg})\n"
     entries = dec_mod.parse_entries(text)
     parts: list[str] = ["\n### decisions\n"]
     for did in domain.decisions:
@@ -259,23 +284,38 @@ def _render_requirements(
     opts: PrintOptions,
     state: RenderState,
 ) -> str:
-    """Render every requirement matching the domain's prefix list."""
+    """Render every requirement matching the domain's prefix list.
+
+    When two prefixes overlap (e.g. `MR-` and `MR-00`), each matched
+    requirement is rendered once — the first prefix wins.
+    """
     if not domain.requirements_prefixes:
         return ""
     text = _read_text(opts.repo_root / _REQUIREMENTS_FILE)
-    if text is None:
-        state.errors.append(f"file not found: {_REQUIREMENTS_FILE}")
-        return (
-            "\n### requirements\n"
-            f"(file not found: {_REQUIREMENTS_FILE})\n"
-        )
+    if isinstance(text, OSError):
+        msg = _io_msg(_REQUIREMENTS_FILE, text)
+        state.errors.append(msg)
+        return f"\n### requirements\n({msg})\n"
     entries = dec_mod.parse_entries(text)
+    return _render_requirement_entries(entries, domain, opts)
+
+
+def _render_requirement_entries(
+    entries: list[dec_mod.Entry],
+    domain: Domain,
+    opts: PrintOptions,
+) -> str:
+    """Walk prefix list, render each unique matched entry once."""
     parts: list[str] = ["\n### requirements\n"]
+    seen: set[str] = set()
     for prefix in domain.requirements_prefixes:
         matches = dec_mod.find_by_prefix(
             entries, prefix, include_deprecated=True,
         )
         for entry in matches:
+            if entry.entry_id in seen:
+                continue
+            seen.add(entry.entry_id)
             parts.append(_render_one_requirement(entry, opts))
     return "".join(parts)
 
@@ -294,12 +334,26 @@ def _render_one_requirement(
     )
 
 
-def _read_text(path: Path) -> str | None:
-    """Read a file, returning None if it doesn't exist."""
+def _read_text(path: Path) -> str | OSError:
+    """Read a file; return its text, or the OSError if I/O failed.
+
+    Catches the full OSError family — FileNotFoundError (the typical
+    "missing canonical file" case), IsADirectoryError (a directory at
+    a path that expected a file), PermissionError, etc. Callers
+    isinstance-check the result to distinguish text from failure.
+    """
     try:
         return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
+    except OSError as err:
+        return err
+
+
+def _io_msg(label: str, err: OSError) -> str:
+    """Format an OSError into a one-line inline note."""
+    if isinstance(err, FileNotFoundError):
+        return f"file not found: {label}"
+    reason = err.strerror or type(err).__name__
+    return f"file unreadable: {label} — {reason}"
 
 
 def _cap_text(text: str, cap_bytes: int, source_label: str) -> str:
