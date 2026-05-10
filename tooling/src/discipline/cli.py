@@ -143,7 +143,10 @@ def _silence_broken_pipe() -> None:
     try:
         fd = sys.stdout.fileno()
         devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, fd)
+        try:
+            os.dup2(devnull, fd)
+        finally:
+            os.close(devnull)
     except (AttributeError, io.UnsupportedOperation, OSError):
         sys.stdout = io.StringIO()
 
@@ -287,7 +290,9 @@ def _render_requirements(
     """Render every requirement matching the domain's prefix list.
 
     When two prefixes overlap (e.g. `MR-` and `MR-00`), each matched
-    requirement is rendered once — the first prefix wins.
+    requirement is rendered exactly once; the first prefix that
+    matches a given `entry_id` wins, and later prefix passes skip
+    that id.
     """
     if not domain.requirements_prefixes:
         return ""
