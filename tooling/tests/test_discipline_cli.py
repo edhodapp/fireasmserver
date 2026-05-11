@@ -259,6 +259,27 @@ class TestRenderContext:
         assert "file unreadable" in out
         assert "arch/aarch64/memory/memreq.inc" in out
 
+    def test_non_utf8_schema_file_yields_unreadable_note(
+        self, repo: Path,
+    ) -> None:
+        inc = repo / "arch" / "aarch64" / "memory" / "memreq.inc"
+        # Latin-1 byte 0xFF is not a valid UTF-8 lead byte.
+        inc.write_bytes(b"\xff\xfe garbage \xff\xfe\n")
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "file unreadable" in out
+        assert "not valid UTF-8" in out
+
+    def test_non_utf8_decisions_file_yields_unreadable_note(
+        self, repo: Path,
+    ) -> None:
+        (repo / "DECISIONS.md").write_bytes(b"\xff\xfe garbage\n")
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "file unreadable: DECISIONS.md — not valid UTF-8" in out
+
     def test_per_section_truncation_appends_pointer(
         self, repo: Path,
     ) -> None:
@@ -305,6 +326,25 @@ class TestRenderContext:
             "arch/aarch64/memory/memreq.inc", _opts(repo),
         )
         assert "shall clause" not in out
+
+    def test_empty_requirements_section_header_suppressed(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        no_matches = (
+            Domain(
+                name="memreq",
+                path_globs=("arch/*/memory/memreq.inc",),
+                requirements_prefixes=("ZZ-",),
+            ),
+        )
+        monkeypatch.setattr(
+            "discipline.cli.matching_domains",
+            lambda _: list(no_matches),
+        )
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "### requirements" not in out
 
     def test_domain_with_no_schema_blocks_skips_section(
         self, repo: Path, monkeypatch: pytest.MonkeyPatch,
@@ -647,7 +687,7 @@ class TestRenderStateCaching:
         reads: list[str] = []
         real = cli_mod._read_text
 
-        def counting(path: Path) -> "str | OSError":
+        def counting(path: Path) -> "str | OSError | UnicodeDecodeError":
             reads.append(str(path))
             return real(path)
 

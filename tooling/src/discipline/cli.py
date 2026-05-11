@@ -32,6 +32,11 @@ DEFAULT_CAP_BYTES = 32_768
 _DECISIONS_FILE = "DECISIONS.md"
 _REQUIREMENTS_FILE = "REQUIREMENTS.md"
 
+# Read failures: file-system errors (the OSError family) or a
+# UnicodeDecodeError when a domain glob lands on a binary or
+# non-UTF-8 file. Callers isinstance-check against this union.
+_ReadFailure = OSError | UnicodeDecodeError
+
 
 @dataclass(frozen=True)
 class PrintOptions:
@@ -58,12 +63,14 @@ class RenderState:
     """
 
     errors: list[str] = field(default_factory=list)
-    _text_cache: dict[Path, "str | OSError"] = field(default_factory=dict)
+    _text_cache: "dict[Path, str | _ReadFailure]" = field(
+        default_factory=dict,
+    )
     _entries_cache: dict[Path, "list[dec_mod.Entry]"] = field(
         default_factory=dict,
     )
 
-    def read(self, path: Path) -> "str | OSError":
+    def read(self, path: Path) -> "str | _ReadFailure":
         """Read `path` once per render; subsequent calls hit the cache."""
         if path not in self._text_cache:
             self._text_cache[path] = _read_text(path)
@@ -71,10 +78,10 @@ class RenderState:
 
     def parsed_entries(
         self, path: Path,
-    ) -> "list[dec_mod.Entry] | OSError":
+    ) -> "list[dec_mod.Entry] | _ReadFailure":
         """Parse entries from `path`; subsequent calls hit the cache."""
         text = self.read(path)
-        if isinstance(text, OSError):
+        if isinstance(text, _ReadFailure):
             return text
         if path not in self._entries_cache:
             self._entries_cache[path] = dec_mod.parse_entries(text)
@@ -278,7 +285,7 @@ def _render_one_block(
     full = opts.repo_root / block.file
     header = f"\n#### {block.file} :: {block.block_name}\n"
     text = state.read(full)
-    if isinstance(text, OSError):
+    if isinstance(text, _ReadFailure):
         msg = _io_msg(block.file, text)
         state.errors.append(msg)
         return header + f"({msg})\n"
@@ -302,7 +309,7 @@ def _render_decisions(
     if not domain.decisions:
         return ""
     entries = state.parsed_entries(opts.repo_root / _DECISIONS_FILE)
-    if isinstance(entries, OSError):
+    if isinstance(entries, _ReadFailure):
         msg = _io_msg(_DECISIONS_FILE, entries)
         state.errors.append(msg)
         return f"\n### decisions\n({msg})\n"
@@ -345,7 +352,7 @@ def _render_requirements(
     if not domain.requirements_prefixes:
         return ""
     entries = state.parsed_entries(opts.repo_root / _REQUIREMENTS_FILE)
-    if isinstance(entries, OSError):
+    if isinstance(entries, _ReadFailure):
         msg = _io_msg(_REQUIREMENTS_FILE, entries)
         state.errors.append(msg)
         return f"\n### requirements\n({msg})\n"
@@ -357,8 +364,13 @@ def _render_requirement_entries(
     domain: Domain,
     opts: PrintOptions,
 ) -> str:
-    """Walk prefix list, render each unique matched entry once."""
-    parts: list[str] = ["\n### requirements\n"]
+    """Walk prefix list, render each unique matched entry once.
+
+    The `### requirements` header is only emitted when at least one
+    entry matches; an empty section header (which would clutter the
+    output) is suppressed.
+    """
+    rendered: list[str] = []
     seen: set[str] = set()
     for prefix in domain.requirements_prefixes:
         matches = dec_mod.find_by_prefix(
@@ -368,8 +380,10 @@ def _render_requirement_entries(
             if entry.entry_id in seen:
                 continue
             seen.add(entry.entry_id)
-            parts.append(_render_one_requirement(entry, opts))
-    return "".join(parts)
+            rendered.append(_render_one_requirement(entry, opts))
+    if not rendered:
+        return ""
+    return "\n### requirements\n" + "".join(rendered)
 
 
 def _render_one_requirement(
@@ -386,24 +400,28 @@ def _render_one_requirement(
     )
 
 
-def _read_text(path: Path) -> str | OSError:
-    """Read a file; return its text, or the OSError if I/O failed.
+def _read_text(path: Path) -> "str | _ReadFailure":
+    """Read a file; return its text, or the failure if I/O/decode failed.
 
     Catches the full OSError family — FileNotFoundError (the typical
     "missing canonical file" case), IsADirectoryError (a directory at
-    a path that expected a file), PermissionError, etc. Callers
-    isinstance-check the result to distinguish text from failure.
+    a path that expected a file), PermissionError, etc. — and also
+    UnicodeDecodeError, which fires if a domain glob accidentally
+    matches a binary or non-UTF-8 file. Callers isinstance-check the
+    result to distinguish text from failure.
     """
     try:
         return path.read_text(encoding="utf-8")
-    except OSError as err:
+    except (OSError, UnicodeDecodeError) as err:
         return err
 
 
-def _io_msg(label: str, err: OSError) -> str:
-    """Format an OSError into a one-line inline note."""
+def _io_msg(label: str, err: "_ReadFailure") -> str:
+    """Format a read failure into a one-line inline note."""
     if isinstance(err, FileNotFoundError):
         return f"file not found: {label}"
+    if isinstance(err, UnicodeDecodeError):
+        return f"file unreadable: {label} — not valid UTF-8"
     reason = err.strerror or type(err).__name__
     return f"file unreadable: {label} — {reason}"
 
