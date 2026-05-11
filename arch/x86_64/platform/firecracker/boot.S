@@ -86,10 +86,12 @@ VIRTQ_DESC_F_NEXT     equ 1
 VIRTQ_DESC_F_WRITE    equ 2
 VIRTQ_DESC_F_INDIRECT equ 4
 
-; RX buffer pool. 256 buffers × 2 KiB each = 512 KiB total, above the
-; virtqueue pages (which end at 0x406000). 2 KiB per buffer fits a
-; 12 B virtio_net_hdr + max-size tagged Ethernet frame with slack.
-RX_BUFFER_BASE      equ 0x500000
+; RX buffer pool — 256 × 2 KiB = 512 KiB total. Allocator-placed
+; via the `rx_buffer` region in regions.yaml (D066 step 5b);
+; consumers load `__memreq_addr__rx_buffer` for the base address.
+; The per-buffer size stays a `.equ` constant because it's a
+; protocol-level slot width (12 B virtio_net_hdr + max Ethernet
+; frame with slack), not a region.
 RX_BUFFER_SIZE      equ 0x800
 
 ; Device Status (Virtio 1.2 §2.1).
@@ -565,10 +567,14 @@ kernel_main_64:
     shl eax, 4
     lea rbx, [rax + RX_QUEUE_BASE + VIRTQ_OFF_DESC]
 
-    ; Buffer addr: RX_BUFFER_BASE + i*2048. Stays < 4 GiB so addr_hi=0.
-    mov eax, edi
-    shl eax, 11
-    add eax, RX_BUFFER_BASE
+    ; Buffer addr: __memreq_addr__rx_buffer (cold-tier lookup) + i*2048.
+    ; One memory load per loop iteration; acceptable because RX
+    ; populate runs once at boot. addr_hi=0 because the allocator
+    ; places under low 4 GiB (current identity-map coverage per D063).
+    mov rax, [rel __memreq_addr__rx_buffer]
+    mov ecx, edi
+    shl ecx, 11
+    add rax, rcx
 
     mov dword [rbx + 0],  eax
     mov dword [rbx + 4],  0
@@ -641,14 +647,16 @@ kernel_main_64:
     cmp edi, VIRTQ_MAX_SIZE
     jae .rx_bad_id_fail
 
-    ; Buffer addr: RX_BUFFER_BASE + id*2048.
-    mov eax, edi
-    shl eax, 11
-    add eax, RX_BUFFER_BASE
+    ; Buffer addr: __memreq_addr__rx_buffer + id*2048 (cold-tier
+    ; lookup). One load per frame on the RX completion hot path;
+    ; could become a hot-tier pin later (task #30 would extend the
+    ; x86_64 budget to make room).
+    mov rax, [rel __memreq_addr__rx_buffer]
+    mov ecx, edi
+    shl ecx, 11
+    add rax, rcx
 
     ; Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
-    ; eax holds the buffer's 32-bit physical address; long-mode auto-
-    ; zero-extends to rax for the address calculation.
     lfence
     movzx esi, word [rax + 2]                        ; hdr_len
     movzx ebp, word [rax + 10]                       ; num_buffers

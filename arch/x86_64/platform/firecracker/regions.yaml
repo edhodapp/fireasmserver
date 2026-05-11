@@ -33,3 +33,19 @@ regions:
       → bump allocator → assigned_addr/assigned_size written in
       place. If allocation fails the LAYOUT-OK tracer marker
       won't fire.
+
+  - name: rx_buffer
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 524288   # 256 buffers × 2048 bytes (0x80000)
+    align: 4096
+    doc: >
+      RX buffer pool for virtio-net — 256 × 2048-byte slots backing
+      the receive descriptor table. D066 step 5b: first real
+      consumer migration. Replaces the hardcoded RX_BUFFER_BASE
+      constant. Cold-tier because the only hot-loop access is the
+      RX completion path's address compute (one per frame); the
+      RX fill loop runs once at boot. Consumers load
+      __memreq_addr__rx_buffer on each access.
