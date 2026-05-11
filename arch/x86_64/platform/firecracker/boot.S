@@ -68,19 +68,25 @@ VIRTIO_MMIO_QUEUE_DEVICE_LOW    equ 0x0A0
 VIRTIO_MMIO_QUEUE_DEVICE_HIGH   equ 0x0A4
 
 ; Virtqueue layout — 12 KiB per queue (page-aligned slots for desc,
-; avail, used). 4 MiB base, well above the loaded image at 1 MiB.
-; Firecracker zero-initializes guest RAM, so all rings are idx=0,
-; flags=0 at boot — exactly the "uninhabited queue" state the spec
-; requires at QueueReady time.
-VIRTQ_BASE          equ 0x400000
+; avail, used). The base address is allocator-placed via the `virtq`
+; region in regions.yaml (D066 step 5c, hot-tier); r15 is pinned to
+; assigned_addr at kernel_main_64 entry by the codegen-emitted
+; memreq_pin_hot.inc. Firecracker zero-initializes guest RAM, so all
+; rings are idx=0 / flags=0 at boot — the "uninhabited queue" state
+; the spec requires at QueueReady time.
+;
+; Queue addressing under the migration:
+;   RX queue base = r15 + RX_QUEUE_OFF (= r15)
+;   TX queue base = r15 + TX_QUEUE_OFF (= r15 + VIRTQ_STRIDE)
+; Within each queue: + VIRTQ_OFF_{DESC,AVAIL,USED}.
 VIRTQ_STRIDE        equ 0x3000
 VIRTQ_OFF_DESC      equ 0x0000
 VIRTQ_OFF_AVAIL     equ 0x1000
 VIRTQ_OFF_USED      equ 0x2000
 
 VIRTQ_MAX_SIZE      equ 0x100    ; 256 descriptors max
-RX_QUEUE_BASE       equ VIRTQ_BASE + 0 * VIRTQ_STRIDE
-TX_QUEUE_BASE       equ VIRTQ_BASE + 1 * VIRTQ_STRIDE
+RX_QUEUE_OFF        equ 0 * VIRTQ_STRIDE
+TX_QUEUE_OFF        equ 1 * VIRTQ_STRIDE
 
 VIRTQ_DESC_F_NEXT     equ 1
 VIRTQ_DESC_F_WRITE    equ 2
@@ -278,7 +284,20 @@ emit_bytes_32:
 ; Clobbers: eax, flags, MMIO at [r12 + ...], avail+used ring headers
 ;           at [%3] / [%4]. Preserves all GPRs except eax (and dx
 ;           explicitly).
-%macro program_queue 5
+; program_queue: configure one virtqueue via the virtio-MMIO
+; control window. r15 (D066 step 5c hot-tier pin) holds VIRTQ_BASE.
+; r12 holds VIRTIO_MMIO_BASE per kernel_main_64's manual pin.
+;
+;   %1 = queue index (0 for RX, 1 for TX) — passed to QUEUE_SEL.
+;   %2 = queue offset within the virtq region (RX_QUEUE_OFF /
+;        TX_QUEUE_OFF) — added to r15 to find this queue's bytes.
+;   %3 = .fail_label to branch to if QUEUE_READY readback != 1.
+;
+; Truncating r15 + offset + per-ring offset to 32 bits via
+; `lea eax, [r15 + ...]` is correct: the allocator places virtq
+; under low 4 GiB (D063 identity-map coverage), so the high 32 bits
+; of every address here are zero. QUEUE_*_HIGH gets a literal 0.
+%macro program_queue 3
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_SEL], %1
     mfence
@@ -292,21 +311,24 @@ emit_bytes_32:
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_NUM], eax
     mfence
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_DESC_LOW], %2
+    lea eax, [r15 + %2 + VIRTQ_OFF_DESC]
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DESC_LOW], eax
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_DESC_HIGH], 0
     mfence
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_DRIVER_LOW], %3
+    lea eax, [r15 + %2 + VIRTQ_OFF_AVAIL]
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DRIVER_LOW], eax
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_DRIVER_HIGH], 0
     mfence
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_DEVICE_LOW], %4
+    lea eax, [r15 + %2 + VIRTQ_OFF_USED]
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_DEVICE_LOW], eax
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_DEVICE_HIGH], 0
     ; Avail/Used ring header zero (belt-and-suspenders; Firecracker
     ; zero-inits but spec doesn't mandate it).
-    mov dword [%3], 0
-    mov dword [%4], 0
+    mov dword [r15 + %2 + VIRTQ_OFF_AVAIL], 0
+    mov dword [r15 + %2 + VIRTQ_OFF_USED], 0
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_READY], 1
     mfence
@@ -314,22 +336,23 @@ emit_bytes_32:
     mov eax, [r12 + VIRTIO_MMIO_QUEUE_READY]
     lfence
     cmp eax, 1
-    jne %5
+    jne %3
 %endmacro
 
 [bits 64]
 global kernel_main_64
 kernel_main_64:
-    ; D060 step 4.2 + D066 step 5a: init-time static memory
-    ; allocator. The .memreq section now carries one record (the
-    ; smoke_test region from regions.yaml); the allocator iterates
-    ; it and writes assigned_addr/assigned_size in place.
+    ; D060 step 4.2 + D066 step 5a/b/c: init-time static memory
+    ; allocator. .memreq carries three records (smoke_test,
+    ; rx_buffer, virtq); the allocator iterates them and writes
+    ; assigned_addr/assigned_size in place.
     call init_memory_layout
 
-    ; D066 step 5a — hot-tier register pins. Loaded AFTER the
-    ; allocator returns (assigned_addr is now populated). Empty
-    ; for 5a (smoke_test is cold-tier); becomes non-empty at 5c
-    ; when VIRTQ_BASE migrates to hot-tier and r15 takes the pin.
+    ; Hot-tier register pins emitted by `memreq-codegen` from the
+    ; `tier: hot` regions in regions.yaml (D066 Q-B). At step 5c
+    ; this loads r15 = __memreq_assigned__virtq (VIRTQ_BASE) so
+    ; all subsequent RX/TX queue accesses use r15-relative
+    ; addressing.
 %include "memreq_pin_hot.inc"
 
     ; UART base for all emit_bytes / emit_hex32 calls. Set BEFORE
@@ -523,16 +546,10 @@ kernel_main_64:
     call emit_bytes
 
     ; --- VIO-007 Slice 2: initialize virtqueues ---
-    program_queue 0, \
-        RX_QUEUE_BASE + VIRTQ_OFF_DESC, \
-        RX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
-        RX_QUEUE_BASE + VIRTQ_OFF_USED, \
-        .queue_ready_fail
-    program_queue 1, \
-        TX_QUEUE_BASE + VIRTQ_OFF_DESC, \
-        TX_QUEUE_BASE + VIRTQ_OFF_AVAIL, \
-        TX_QUEUE_BASE + VIRTQ_OFF_USED, \
-        .queue_ready_fail
+    ; r15 (memreq virtq pin) holds VIRTQ_BASE; the macro computes
+    ; per-queue desc/avail/used addresses as r15-relative offsets.
+    program_queue 0, RX_QUEUE_OFF, .queue_ready_fail
+    program_queue 1, TX_QUEUE_OFF, .queue_ready_fail
 
     lea rsi, [rel queues_ready_msg]
     mov ecx, queues_ready_len
@@ -565,7 +582,7 @@ kernel_main_64:
     ; Descriptor table entry at desc_base + i*16.
     mov eax, edi
     shl eax, 4
-    lea rbx, [rax + RX_QUEUE_BASE + VIRTQ_OFF_DESC]
+    lea rbx, [rax + r15 + VIRTQ_OFF_DESC]
 
     ; Buffer addr: __memreq_addr__rx_buffer (cold-tier lookup) + i*2048.
     ; One memory load per loop iteration; acceptable because RX
@@ -583,9 +600,11 @@ kernel_main_64:
     mov word  [rbx + 14], 0
 
     ; AvailRing.ring[i] = i. Ring slots start past the u16 flags + u16 idx
-    ; header at offset +4. RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 = 0x401004,
-    ; well within disp32 sign-extended range.
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rdi*2], di
+    ; header at offset +4. [r15 + VIRTQ_OFF_AVAIL + 4 + rdi*2] is a
+    ; SIB-form addressing the i-th ring slot; the VIRTQ_OFF_AVAIL + 4
+    ; constant fits in disp32 and r15 holds VIRTQ_BASE (allocator-
+    ; placed under low 4 GiB per D063).
+    mov [r15 + VIRTQ_OFF_AVAIL + 4 + rdi*2], di
 
     inc edi
     cmp edi, r13d
@@ -598,7 +617,7 @@ kernel_main_64:
     ; (Firecracker), so the wire form is identical to the prior
     ; hardcoded VIRTQ_MAX_SIZE. The r13 plumbing protects against a
     ; future VMM with a smaller power-of-2 queue size.
-    mov word [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], r13w
+    mov word [r15 + VIRTQ_OFF_AVAIL + 2], r13w
 
     ; Pin driver-private next-avail shadow in r14. After RX populate
     ; idx == N, so next_avail = N. The shadow replaces the prior
@@ -624,7 +643,7 @@ kernel_main_64:
     mov ecx, 100000000
 .rx_wait_loop:
     lfence
-    mov ax, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 2]
+    mov ax, [r15 + VIRTQ_OFF_USED + 2]
     lfence
     test ax, ax
     jnz .rx_received
@@ -639,8 +658,8 @@ kernel_main_64:
 .rx_received:
     ; ring[0]: id (u32 @ +4), len (u32 @ +8). edi ← id, ebx ← len.
     lfence
-    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]
-    mov ebx, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 8]
+    mov edi, [r15 + VIRTQ_OFF_USED + 4]
+    mov ebx, [r15 + VIRTQ_OFF_USED + 8]
     lfence
 
     ; Bounds check id < VIRTQ_MAX_SIZE.
@@ -707,7 +726,7 @@ kernel_main_64:
     ; index advances only when we advance our consumer-shadow, which
     ; we don't track here.
     lfence
-    mov edi, [RX_QUEUE_BASE + VIRTQ_OFF_USED + 4]
+    mov edi, [r15 + VIRTQ_OFF_USED + 4]
     lfence
 
     ; Use the driver-private next-avail shadow (r14, initialized to
@@ -720,14 +739,14 @@ kernel_main_64:
     and eax, ebx                    ; eax = next_avail mod N
 
     ; ring[slot] = id.
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4 + rax*2], di
+    mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di
 
     ; Barrier before idx bump.
     mfence
 
     ; Advance shadow + publish.
     inc r14d
-    mov [RX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], r14w
+    mov [r15 + VIRTQ_OFF_AVAIL + 2], r14w
 
     ; Barrier before notify.
     mfence
@@ -741,7 +760,7 @@ kernel_main_64:
     call emit_bytes
 
     ; --- VIO-T-002..005: submit one canary Ethernet frame ---
-    lea rbx, [TX_QUEUE_BASE + VIRTQ_OFF_DESC]
+    lea rbx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_DESC]
     ; addr_lo = tx_test_pkt absolute address. NASM in [bits 64]
     ; with `mov dword [...], imm32` writes a sign-extended-to-64
     ; immediate; tx_test_pkt's address is < 4 GiB so the 32-bit
@@ -755,13 +774,13 @@ kernel_main_64:
     mov word  [rbx + 14], 0
 
     ; AvailRing.ring[0] = 0 (head descriptor of single-desc TX).
-    mov word [TX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 4], 0
+    mov word [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 4], 0
 
     ; Barrier before idx bump.
     mfence
 
     ; Publish AvailRing.idx = 1.
-    mov word [TX_QUEUE_BASE + VIRTQ_OFF_AVAIL + 2], 1
+    mov word [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 2], 1
 
     ; Barrier before notify.
     mfence
@@ -778,7 +797,7 @@ kernel_main_64:
     mov ecx, 100000000
 .tx_wait_loop:
     lfence
-    mov ax, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 2]
+    mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]
     lfence
     test ax, ax
     jnz .tx_reclaimed
@@ -792,8 +811,8 @@ kernel_main_64:
 
 .tx_reclaimed:
     lfence
-    mov edi, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 4]    ; id
-    mov ebx, [TX_QUEUE_BASE + VIRTQ_OFF_USED + 8]    ; len
+    mov edi, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 4]    ; id
+    mov ebx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 8]    ; len
     lfence
 
     ; Bounds-check id symmetrically with RX.

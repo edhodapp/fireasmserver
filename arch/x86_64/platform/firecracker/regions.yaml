@@ -49,3 +49,23 @@ regions:
       RX completion path's address compute (one per frame); the
       RX fill loop runs once at boot. Consumers load
       __memreq_addr__rx_buffer on each access.
+
+  - name: virtq
+    tier: hot
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 24576    # 2 queues × 0x3000 (VIRTQ_STRIDE) = 0x6000
+    align: 4096
+    doc: >
+      Virtqueue memory for the virtio-net device — RX queue at
+      [base + 0], TX queue at [base + VIRTQ_STRIDE]. Each queue's
+      descriptor / avail / used rings span 0x1000 each (Virtio 1.2
+      §2.7). D066 step 5c: first hot-tier region. r15 is pinned to
+      assigned_addr at kernel_main_64 entry (codegen emits the load
+      via memreq_pin_hot.inc); all subsequent RX/TX queue accesses
+      use [r15 + offset] or [r15 + VIRTQ_STRIDE + offset] instead
+      of the hardcoded VIRTQ_BASE / RX_QUEUE_BASE / TX_QUEUE_BASE
+      constants. Hot-tier eliminates per-access cache touch on the
+      RX/TX hot paths (~14 Mpps × 1 cache touch = ~5% of a 3 GHz
+      core if cold).
