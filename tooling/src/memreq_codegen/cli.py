@@ -6,7 +6,11 @@ Usage:
 
 Reads the YAML, validates it against the schema, enforces the
 per-arch hot-tier budget (D066 Q-B), and writes the two `.inc`
-files atomically. Exits non-zero on validation or budget errors.
+files. Exits non-zero on validation or budget errors before any
+file is written; once writing starts, each file is written with
+a single `Path.write_text` call (not crash-atomic across both,
+but Make's grouped-target rebuild on the next invocation
+recovers from any half-completed run).
 """
 
 from __future__ import annotations
@@ -19,9 +23,12 @@ import yaml
 
 from memreq_codegen import emitter, schema
 
-# x86_64 hot-tier slot count from D066 Q-B. Updates here must
-# match `_X86_64_HOT_POOL` in `emitter.py`.
-_HOT_BUDGET_X86_64 = 1
+# Per-arch hot-tier slot budget. Derived from the emitter's
+# register pool so updates to the pool propagate without a second
+# constant drifting.
+_HOT_BUDGET = {
+    "x86_64": len(emitter.HOT_POOL_X86_64),
+}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -95,7 +102,12 @@ def _enforce_hot_budget(
     regions: list[schema.RegionDecl], arch: str,
 ) -> None:
     """Refuse if hot-tier count exceeds the per-arch budget."""
-    budget = {"x86_64": _HOT_BUDGET_X86_64}[arch]
+    if arch not in _HOT_BUDGET:  # pragma: no cover
+        # argparse `choices` already guards this; defensive
+        # narrowing keeps the failure mode consistent with the
+        # rest of the validation surface (ValueError, not KeyError).
+        raise ValueError(f"unsupported arch: {arch}")
+    budget = _HOT_BUDGET[arch]
     hot_count = sum(1 for r in regions if r.tier == "hot")
     if hot_count > budget:
         raise ValueError(

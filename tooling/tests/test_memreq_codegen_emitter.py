@@ -137,3 +137,12 @@ class TestEmitPinsX8664:
     def test_non_hot_tiers_dont_pin(self, tier: str) -> None:
         out = emit_pins_x86_64([_region(tier=tier)])
         assert "mov" not in out
+
+    def test_hot_count_over_pool_raises(self) -> None:
+        # x86_64 pool has 1 slot; two hot regions must raise even
+        # when callers bypass the CLI's budget check.
+        with pytest.raises(ValueError, match="pool size"):
+            emit_pins_x86_64([
+                _region(name="hot_a", tier="hot"),
+                _region(name="hot_b", tier="hot"),
+            ])
