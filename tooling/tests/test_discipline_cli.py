@@ -291,6 +291,22 @@ class TestRenderContext:
         assert "file too large" in out
         assert "16-byte cap" in out
 
+    def test_bounded_read_enforces_cap_after_stat(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Simulate a TOCTOU race: the stat-based fast path is bypassed
+        # (returns None as if the file were small), but the actual
+        # read still refuses oversized content via the bounded read.
+        monkeypatch.setattr(
+            "discipline.cli._read_size_guard", lambda _p: None,
+        )
+        monkeypatch.setattr("discipline.cli._MAX_READ_BYTES", 16)
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "file too large" in out
+        assert "16-byte cap" in out
+
     def test_empty_marker_block_emits_explicit_note(
         self, repo: Path,
     ) -> None:

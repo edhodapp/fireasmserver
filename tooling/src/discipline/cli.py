@@ -499,25 +499,26 @@ def _read_text(path: Path) -> "str | _ReadFailure":
     "missing canonical file" case), IsADirectoryError (a directory at
     a path that expected a file), PermissionError, etc. — and also
     UnicodeDecodeError, which fires if a domain glob accidentally
-    matches a binary or non-UTF-8 file. Files larger than
-    `_MAX_READ_BYTES` short-circuit to `_FileTooLargeError` without
-    being read into memory, guarding against OOM if a glob lands on
-    a generated artifact. Callers isinstance-check the result.
+    matches a binary or non-UTF-8 file.
+
+    Defense-in-depth against OOM: the `stat`-based fast path refuses
+    files known to exceed `_MAX_READ_BYTES` without opening them at
+    all, AND the actual read is bounded to `_MAX_READ_BYTES + 1`
+    bytes so a TOCTOU race (file grew after stat) still cannot
+    breach the cap. Callers isinstance-check the result.
     """
     guard = _read_size_guard(path)
     if guard is not None:
         return guard
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as err:
-        return err
+    return _read_bounded(path)
 
 
 def _read_size_guard(path: Path) -> "_ReadFailure | None":
     """Stat `path`; return a failure if oversized or if stat itself failed.
 
-    Returns None when the file is within `_MAX_READ_BYTES` and ready
-    to be read by the caller.
+    Returns None when the file is within `_MAX_READ_BYTES` per its
+    current stat (a fast path) — the bounded read in `_read_bounded`
+    is what actually enforces the cap.
     """
     try:
         size = path.stat().st_size
@@ -526,6 +527,31 @@ def _read_size_guard(path: Path) -> "_ReadFailure | None":
     if size > _MAX_READ_BYTES:
         return _FileTooLargeError(size, _MAX_READ_BYTES)
     return None
+
+
+def _read_bounded(path: Path) -> "str | _ReadFailure":
+    """Open `path` and read up to `_MAX_READ_BYTES + 1` bytes; decode UTF-8.
+
+    The +1 lets us detect the case where the file grew past the cap
+    between stat and read (TOCTOU): if we got more than `_MAX_READ_BYTES`,
+    the file is at least that long and we refuse it.
+    """
+    try:
+        with path.open("rb") as f:
+            raw = f.read(_MAX_READ_BYTES + 1)
+    except OSError as err:
+        return err
+    if len(raw) > _MAX_READ_BYTES:
+        return _FileTooLargeError(len(raw), _MAX_READ_BYTES)
+    return _decode_utf8(raw)
+
+
+def _decode_utf8(raw: bytes) -> "str | UnicodeDecodeError":
+    """Decode `raw` as UTF-8; return the UnicodeDecodeError on failure."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        return err
 
 
 def _io_msg(label: str, err: "_ReadFailure") -> str:
