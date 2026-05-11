@@ -103,6 +103,12 @@ class TestEmitRecordsX8664:
         for name in ("a", "b", "c"):
             assert f"__memreq_rec__{name}:" in out
 
+    def test_trailing_sect_restores_section(self) -> None:
+        # Without trailing __SECT__, %include'ing this file inside
+        # boot.S's .text would leave subsequent code in .memreq.
+        out = emit_records_x86_64([_region()])
+        assert out.rstrip().endswith("__SECT__")
+
 
 class TestEmitPinsX8664:
     """`memreq_pin_hot.inc` rendering."""

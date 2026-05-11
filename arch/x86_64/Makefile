@@ -16,11 +16,16 @@ LD := x86_64-linux-gnu-ld
 # ELF. firecracker boots via PVH, which requires a 64-bit ELF wrapping
 # the same `[bits 32]` entry stub. ELF class is a function of (arch,
 # platform).
-# -i path for `%include "bcvm_errors.nasm.inc"` from
-# arch/x86_64/memory/bytecode_vm.S — shared contract with
-# the diff harness driver. Trailing slash is required by
-# NASM's path-handling.
-NASM_INCLUDE := -i ../../tooling/memlayout_diffharness/
+# -i paths for NASM `%include`s:
+#   - tooling/memlayout_diffharness/ : `bcvm_errors.nasm.inc` from
+#     arch/x86_64/memory/bytecode_vm.S — shared contract with the
+#     diff harness driver.
+#   - build/$(PLATFORM)/ : `memreq_records.inc` and
+#     `memreq_pin_hot.inc` emitted by the memreq_codegen tool from
+#     platform/$(PLATFORM)/regions.yaml (D066 step 5a).
+# Trailing slash is required by NASM's path-handling.
+NASM_INCLUDE := -i ../../tooling/memlayout_diffharness/ \
+                -i build/$(PLATFORM)/
 
 ifeq ($(PLATFORM),firecracker)
 ASFLAGS := -f elf64 $(NASM_INCLUDE)
@@ -32,6 +37,15 @@ endif
 
 SRC_DIR := platform/$(PLATFORM)
 BUILD_DIR := build/$(PLATFORM)
+
+# Codegen for `.memreq` records and hot-tier register pins.
+# Triggered by any change to the YAML source-of-truth or the
+# tool's Python sources. Outputs land alongside object files in
+# build/$(PLATFORM)/ so the `-i` flag above finds them.
+REGIONS_YAML := $(SRC_DIR)/regions.yaml
+MEMREQ_INCS := $(BUILD_DIR)/memreq_records.inc \
+               $(BUILD_DIR)/memreq_pin_hot.inc
+MEMREQ_CODEGEN_SRC := $(wildcard ../../tooling/src/memreq_codegen/*.py)
 
 PLAT_SOURCES := $(sort $(wildcard $(SRC_DIR)/*.S))
 PLAT_OBJECTS := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(PLAT_SOURCES))
@@ -51,11 +65,21 @@ BINARY := $(BUILD_DIR)/guest.elf
 
 all: $(BINARY)
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.S | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.S $(MEMREQ_INCS) | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -o $@ $<
 
 $(BUILD_DIR)/memory/%.o: memory/%.S | $(BUILD_DIR)/memory
 	$(AS) $(ASFLAGS) -o $@ $<
+
+# Both .inc files are produced in one tool invocation; the second
+# target rule for memreq_pin_hot.inc just points at the same recipe.
+$(BUILD_DIR)/memreq_records.inc \
+$(BUILD_DIR)/memreq_pin_hot.inc &: \
+        $(REGIONS_YAML) $(MEMREQ_CODEGEN_SRC) | $(BUILD_DIR)
+	../../.venv/bin/memreq-codegen $(REGIONS_YAML) \
+	    --arch x86_64 \
+	    --out-records $(BUILD_DIR)/memreq_records.inc \
+	    --out-pins $(BUILD_DIR)/memreq_pin_hot.inc
 
 $(BINARY): $(OBJECTS) $(LINKER_SCRIPT)
 	$(LD) $(LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS)

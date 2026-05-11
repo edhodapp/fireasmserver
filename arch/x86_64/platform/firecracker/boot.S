@@ -120,6 +120,13 @@ section .note.Xen note alloc align=4
 
 section .text
 
+; D066 step 5a — `.memreq` records emitted by `memreq-codegen`
+; from arch/x86_64/platform/firecracker/regions.yaml. The
+; included file switches to `[section .memreq]`, emits records,
+; and ends with `__SECT__` so this `.text` is restored before
+; any code below.
+%include "memreq_records.inc"
+
 ; ================================================================
 ; [bits 32] PVH prologue
 ; ================================================================
@@ -311,11 +318,17 @@ emit_bytes_32:
 [bits 64]
 global kernel_main_64
 kernel_main_64:
-    ; Step 4.2: D060 init-time static memory allocator. Returns
-    ; immediately today (.memreq is empty); the wire-up exists so
-    ; the call site stops being a no-op the moment a module
-    ; declares a region (step 5).
+    ; D060 step 4.2 + D066 step 5a: init-time static memory
+    ; allocator. The .memreq section now carries one record (the
+    ; smoke_test region from regions.yaml); the allocator iterates
+    ; it and writes assigned_addr/assigned_size in place.
     call init_memory_layout
+
+    ; D066 step 5a — hot-tier register pins. Loaded AFTER the
+    ; allocator returns (assigned_addr is now populated). Empty
+    ; for 5a (smoke_test is cold-tier); becomes non-empty at 5c
+    ; when VIRTQ_BASE migrates to hot-tier and r15 takes the pin.
+%include "memreq_pin_hot.inc"
 
     ; UART base for all emit_bytes / emit_hex32 calls. Set BEFORE
     ; the LAYOUT-OK emit below so the marker can land immediately
