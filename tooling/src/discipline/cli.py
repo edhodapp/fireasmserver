@@ -191,23 +191,49 @@ def _normalize_path(raw_path: str, repo_root: Path) -> str:
     """Normalize a touched-path argument to a repo-relative posix string.
 
     Resolves both the touched path and `repo_root` so symlinks and
-    `..` segments are handled consistently. Accepts absolute paths,
-    `./`-prefixed paths, `..` segments, and native separators. When
-    the path resolves outside `repo_root`, falls back to the input
-    posix form (with `./` stripped) — relevance matching then returns
-    no domains and the caller emits a "no canonical context" note,
-    the desired observable.
+    `..` segments are handled consistently. For a relative input,
+    considers both cwd-relative (user intent when invoking from a
+    subdir with a discovered repo-root) and repo-root-relative
+    (tests and scripted invocations that pass a repo-rooted path)
+    candidates. Prefers a candidate that actually exists; otherwise
+    falls back to the last inside-repo candidate (the repo-rooted
+    one for relative input) — so a "file about to be created" path
+    still produces a sensible relative form. Paths that resolve
+    outside `repo_root` fall back to the input posix form with
+    `./` stripped — relevance matching then returns no domains and
+    the caller emits a "no canonical context" note.
     """
     p = Path(raw_path)
-    candidate = p if p.is_absolute() else repo_root / p
-    try:
-        rel = candidate.resolve().relative_to(repo_root.resolve())
+    repo_resolved = repo_root.resolve()
+    if p.is_absolute():
+        candidates: list[Path] = [p]
+    else:
+        candidates = [Path.cwd() / p, repo_root / p]
+    rel = _pick_inside_repo(candidates, repo_resolved)
+    if rel is not None:
         return rel.as_posix()
-    except ValueError:
-        parts = [s for s in p.parts if s != "."]
-        if not parts:
-            return p.as_posix()
-        return Path(*parts).as_posix()
+    parts = [s for s in p.parts if s != "."]
+    if not parts:
+        return p.as_posix()
+    return Path(*parts).as_posix()
+
+
+def _pick_inside_repo(
+    candidates: list[Path],
+    repo_resolved: Path,
+) -> "Path | None":
+    """Pick the best inside-repo candidate (existing preferred) or None."""
+    fallback: Path | None = None
+    for c in candidates:
+        try:
+            resolved = c.resolve()
+            rel = resolved.relative_to(repo_resolved)
+        except ValueError:
+            continue
+        if resolved.exists():
+            return rel
+        fallback = rel
+    return fallback
 
 
 def _silence_broken_pipe() -> None:

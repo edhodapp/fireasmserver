@@ -308,6 +308,29 @@ class TestRenderContext:
         )
         assert "(empty block)" in out
 
+    def test_single_blank_line_block_is_not_empty(
+        self, repo: Path,
+    ) -> None:
+        # Boundary: one blank line between markers is NOT empty — the
+        # extracted list has one element (the blank line), so the
+        # block renders as a blank line under the header, not as
+        # `(empty block)`.
+        inc = repo / "arch" / "aarch64" / "memory" / "memreq.inc"
+        inc.write_text(
+            "// DISCIPLINE-PRINT-START: memreq-record-fields\n"
+            "\n"
+            "// DISCIPLINE-PRINT-END: memreq-record-fields\n"
+            "// DISCIPLINE-PRINT-START: memreq-macro-shape\n"
+            "shape body\n"
+            "// DISCIPLINE-PRINT-END: memreq-macro-shape\n",
+            encoding="utf-8",
+        )
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "(empty block)" not in out
+        assert "shape body" in out
+
     def test_per_section_truncation_appends_pointer(
         self, repo: Path,
     ) -> None:
@@ -672,6 +695,22 @@ class TestPathNormalization:
         assert rc == 0
         captured = capsys.readouterr()
         assert "no canonical context" in captured.out
+
+    def test_main_cwd_relative_path_from_subdir(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # User in <repo>/arch/aarch64/memory types `discipline-print
+        # memreq.inc` with the repo-root auto-discovered. The relative
+        # path should resolve against cwd, not against repo_root.
+        (repo / ".git").mkdir()
+        subdir = repo / "arch" / "aarch64" / "memory"
+        monkeypatch.chdir(subdir)
+        rc = main(["memreq.inc"])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "for arch/aarch64/memory/memreq.inc" in captured.out
+        assert "name_hash" in captured.out
 
 
 class TestRepoRootDiscovery:
