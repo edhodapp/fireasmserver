@@ -1,5 +1,8 @@
-# Claude Code session state
-.claude/
+# Claude Code session state. Carve out settings.json so the
+# team-shared hook/permission config ships; keep settings.local.json
+# and per-user state ignored.
+.claude/*
+!.claude/settings.json
 
 # Python
 __pycache__/
