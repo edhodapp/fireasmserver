@@ -3512,6 +3512,26 @@ file's MSR-bits block.
 
 ### D065: `.memreq` macro shape, Python codegen, hot/cold tier system
 
+**DEPRECATED 2026-05-11 08:48 UTC — superseded by D066.** D065 was
+drafted from memory without consulting the existing implementation.
+A 2026-05-01 three-reviewer audit (`notes/d065-audit/`) found four
+data-model conflicts with the in-tree code: Q-A collapsed the
+4-valued `Lifetime` enum to 2 values that the allocator's runtime
+range check (`arch/x86_64/memory/allocator.S:139-143`,
+`MEMLAYOUT_ERR_BAD_LIFETIME=102`) actively rejects; Q-C invented a
+record format incompatible with the existing 48-byte layout in
+`arch/<isa>/memory/memreq.inc` and `tooling/src/memlayout/models.py`,
+including silently shrinking `assigned_size` from u64 to u32 (a
+field the allocator already writes 8 bytes to at `allocator.S:191`);
+Q-D specified a 5-arg macro that doesn't match the 7-arg macro
+already in place; and Q-F deferred per-core kernel stacks indefinitely
+even though D059 step 5 + REQ MR-004 put them in scope. D066
+corrects the data-model claims, restores the omitted scope items,
+and keeps D065's genuinely new contributions (tier-aware codegen,
+hot-pin register convention, Python codegen on the build path) with
+explicit cross-references to D059/D060. Original entry preserved
+intact below.
+
 **Context.** D059 established init-time static memory layout —
 modules declare regions via `.memreq` records; init-code assigns
 addresses; the layout is then frozen. D060 layered the tuning
@@ -3904,6 +3924,397 @@ sequenced and resolved one at a time; tasks #18-#23 capture
 the discussion. Deferral tracking (this entry's "Deferrals"
 section) added per Ed's directive to "track all design
 decisions, especially the ones we are deferring."
+
+
+## 2026-05-11
+
+### D066: `.memreq` design — supersede D065, adopt existing 48-byte format, restore per-core stacks to step 5 scope
+
+**Supersedes:** D065 (deprecated 2026-05-11 08:48 UTC). D065 was
+drafted from memory without consulting the in-tree implementation
+and drifted on four data-model claims (lifetime, record format,
+macro signature, per-core-stack scope). The three-reviewer audit
+in `notes/d065-audit/` converged on the corrections below. D066
+preserves D065's genuinely new contributions — tier-aware codegen,
+hot-pin register convention, Python codegen on the build path —
+and reframes them as explicit layers on top of the existing
+D059/D060 base rather than a clean-sheet design.
+
+---
+
+**Context.**
+
+D059 (2026-04-23) established init-time static memory layout:
+modules declare via `.memreq` records, init-code assigns addresses,
+the layout is then frozen. D060 (2026-04-23) layered the bytecode
+VM that computes size and alignment expressions at allocator time.
+Both decisions are realized in
+`arch/<isa>/memory/{memreq.inc,allocator.S,bytecode_vm.S,init_memory_layout.S}`
+and the Pydantic reference in `tooling/src/memlayout/`, validated
+by the 62-case differential harness at
+`tooling/memlayout_diffharness/` with 100% statement + branch
+coverage. D065 attempted to specify the macro surface, record
+format, and codegen pipeline but did so without reading the
+existing artifacts; D066 anchors the design to what's already in
+place and corrects the points that drifted.
+
+---
+
+**Q-A revision — keep 4-valued lifetime; restore `writable` and `owner_id`; tier moves to codegen-time.**
+
+Lifetime stays at 4 values per D059 and REQ MR-002
+(`steady_state | init_only | immutable_after_init | stack`). The
+allocator at `arch/x86_64/memory/allocator.S:139-143` actively
+range-checks the lifetime byte and returns
+`MEMLAYOUT_ERR_BAD_LIFETIME=102` for any value outside 0..3.
+Collapsing to 2 values would have required allocator surgery and
+broken the differential-harness invariants.
+
+`owner_id` (u16, REQ MR-001) and `writable` (u8, REQ MR-005) stay
+in the record. `owner_id` encodes the D058 actor-model multi-core
+posture (0 = boot core, 1..N-1 = worker, 0xFFFF = shared-readonly);
+`writable` carries permission discipline into the post-allocator
+freeze. Both are load-bearing and were silently dropped by D065.
+
+`tier` (hot | cold | init) is retained as a NEW codegen-time
+concept but does NOT appear in the on-disk record. The runtime
+allocator already ignores tier (the D065 "tier-in-record for
+diagnostic value" framing was unmotivated overhead). Tier lives
+in two places:
+
+- The YAML source-of-truth at
+  `arch/<isa>/platform/<vmm>/regions.yaml`.
+- The generated `memreq_pin_hot.inc` that Python codegen emits
+  for the per-arch hot-tier register pins.
+
+Inspecting tier at runtime is achievable by reading those two
+artifacts; keeping it out of the record preserves the 48-byte
+layout that the existing allocator + diff harness already cover.
+
+---
+
+**Q-B reaffirmation — hot-tier register convention, with explicit r15 acknowledgment on x86_64.**
+
+D065's hot-tier register budgets stand:
+
+- **x86_64**: hot-tier pool = `r15` (1 slot). Other callee-saved
+  GPRs (rbx, rbp, r12-r14) are reserved for manual purposes
+  outside the memreq convention — specifically in `kernel_main_64`:
+  r12 = VIRTIO_MMIO_BASE, r13 = clamped RX queue size, r14 =
+  AvailRing.idx shadow. These are scalars / runtime values, not
+  regions, and are not folded into the memreq convention.
+- **aarch64**: hot-tier pool = `x19-x25` (7 slots). `x26-x28`
+  reserved for future memreq or non-memreq scratch.
+
+**r15 namespace overlap with the allocator.** The existing
+allocator at `arch/x86_64/memory/allocator.S:31` uses `r15` as its
+reverse-bump pointer during the init-time allocation pass. r15 is
+callee-saved under SysV ABI and the allocator save/restores it
+across its own scope (`push r15` at line 102, `pop r15` at line
+304), so the hot-tier convention layers on top cleanly:
+`kernel_main_64` starts AFTER `init_memory_layout` returns, and
+the Python-emitted `mov r15, [<region>_record + MR_OFF_ASSIGNED_ADDR]`
+at the kernel-main entry sees a free r15. D065 didn't acknowledge
+this overlap; D066 names it explicitly so future readers don't
+discover the collision-by-namespace by surprise.
+
+Strict declaration-order assignment to slots and compile-time
+error on budget exceedance — both retained from D065.
+
+---
+
+**Q-C — adopt the existing 48-byte record format unchanged.**
+
+The record format is what `arch/<isa>/memory/memreq.inc` already
+emits and `tooling/src/memlayout/models.py:MemoryRegion` already
+mirrors:
+
+```
+offset  size  field
+0       4     name_hash    fnv1a u32                          (REQ MR-006)
+4       16    size_bc      D060 bytecode, END-terminated
+20      8     align_bc     D060 bytecode, END-terminated
+28      2     owner_id     u16                                (REQ MR-001)
+30      1     lifetime     u8, 4 values                       (REQ MR-002)
+31      1     writable     u8                                 (REQ MR-005)
+32      8     assigned_addr  u64, allocator-written           (REQ MR-008)
+40      8     assigned_size  u64, allocator-written           (REQ MR-008)
+total: 48 bytes, 8-byte aligned                               (REQ MR-007)
+```
+
+Specifically:
+
+- `name_hash` is u32, not a u64 pointer to a `.rodata` string.
+  The runtime identity is the hash; human-readable names live
+  only in the YAML and are not retained in the kernel artifact.
+- `assigned_size` is u64. D065's u32 was a silent regression
+  with no rationale — and would have caused a real memory
+  corruption rather than a soft cap: the existing allocator at
+  `arch/x86_64/memory/allocator.S:191` writes 8 bytes via
+  `mov [r12 + MR_OFF_ASSIGNED_SIZE], rcx`, which would have
+  trampled the next field if D065's layout had been adopted.
+- 16/8 asymmetric bytecode budget per D060 retained — sizes can
+  need MUL / CPU references, alignments are typically literal.
+
+Linker section flags: `.memreq` resolves to alloc + write
+(allocator mutates `assigned_addr` / `assigned_size`). Already
+verified at every build.
+
+---
+
+**Q-D — keep the 7-arg macro; Python codegen retained, explicit pivot from D060.**
+
+Macro signature stays at 7 args per the existing
+`arch/<isa>/memory/memreq.inc`:
+
+```
+%macro memreq 7
+    ; %1=region, %2=name_hash, %3=size_bc_label,
+    ; %4=align_bc_label, %5=owner, %6=lifetime, %7=writable
+```
+
+Bytecode is consumed via labels: `%3` and `%4` reference labels
+whose `.data` / `.rodata` blocks contain the END-terminated opcode
+streams; the macro copies up to 16 / 8 bytes from those labels
+into the record. The macro file's own comments at
+`arch/<isa>/memory/memreq.inc:42-47` already spell this out as the
+step-3 deliverable. D065's 5-arg form with INLINE size/align
+expressions bypassed that path entirely; D066 keeps the 7-arg
+shape and the bytecode-via-label consumption pattern.
+
+**Python codegen path retained.** YAML at
+`arch/<isa>/platform/<vmm>/regions.yaml` is the human-edited
+source-of-truth; `tooling/memreq_codegen/` (Python, project
+quality bar) emits:
+
+- `arch/<isa>/build/<vmm>/memreq_records.inc` — the 7-arg macro
+  invocations and the corresponding bytecode-label data blocks.
+- `arch/<isa>/build/<vmm>/memreq_pin_hot.inc` — register pins for
+  hot-tier regions at function entry.
+
+boot.S `%include`s `memreq_records.inc` inside the `.memreq`
+section and `memreq_pin_hot.inc` at `kernel_main_64` entry.
+
+**This IS a pivot from D060's "the bytecode IS the declaration"
+stance**, and D066 names it explicitly rather than slipping it
+in. D060 framed Python as a REFERENCE (validation/test); D066
+keeps Python's reference role and additionally makes Python the
+source-of-truth for WHICH regions exist. The
+audit-from-bytecode property still holds at runtime — the
+allocator reads bytecode bytes from the record, not YAML — but
+the human-edited surface shifts from hand-written .S to YAML.
+
+Python validations at codegen time, all retained from D065:
+
+- Bytecode opcode legality (matches the live bytecode VM's
+  opcode table).
+- Per-arch hot-tier budget (Q-B) — compile-time error on
+  exceedance.
+- Region name uniqueness within a platform.
+- Lifetime / tier enum membership.
+
+Python tool meets the project quality bar (flake8, pylint
+--rcfile=~/.claude/pylintrc, mypy --strict, pytest --cov-branch)
+per `feedback_tooling_quality_equals_product_quality`.
+
+---
+
+**Q-E revision — non-migration set; bootstrap-stack growth acknowledged.**
+
+Permanent linker-script reservations (NOT memreq regions):
+
+- Bootstrap stack (`__bootstrap_stack_top`). boot.S sets SP from
+  this BEFORE calling `init_memory_layout`; the allocator runs
+  on it. Chicken-and-egg. **D059 framed this as ~64 bytes; the
+  current implementation is 4 KiB** at
+  `arch/x86_64/platform/firecracker/linker.ld:52`
+  (`__bootstrap_stack_size = 0x1000`), grown during D060 step 4.1
+  without amending D059. The growth was driven by
+  `init_memory_layout`'s actual call-depth needs once the
+  allocator started doing real work; documenting here so the
+  divergence is anchored to a decision rather than discovered by
+  someone reading D059 against the linker script.
+- x86_64 boot page tables (`__boot_pml4`, `__boot_pdpt`,
+  `__boot_pd`). Mode-switch consumes them before the allocator
+  runs (D062 + D063).
+
+Hardware-imposed `.equ` constants (VIRTIO_MMIO_BASE, COM1_PORT,
+virtio register offsets, etc.) are NOT regions — they're addresses
+imposed by the device or VMM. `.equ` is the correct encoding.
+
+**Per-core kernel stacks ARE memreq regions** per D059 step 5
+and REQ MR-004. D065 deferred them indefinitely; D066 restores
+them to step 5 scope (see Q-F below). They are placed by the
+allocator at boot, before secondary cores wake — each core's
+stack is a distinct region so no cross-boundary mutable state
+crosses (D058).
+
+---
+
+**Q-F revision — four-step rollout (5d adds per-core stacks).**
+
+Each sub-step lands as its own commit with an isolated failure
+mode:
+
+- **Step 5a** (task #25): Python `memreq_codegen` tool + Makefile
+  wiring + ONE trivial test region (no consumer). Validates the
+  build pipeline plumbing without kernel-behavior coupling.
+  Retained from D065.
+
+- **Step 5b** (task #26): First REAL region — `RX_BUFFER_BASE`
+  on firecracker x86_64, cold-tier. Two consumer sites (RX
+  populate loop, RX completion path) use the cold-tier lookup
+  pattern. Retained from D065.
+
+- **Step 5c** (task #27): First HOT-TIER region — `VIRTQ_BASE`
+  on firecracker x86_64. r15 pinned at `kernel_main_64` entry by
+  the Python-emitted prologue. RX_QUEUE_BASE / TX_QUEUE_BASE
+  stay as derived offsets `[r15 + 0]` / `[r15 + VIRTQ_STRIDE]`.
+  Retained from D065.
+
+- **Step 5d** (NEW — task to be allocated): per-core kernel
+  stack regions, per D059 step 5 + REQ MR-004. Allocator-placed
+  on the heap (forward bump) or via the reverse-bump path
+  depending on lifetime tagging; consumers install SP/ESP from
+  the assigned address on secondary-core wake before any
+  stack-using code runs. D065's omission of per-core stacks
+  undid D059's original motivation (stack-headroom convergence);
+  D066 restores it.
+
+Tracer-bullet on x86_64/firecracker must observe the full marker
+sequence (READY → LAYOUT-OK → VIRTIO:OK → STATUS:DRIVER →
+FEATURES:OK → QUEUES:RX/TX → QUEUES:READY → DRIVER_OK →
+RX:POPULATED → RX:FRAME → RX:RETURNED → TX:SUBMITTED →
+TX:RECLAIMED) at each step.
+
+Bytecode encoding for steps 5b and 5c: literal-only (LIT). Non-
+literal demonstrations (CPU / TUNING references) remain deferred
+per task #28.
+
+aarch64/firecracker replication remains deferred per task #29.
+QEMU cells (x86_64/qemu, aarch64/qemu) get nothing per D065 —
+they don't have virtio init.
+
+---
+
+**Cache-performance rationale for the tier system (unchanged from D065).**
+
+The tier system exists because of cache-locality cost. Naïve
+migration (every access loads `assigned_addr` from the record)
+adds 1-2 cache-line touches per access. For boot-time setup
+that's fine; for production hot paths (10 Gbps line-rate RX/TX
+≈ 14 Mpps ≈ 14M cache touches/sec ≈ 5-7% of a 3 GHz core if
+cache-cold) it's real cost. The `hot` tier pins `assigned_addr`
+in a callee-saved register at function entry — zero per-access
+cost vs the prior compile-time-constant. `cold` accepts per-
+access lookup for sporadic accesses. `init` is for boot-only
+regions where cost is irrelevant.
+
+Records themselves are cache-friendly: 48 bytes, contiguous in
+`.memreq`. A handful fit in one cache line; the whole table fits
+in L1 even with hundreds of regions.
+
+---
+
+**REQ-IDs (1-to-many D→REQ coverage per
+`project_decisions_requirements_coverage_policy`).**
+
+Directly governed by D066:
+
+- **MR-001** (owner_id on every record) — restored from D065's
+  drop.
+- **MR-002** (4-valued lifetime, allocator-enforced) — restored.
+- **MR-003** (bootstrap stack is NOT a memreq region) — D066
+  reaffirms, with the 64B → 4 KiB scale-up documented.
+- **MR-004** (per-core kernel stacks ARE memreq regions) —
+  restored to step 5 scope (5d).
+- **MR-005** (per-region writable flag) — restored from D065's
+  drop.
+- **MR-006** (FNV-1a u32 name_hash) — reaffirmed; D065's u64
+  pointer-to-string overruled.
+- **MR-007** (48-byte fixed layout) — adopted unchanged; D065's
+  alternate layout overruled.
+- **MR-008** (allocator writes `assigned_addr` and `assigned_size`
+  in place; `assigned_size` u64) — reaffirmed; D065's u32
+  regression overruled.
+
+Cross-referenced (D066 doesn't change them but anchors layout
+invariants to them):
+
+- **AL-001** (init-time allocation runs once).
+- **AL-002** (two-pass: forward heap, reverse stack).
+- **AL-003** (three-phase init sequence).
+- **AL-005** (allocator pre-stack discipline — register-only
+  bytecode VM stack).
+
+---
+
+**What this decision doesn't bind.**
+
+- Specific YAML schema fields beyond the agreed minimum (name,
+  tier, lifetime, size, align, owner, writable, doc). The
+  schema can grow additively without a new D-class entry.
+- Internal architecture of `tooling/memreq_codegen/` (parser /
+  validator / emitter modules). Implementation-level.
+- Exact NASM `db` / GNU as `.byte` syntax the Python tool emits.
+  Implementation-level.
+
+---
+
+**Cross-refs.**
+
+- **D058** — actor model. `owner_id` encodes per-core ownership
+  consistent with no-cross-boundary-mutable-state; per-core
+  kernel stacks (step 5d) are the materialization.
+- **D059** — init-time static memory layout. D066 anchors to
+  D059's record fields and retrofit order, and restores
+  per-core stacks to step 5 scope.
+- **D060** — bytecode VM + Python reference. D066 confirms
+  Python's reference role for bytecode and additionally makes
+  Python the source-of-truth for WHICH regions exist (an
+  explicit pivot from D060's "the bytecode IS the declaration"
+  framing).
+- **D062, D063** — stage-1 boot identity map. Boot page tables
+  stay as linker reservations (Q-E).
+- **`notes/d065-audit/`** — the three-reviewer audit
+  (self-audit, clean-Claude subagent, Gemini) that surfaced
+  D065's drift.
+- **`feedback_keep_ontology_in_sync`** — Python codegen pipeline
+  must update the ontology when the regions YAML schema grows.
+- **`feedback_tooling_quality_equals_product_quality`** — the
+  codegen tool meets the project quality bar.
+
+---
+
+**Deferrals (unchanged from D065 unless noted).**
+
+- `#28` — Non-literal bytecode demonstration. Trigger: first
+  migration that needs runtime-CPU-dependent or runtime-tuning-
+  dependent values.
+- `#29` — Replicate memreq migration to aarch64/firecracker.
+  Trigger: x86_64 path stabilized through 5c (and 5d).
+- `#30` — x86_64 hot-tier budget extension. Trigger: 2nd hot
+  region needed.
+- `#31` — Per-function hot-tier budgets. Trigger: multi-function
+  actors (post-D058).
+- `#32` — Y2 YAML restructure (cross-platform unified
+  declaration). Trigger: cross-platform consistency becomes a
+  maintenance burden.
+- `#33` — Record format versioning. Trigger: any concrete need
+  for format change.
+- `#34` — Ontology integration (MemoryRegion entity from
+  regions.yaml). Trigger: step 5c stabilizes.
+
+---
+
+**Trigger event.** 2026-05-01 audit identified D065's drift from
+the in-tree implementation. The discipline-tooling slate
+(`discipline-print` + PreToolUse hook, landed 2026-05-09 →
+2026-05-11) was built specifically to prevent recurrence of the
+drafted-from-memory failure mode. D066 is the first dogfooding
+of that slate: each Edit to `memreq.inc` or `memlayout/models.py`
+during D066's authoring automatically injected the canonical
+schema, so the data-model claims could no longer drift unnoticed.
 
 
 ## Future decisions (not yet made)

@@ -79,7 +79,7 @@ DOMAINS: tuple[Domain, ...] = (
                 block_name="memreq-pydantic-model",
             ),
         ),
-        decisions=("D058", "D059", "D060", "D063", "D064", "D065"),
+        decisions=("D058", "D059", "D060", "D063", "D064", "D065", "D066"),
         requirements_prefixes=("MR-", "AL-"),
     ),
 )

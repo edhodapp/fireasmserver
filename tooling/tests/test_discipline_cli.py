@@ -69,6 +69,8 @@ def _repo(tmp_path: Path) -> Path:
         "body of D064\n"
         "### D065: Old\n"
         "**DEPRECATED 2026-05-01 — superseded by D066.** rationale\n"
+        "### D066: Memreq corrected\n"
+        "body of D066\n"
         "### D999: Unrelated\n"
         "noise\n",
         encoding="utf-8",
