@@ -32,9 +32,30 @@ DEFAULT_CAP_BYTES = 32_768
 _DECISIONS_FILE = "DECISIONS.md"
 _REQUIREMENTS_FILE = "REQUIREMENTS.md"
 
-# Read failures: file-system errors (the OSError family) or a
-# UnicodeDecodeError when a domain glob lands on a binary or
-# non-UTF-8 file. Callers isinstance-check against this union.
+# 1 MiB hard cap on any single file read. The canonical files
+# (DECISIONS.md ~70 KiB, REQUIREMENTS.md ~30 KiB, schema-bearing
+# source files much smaller) are well under this — the cap is a
+# guardrail against a domain glob accidentally matching a generated
+# artifact or large log file and OOMing the tool.
+_MAX_READ_BYTES = 1_048_576
+
+
+class _FileTooLargeError(OSError):
+    """Read aborted because the file exceeds `_MAX_READ_BYTES`."""
+
+    def __init__(self, size: int, cap: int) -> None:
+        super().__init__()
+        self.size = size
+        self.cap = cap
+
+    def __str__(self) -> str:
+        return f"{self.size} bytes exceeds {self.cap}-byte cap"
+
+
+# Read failures: file-system errors (the OSError family), the
+# size-cap subclass above, or a UnicodeDecodeError when a domain
+# glob lands on a binary or non-UTF-8 file. Callers isinstance-check
+# against this union.
 _ReadFailure = OSError | UnicodeDecodeError
 
 
@@ -112,8 +133,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path.cwd(),
-        help="Repo root (defaults to cwd).",
+        default=None,
+        help=(
+            "Repo root. Defaults to walking up from cwd to find a "
+            "`.git` marker; falls back to cwd if none is found."
+        ),
     )
     parser.add_argument(
         "--schemas",
@@ -189,12 +213,22 @@ def _normalize_path(raw_path: str, repo_root: Path) -> str:
 def _silence_broken_pipe() -> None:
     """Redirect stdout to /dev/null after a BrokenPipeError.
 
-    Prevents the stdlib's "BrokenPipeError" message from being printed
-    during interpreter shutdown when stdout is piped to a consumer
-    that closes early (e.g., `discipline-print … | head`). Under
-    pytest capture or any wrapper that lacks an underlying fd, falls
-    back to swapping sys.stdout for an in-memory sink so subsequent
-    writes are absorbed silently.
+    This is the canonical recipe from the Python signal docs
+    (https://docs.python.org/3/library/signal.html#note-on-sigpipe):
+    after BrokenPipeError, dup /dev/null onto stdout's fd so the
+    interpreter-shutdown stdout flush has somewhere benign to write.
+
+    Trade-off: the redirect is process-global. If `main()` is called
+    from a long-lived host (e.g., a test runner that captures stdout
+    via fd manipulation rather than sys.stdout swap), subsequent
+    stdout writes by the host will land in /dev/null. We accept this
+    because (a) at the point of BrokenPipe the original consumer is
+    gone, so there is nothing useful to flush; (b) `main()` is a
+    leaf CLI entry point — the documented embedding pattern is
+    subprocess, not in-process call; and (c) under pytest's stdout
+    capture the fd path raises `io.UnsupportedOperation` and we fall
+    back to swapping `sys.stdout` for an in-memory sink, which is
+    test-safe.
     """
     try:
         fd = sys.stdout.fileno()
@@ -234,13 +268,31 @@ def render_full(rel_path: str, opts: PrintOptions) -> RenderResult:
 def _options_from_namespace(ns: argparse.Namespace) -> PrintOptions:
     """Resolve --schemas/--decisions/--requirements (no flags = all)."""
     any_flag = ns.schemas or ns.decisions or ns.requirements
+    repo_root = (
+        ns.repo_root if ns.repo_root is not None else _find_repo_root()
+    )
     return PrintOptions(
-        repo_root=ns.repo_root,
+        repo_root=repo_root,
         show_schemas=ns.schemas or not any_flag,
         show_decisions=ns.decisions or not any_flag,
         show_requirements=ns.requirements or not any_flag,
         cap_bytes=ns.cap_bytes,
     )
+
+
+def _find_repo_root() -> Path:
+    """Walk up from cwd looking for a `.git` marker (dir or file).
+
+    A `.git` file (rather than directory) is what `git worktree`
+    creates, so we accept either. Falls back to cwd if no marker is
+    found in the ancestor chain — relevance matching then fails on
+    the touched path and the caller emits "no canonical context."
+    """
+    cwd = Path.cwd().resolve()
+    for ancestor in (cwd, *cwd.parents):
+        if (ancestor / ".git").exists():
+            return ancestor
+    return cwd
 
 
 def _render_domain(
@@ -296,6 +348,8 @@ def _render_one_block(
             f"{extracted.reason}"
         )
         return header + f"(marker error: {extracted.reason})\n"
+    if not extracted:
+        return header + "(empty block)\n"
     body = "\n".join(extracted) + "\n"
     return header + _cap_text(body, opts.cap_bytes, block.file)
 
@@ -305,7 +359,19 @@ def _render_decisions(
     opts: PrintOptions,
     state: RenderState,
 ) -> str:
-    """Render the requested decision entries from DECISIONS.md."""
+    """Render the requested decision entries from DECISIONS.md.
+
+    The `### decisions` header is always emitted when the domain
+    declares at least one decision id, even when every id resolves to
+    a "(not found)" or "(deprecated; skipped)" note. This asymmetry
+    vs. `_render_requirement_entries` (which suppresses an empty
+    header) is intentional: a domain's explicit decision-id list is
+    a contract — a missing id is a signal, and the user benefits
+    from seeing the lookup ran and what was missing. Prefix-based
+    requirements, by contrast, may legitimately match zero entries
+    in a domain whose work has not landed yet, where the header
+    would be noise.
+    """
     if not domain.decisions:
         return ""
     entries = state.parsed_entries(opts.repo_root / _DECISIONS_FILE)
@@ -407,19 +473,41 @@ def _read_text(path: Path) -> "str | _ReadFailure":
     "missing canonical file" case), IsADirectoryError (a directory at
     a path that expected a file), PermissionError, etc. — and also
     UnicodeDecodeError, which fires if a domain glob accidentally
-    matches a binary or non-UTF-8 file. Callers isinstance-check the
-    result to distinguish text from failure.
+    matches a binary or non-UTF-8 file. Files larger than
+    `_MAX_READ_BYTES` short-circuit to `_FileTooLargeError` without
+    being read into memory, guarding against OOM if a glob lands on
+    a generated artifact. Callers isinstance-check the result.
     """
+    guard = _read_size_guard(path)
+    if guard is not None:
+        return guard
     try:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as err:
         return err
 
 
+def _read_size_guard(path: Path) -> "_ReadFailure | None":
+    """Stat `path`; return a failure if oversized or if stat itself failed.
+
+    Returns None when the file is within `_MAX_READ_BYTES` and ready
+    to be read by the caller.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as err:
+        return err
+    if size > _MAX_READ_BYTES:
+        return _FileTooLargeError(size, _MAX_READ_BYTES)
+    return None
+
+
 def _io_msg(label: str, err: "_ReadFailure") -> str:
     """Format a read failure into a one-line inline note."""
     if isinstance(err, FileNotFoundError):
         return f"file not found: {label}"
+    if isinstance(err, _FileTooLargeError):
+        return f"file too large: {label} — {err}"
     if isinstance(err, UnicodeDecodeError):
         return f"file unreadable: {label} — not valid UTF-8"
     reason = err.strerror or type(err).__name__

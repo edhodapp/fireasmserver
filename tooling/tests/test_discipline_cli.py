@@ -280,6 +280,34 @@ class TestRenderContext:
         )
         assert "file unreadable: DECISIONS.md — not valid UTF-8" in out
 
+    def test_oversized_schema_file_yields_too_large_note(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Drop the cap so the fixture's tiny .inc file trips it.
+        monkeypatch.setattr("discipline.cli._MAX_READ_BYTES", 16)
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "file too large" in out
+        assert "16-byte cap" in out
+
+    def test_empty_marker_block_emits_explicit_note(
+        self, repo: Path,
+    ) -> None:
+        inc = repo / "arch" / "aarch64" / "memory" / "memreq.inc"
+        # Markers present, no content between them.
+        inc.write_text(
+            "// DISCIPLINE-PRINT-START: memreq-record-fields\n"
+            "// DISCIPLINE-PRINT-END: memreq-record-fields\n"
+            "// DISCIPLINE-PRINT-START: memreq-macro-shape\n"
+            "// DISCIPLINE-PRINT-END: memreq-macro-shape\n",
+            encoding="utf-8",
+        )
+        out = render_context(
+            "arch/aarch64/memory/memreq.inc", _opts(repo),
+        )
+        assert "(empty block)" in out
+
     def test_per_section_truncation_appends_pointer(
         self, repo: Path,
     ) -> None:
@@ -643,6 +671,51 @@ class TestPathNormalization:
         ])
         assert rc == 0
         captured = capsys.readouterr()
+        assert "no canonical context" in captured.out
+
+
+class TestRepoRootDiscovery:
+    """When `--repo-root` is omitted, walk up cwd looking for `.git`."""
+
+    def test_discovery_finds_dot_git_dir(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (repo / ".git").mkdir()
+        subdir = repo / "arch" / "aarch64" / "memory"
+        monkeypatch.chdir(subdir)
+        rc = main(["arch/aarch64/memory/memreq.inc"])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "for arch/aarch64/memory/memreq.inc" in captured.out
+        # Schema content from the fixture proves the right root was used.
+        assert "name_hash" in captured.out
+
+    def test_discovery_accepts_dot_git_file(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # `git worktree` writes a `.git` *file* instead of a directory.
+        (repo / ".git").write_text("gitdir: /elsewhere\n", encoding="utf-8")
+        monkeypatch.chdir(repo)
+        rc = main(["arch/aarch64/memory/memreq.inc"])
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "name_hash" in captured.out
+
+    def test_no_dot_git_falls_back_to_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # tmp_path has no .git anywhere up the chain (pytest tmp roots
+        # are outside any git tree on a CI runner; locally they may be
+        # under /tmp which is outside the dev tree too).
+        monkeypatch.chdir(tmp_path)
+        rc = main(["some/path.inc"])
+        assert rc == 0
+        captured = capsys.readouterr()
+        # No canonical context for an arbitrary path under cwd is the
+        # observable; the discovery walked up and fell back to cwd.
         assert "no canonical context" in captured.out
 
 
