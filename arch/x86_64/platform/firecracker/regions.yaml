@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Memreq regions for x86_64/firecracker (D066 step 5a).
+#
+# Source-of-truth for the regions placed in the `.memreq` ELF
+# section. The codegen at `tooling/src/memreq_codegen/` reads this
+# file and emits two .inc files under `arch/x86_64/build/firecracker/`:
+#
+#   memreq_records.inc — 48-byte records (one per region) in
+#                        the .memreq section, consumed by the
+#                        init-time bump allocator.
+#   memreq_pin_hot.inc — register pins for hot-tier regions
+#                        (currently none), included at
+#                        kernel_main_64 entry.
+#
+# Step 5a (this file's initial state): ONE trivial test region,
+# no consumer. The allocator iterates one valid record for the
+# first time; validates the build pipeline and the .memreq
+# section's content without coupling to any kernel behavior.
+
+regions:
+  - name: smoke_test
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 4096
+    align: 4096
+    doc: >
+      Trivial test region for D066 step 5a — pipeline smoke test.
+      Allocated by init_memory_layout but never consumed by boot.S.
+      Validates codegen → .memreq section → bytecode VM execution
+      → bump allocator → assigned_addr/assigned_size written in
+      place. If allocation fails the LAYOUT-OK tracer marker
+      won't fire.

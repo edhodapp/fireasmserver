@@ -9,6 +9,7 @@ dependencies = [
     "capstone>=5.0",
     "pyelftools>=0.31",
     "osaca>=0.7",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +23,7 @@ dev = [
     "pytest-mock",
     "pytest-randomly",
     "hypothesis>=6.0",
+    "types-PyYAML>=6.0",
 ]
 
 [project.scripts]
@@ -30,6 +32,7 @@ branch-cov = "branch_cov.cli:main"
 audit-ontology = "audit_ontology.cli:main"
 side-session-bootstrap = "side_session_bootstrap.cli:main"
 discipline-print = "discipline.cli:main"
+memreq-codegen = "memreq_codegen.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["tooling/src"]
