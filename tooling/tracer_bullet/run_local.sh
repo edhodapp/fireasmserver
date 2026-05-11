@@ -122,18 +122,39 @@ launch_firecracker_x86_64() {
   ]
 }
 EOF
-    # Firecracker's own log lines (e.g. "[tracer:main] Successfully
-    # started microvm...") go to stderr by default. Keep them out of
-    # SERIAL so they can't interleave with the guest's serial output
-    # — observed in CI on 2026-04-29 where Firecracker's "Successfully
-    # started" log fired between the kernel's "STATUS:" and "DRIVER\n"
-    # bytes, splitting the marker line and breaking the
-    # `^STATUS:DRIVER$` grep. Locally the timing happened to land
-    # outside any marker; CI made the race visible.
+    # Firecracker's own log lines fall into TWO channels in
+    # v1.15.1 — the framework messages ("Running Firecracker",
+    # "Successfully started microvm") and per-component error
+    # logs ("net: Could not add an RX descriptor..."). Both share
+    # the `YYYY-MM-DDTHH:MM:SS.NS [tracer:...]` prefix and both
+    # land on STDOUT, mixed with the guest's serial output. We
+    # capture them inline then strip the prefixed lines before
+    # marker validation so a log line firing mid-emit (observed
+    # on 2026-04-29 between "STATUS:" / "DRIVER\n", and again on
+    # 2026-05-11 between "RX:" / "RETURNED\n") can no longer
+    # split a marker line.
+    local raw_log="$TMPDIR/serial.raw"
     (cd "$TMPDIR" && \
         timeout "${TIMEOUT}s" firecracker \
             --no-api --config-file fc.json --id tracer \
-            > "$SERIAL" 2> "$TMPDIR/firecracker-stderr.log" || true)
+            > "$raw_log" 2> "$TMPDIR/firecracker-stderr.log" || true)
+    # When a Firecracker log line lands mid-kernel-marker (e.g.
+    # "RX:" + log line + "RETURNED\n"), the raw file shows the
+    # log substring embedded in the kernel line and the marker's
+    # tail on the next line. The awk strips the log substring and
+    # rejoins the kernel-emitted halves so the existing
+    # `^RX:RETURNED$` line-anchored greps still work.
+    awk '
+        match($0, /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+ +\[tracer[^]]*\]/) {
+            held = held substr($0, 1, RSTART - 1)
+            next
+        }
+        {
+            if (held != "") { $0 = held $0; held = "" }
+            print
+        }
+        END { if (held != "") print held }
+    ' "$raw_log" > "$SERIAL"
 }
 
 launch_qemu_aarch64() {
