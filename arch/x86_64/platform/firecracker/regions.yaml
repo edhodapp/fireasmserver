@@ -69,3 +69,22 @@ regions:
       constants. Hot-tier eliminates per-access cache touch on the
       RX/TX hot paths (~14 Mpps × 1 cache touch = ~5% of a 3 GHz
       core if cold).
+
+  - name: kstack_boot
+    tier: cold
+    lifetime: stack
+    owner: 0
+    writable: true
+    size: 16384    # 16 KiB — generous headroom for kernel_main_64
+    align: 16      # x86_64 SysV ABI: top-of-stack 16-byte aligned
+    doc: >
+      Per-core kernel stack for the boot core. D066 step 5d: first
+      lifetime=stack region, exercising the allocator's reverse-bump
+      path from __ram_top per AL-002. kernel_main_64 switches SP from
+      the linker-script bootstrap stack to this region's top
+      (assigned_addr + assigned_size, since x86_64 grows down)
+      immediately after init_memory_layout returns and before any
+      further `call`. The bootstrap stack is only needed for
+      init_memory_layout itself per MR-003; the kernel-proper stack
+      lives here and grows to one region per core when multi-core
+      wake lands.

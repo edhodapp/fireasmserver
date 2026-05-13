@@ -101,15 +101,19 @@ SECTIONS
     . = __boot_pd + 0x4000;
 
     /*
-     * Layout contract symbols. Firecracker's x86_64 default guest
-     * RAM goes up to ~0xc0000000 (3 GiB) before the MMIO gap;
-     * conservative bound for the bump allocator's reverse-from-
-     * top stack placement is 0x40000000 (1 GiB) — well within
-     * Firecracker's default --vcpu-count and --mem-size envelope
-     * and free of the MMIO regions Firecracker maps above 3 GiB.
+     * Layout contract symbols. __ram_top is the upper bound for
+     * the bump allocator's reverse-from-top stack placement
+     * (lifetime=stack regions, per AL-002). 128 MiB matches the
+     * tracer-bullet's `mem_size_mib: 128` config — placements
+     * beyond mapped RAM would page-fault on first access (D066
+     * step 5d uncovered this on 2026-05-11 when __ram_top sat at
+     * 1 GiB and the kernel stack landed at an unmapped 0x3FFFFFF8).
+     * Bump this if a deployment configures more guest RAM AND
+     * needs stack-region headroom; tracer-test mem_size_mib must
+     * move in lock-step.
      */
     __heap_start = ALIGN(., 0x1000);
-    __ram_top    = 0x40000000;
+    __ram_top    = 0x08000000;
 }
 
 /* PVH protocol requires the entry point to fit in 32 bits.

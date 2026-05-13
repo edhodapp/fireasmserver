@@ -342,18 +342,33 @@ emit_bytes_32:
 [bits 64]
 global kernel_main_64
 kernel_main_64:
-    ; D060 step 4.2 + D066 step 5a/b/c: init-time static memory
-    ; allocator. .memreq carries three records (smoke_test,
-    ; rx_buffer, virtq); the allocator iterates them and writes
-    ; assigned_addr/assigned_size in place.
+    ; D060 step 4.2 + D066 step 5a/b/c/d: init-time static memory
+    ; allocator. .memreq carries four records (smoke_test,
+    ; rx_buffer, virtq, kstack_boot); the allocator iterates them
+    ; and writes assigned_addr/assigned_size in place.
     call init_memory_layout
 
     ; Hot-tier register pins emitted by `memreq-codegen` from the
-    ; `tier: hot` regions in regions.yaml (D066 Q-B). At step 5c
-    ; this loads r15 = __memreq_assigned__virtq (VIRTQ_BASE) so
-    ; all subsequent RX/TX queue accesses use r15-relative
-    ; addressing.
+    ; `tier: hot` regions in regions.yaml (D066 Q-B). Loads
+    ; r15 = __memreq_assigned__virtq (VIRTQ_BASE) so all subsequent
+    ; RX/TX queue accesses use r15-relative addressing.
 %include "memreq_pin_hot.inc"
+
+    ; D066 step 5d — switch SP from the linker-reserved bootstrap
+    ; stack to the allocator-placed kernel stack. The bootstrap
+    ; stack was only needed for init_memory_layout itself
+    ; (REQ MR-003); kstack_boot is lifetime=stack so the allocator
+    ; reverse-bumped it down from __ram_top per AL-002. x86_64
+    ; grows down — SP = assigned_addr + assigned_size.
+    ;
+    ; Safe to switch here: init_memory_layout's return already
+    ; consumed its bootstrap-stack frame, and we've not yet made
+    ; any post-allocator `call` that would expect a return address
+    ; on the bootstrap stack (the memreq_pin_hot.inc above is
+    ; pure register loads).
+    mov rax, [rel __memreq_assigned__kstack_boot]
+    add rax, [rel __memreq_size__kstack_boot]
+    mov rsp, rax
 
     ; UART base for all emit_bytes / emit_hex32 calls. Set BEFORE
     ; the LAYOUT-OK emit below so the marker can land immediately
