@@ -72,7 +72,13 @@ init_memory_layout:
     mov     [rsp + 48], rax
     mov     rax, __ram_top
     mov     [rsp + 56], rax
-    mov     qword [rsp + 64], 0          ; rc_out (allocator writes)
+    ; Output fields (rc_out, forward_out, reverse_out at +64/+72/+80)
+    ; are pure write surfaces — the allocator never reads them before
+    ; writing. Zeroing them anyway is defensive: a future allocator
+    ; version that reads an output before write won't see stack junk.
+    mov     qword [rsp + 64], 0          ; rc_out
+    mov     qword [rsp + 72], 0          ; forward_out
+    mov     qword [rsp + 80], 0          ; reverse_out
 
     mov     rdi, rsp
     call    memlayout_run_allocator
