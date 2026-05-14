@@ -23,13 +23,24 @@
     .type   init_memory_layout, %function
     .balign 4
 init_memory_layout:
-    // memlayout_call_t is 88 bytes; one extra qword keeps SP
-    // 16-byte aligned per AAPCS64.
-    sub     sp, sp, #96
-    // Preserve LR so we can return cleanly.
-    str     x30, [sp, #88]
+    // The caller (boot.S) pre-loads x0 with UART_BASE so the
+    // emit_bytes/emit_hex32 helpers after the bl can fire without
+    // re-deriving it. AAPCS64 doesn't promise x0 preservation
+    // across a call (x0-x7 are caller-saved volatile), but the
+    // pre-existing stub `ret` honored that informal contract by
+    // touching no registers, and boot.S relies on it. Preserve
+    // x0 explicitly on the frame so the wire-up doesn't break
+    // the contract a `ret`-stub silently maintained.
+    //
+    // Frame: 112 bytes. memlayout_call_t at [sp, #0..#87];
+    // saved x0 (UART_BASE) at [sp, #88]; saved x30 (LR) at
+    // [sp, #96]; 8 bytes of padding at [sp, #104..#111] keep
+    // the frame 16-aligned per AAPCS64.
+    sub     sp, sp, #112
+    stp     x0, x30, [sp, #88]
 
-    // Populate the struct.
+    // Populate the struct. x0 is scratch from here through the
+    // call; it's restored from the saved slot before ret.
     ldr     x0, =__memreq_start
     str     x0, [sp, #0]
     ldr     x0, =__memreq_end
@@ -51,17 +62,20 @@ init_memory_layout:
     bl      memlayout_run_allocator
 
     // rc_out is a u32 in the low 4 bytes of the 8-byte slot.
-    ldr     w0, [sp, #64]
-    cbnz    w0, .Lalloc_failed
+    // w9 is caller-saved (x9-x17 in AAPCS64), no save needed.
+    ldr     w9, [sp, #64]
+    cbnz    w9, .Lalloc_failed
 
-    ldr     x30, [sp, #88]
-    add     sp, sp, #96
+    // Restore x0 (UART_BASE) + LR, then return.
+    ldp     x0, x30, [sp, #88]
+    add     sp, sp, #112
     ret
 
 .Lalloc_failed:
     // Pre-stack-switch fatal. Tracer-bullet sees READY but not
     // LAYOUT-OK — sufficient diagnostic at this layer. Halt
-    // loudly via WFI loop.
+    // loudly via WFI loop. Don't bother restoring frame; we
+    // never return from this path.
 .Lhalt:
     wfi
     b       .Lhalt
