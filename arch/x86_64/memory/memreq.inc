@@ -49,7 +49,7 @@
     ; lands in step 3; for now the macro shape is fixed and the
     ; labels would just be empty placeholders if anyone called it.)
 
-    [section .memreq progbits alloc noexec nowrite align=8]
+    [section .memreq progbits alloc noexec write align=8]
     align 8
 __memreq_rec__%1:
     dd      %2                     ; name_hash
