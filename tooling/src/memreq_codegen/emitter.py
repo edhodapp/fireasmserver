@@ -133,6 +133,12 @@ def _emit_one_record_x86_64(region: RegionDecl) -> str:
         "                          ; lifetime\n"
         f"    db      {writable_byte}"
         "                          ; writable\n"
+        # Defense: D066 Q-C's layout puts assigned_addr at offset 32,
+        # which is naturally 8-aligned given the current bytecode
+        # buffer sizes (16 + 8 = 24). If those ever change, this
+        # `align 8` guards the 64-bit writes the allocator makes
+        # into assigned_addr/size from becoming unaligned.
+        f"align 8\n"
         f"global __memreq_assigned__{region.name}\n"
         f"__memreq_assigned__{region.name}:\n"
         "    dq      0                          ; assigned_addr\n"
@@ -237,6 +243,14 @@ def _emit_one_record_aarch64(region: RegionDecl) -> str:
         "                          // lifetime\n"
         f"    .byte   {writable_byte}"
         "                          // writable\n"
+        # Defense (mirrors the x86_64 emitter): guards the
+        # allocator's 64-bit writes from misalignment if the
+        # bytecode buffer sizes ever change. AArch64 strict-
+        # alignment mode would fault on a misaligned 8-byte
+        # access; this explicit `.balign 8` is a no-op today
+        # (offset 32 is already 8-aligned) and the safety net for
+        # tomorrow.
+        f".balign 8\n"
         f".global __memreq_assigned__{region.name}\n"
         f"__memreq_assigned__{region.name}:\n"
         "    .quad   0                          // assigned_addr\n"
