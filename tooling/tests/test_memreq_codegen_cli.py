@@ -93,6 +93,26 @@ class TestMainHappyPath:
         assert rc == 0
         assert out_records.exists()
 
+    def test_aarch64_emits_gnu_as_syntax(
+        self, tmp_path: Path,
+    ) -> None:
+        yaml_path = _fixture_yaml(tmp_path, _VALID_BODY)
+        out_records = tmp_path / "records.inc"
+        out_pins = tmp_path / "pins.inc"
+        rc = main([
+            str(yaml_path),
+            "--arch", "aarch64",
+            "--out-records", str(out_records),
+            "--out-pins", str(out_pins),
+        ])
+        assert rc == 0
+        records_text = out_records.read_text(encoding="utf-8")
+        # GNU-as `.global` / `.word` / `.byte` instead of NASM
+        # `global` / `dd` / `db`.
+        assert ".global __memreq_rec__smoke_test" in records_text
+        assert ".word   0x" in records_text
+        assert ".byte   0x" in records_text
+
 
 class TestMainErrors:
     """Validation, budget, and parse errors return non-zero."""

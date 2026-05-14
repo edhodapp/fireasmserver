@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from memreq_codegen.emitter import emit_pins_x86_64, emit_records_x86_64
+from memreq_codegen.emitter import (
+    emit_pins_aarch64,
+    emit_pins_x86_64,
+    emit_records_aarch64,
+    emit_records_x86_64,
+)
 from memreq_codegen.schema import RegionDecl
 
 
@@ -146,3 +151,99 @@ class TestEmitPinsX8664:
                 _region(name="hot_a", tier="hot"),
                 _region(name="hot_b", tier="hot"),
             ])
+
+
+class TestEmitRecordsAarch64:
+    """`memreq_records.inc` rendering on aarch64 (GNU-as syntax)."""
+
+    def test_section_directive_uses_pushsection(self) -> None:
+        out = emit_records_aarch64([_region()])
+        assert ".pushsection .memreq" in out
+        assert out.rstrip().endswith(".popsection")
+
+    def test_record_label_emitted(self) -> None:
+        out = emit_records_aarch64([_region()])
+        assert ".global __memreq_rec__rx_buffer" in out
+        assert "__memreq_rec__rx_buffer:" in out
+
+    def test_assigned_label_emitted(self) -> None:
+        out = emit_records_aarch64([_region()])
+        assert ".global __memreq_assigned__rx_buffer" in out
+        assert "__memreq_assigned__rx_buffer:" in out
+
+    def test_addr_alias_emitted_as_equ(self) -> None:
+        out = emit_records_aarch64([_region()])
+        assert (
+            ".equ __memreq_addr__rx_buffer, "
+            "__memreq_assigned__rx_buffer"
+        ) in out
+
+    def test_size_alias_at_offset_8(self) -> None:
+        out = emit_records_aarch64([_region()])
+        assert (
+            ".equ __memreq_size__rx_buffer, "
+            "__memreq_assigned__rx_buffer + 8"
+        ) in out
+
+    def test_word_form_for_name_hash(self) -> None:
+        # GNU-as uses .word for 32-bit (vs NASM's dd).
+        out = emit_records_aarch64([_region(name="smoke_test")])
+        # FNV-1a("smoke_test") = 0x9b6d2f4f
+        assert ".word   0x9b6d2f4f" in out
+
+    def test_byte_form_for_bytecode(self) -> None:
+        out = emit_records_aarch64([_region(size=4096)])
+        # LIT 4096; END at the start of size_bc, as .byte directives
+        assert ".byte   0x01, 0x00, 0x10, 0x00, 0x00, 0x00" in out
+
+    def test_short_form_for_owner_id(self) -> None:
+        out = emit_records_aarch64([_region(owner=42)])
+        assert ".short  42" in out
+
+    def test_lifetime_byte_matches_enum(self) -> None:
+        out = emit_records_aarch64([_region(lifetime="stack")])
+        assert ".byte   3" in out
+
+    def test_balign_8(self) -> None:
+        # Records are 8-byte aligned (REQ MR-007).
+        out = emit_records_aarch64([_region()])
+        assert ".balign 8" in out
+
+
+class TestEmitPinsAarch64:
+    """`memreq_pin_hot.inc` rendering on aarch64."""
+
+    def test_empty_when_no_hot_regions(self) -> None:
+        out = emit_pins_aarch64([_region(tier="cold")])
+        assert "no hot-tier regions" in out
+        assert "ldr" not in out
+
+    def test_one_hot_region_pins_x19(self) -> None:
+        out = emit_pins_aarch64([_region(tier="hot")])
+        assert "ldr     x19, =__memreq_assigned__rx_buffer" in out
+        assert "ldr     x19, [x19]" in out
+
+    def test_second_hot_region_pins_x20(self) -> None:
+        out = emit_pins_aarch64([
+            _region(name="a", tier="hot"),
+            _region(name="b", tier="hot"),
+        ])
+        assert "ldr     x19, =__memreq_assigned__a" in out
+        assert "ldr     x20, =__memreq_assigned__b" in out
+
+    def test_hot_count_over_pool_raises(self) -> None:
+        # aarch64 pool has 7 slots; 8 hot regions must raise.
+        regions = [
+            _region(name=f"h{i}", tier="hot") for i in range(8)
+        ]
+        with pytest.raises(ValueError, match="pool size"):
+            emit_pins_aarch64(regions)
+
+    def test_seven_hot_regions_ok(self) -> None:
+        # Pool capacity, fully used: no overflow.
+        regions = [
+            _region(name=f"h{i}", tier="hot") for i in range(7)
+        ]
+        out = emit_pins_aarch64(regions)
+        for slot in ("x19", "x20", "x21", "x22", "x23", "x24", "x25"):
+            assert f"ldr     {slot}, =" in out

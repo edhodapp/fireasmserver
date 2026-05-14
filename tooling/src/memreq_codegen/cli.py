@@ -28,6 +28,7 @@ from memreq_codegen import emitter, schema
 # constant drifting.
 _HOT_BUDGET = {
     "x86_64": len(emitter.HOT_POOL_X86_64),
+    "aarch64": len(emitter.HOT_POOL_AARCH64),
 }
 
 
@@ -58,8 +59,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--arch",
         required=True,
-        choices=("x86_64",),
-        help="Target architecture (only x86_64 in step 5a).",
+        choices=("x86_64", "aarch64"),
+        help=(
+            "Target architecture. x86_64 emits NASM syntax; "
+            "aarch64 emits GNU-as syntax."
+        ),
     )
     parser.add_argument(
         "--out-records",
@@ -124,11 +128,15 @@ def _write_outputs(
     out_pins: Path,
 ) -> None:
     """Render and write the two .inc files."""
-    if arch != "x86_64":  # pragma: no cover
+    if arch == "x86_64":
+        records_text = emitter.emit_records_x86_64(regions)
+        pins_text = emitter.emit_pins_x86_64(regions)
+    elif arch == "aarch64":
+        records_text = emitter.emit_records_aarch64(regions)
+        pins_text = emitter.emit_pins_aarch64(regions)
+    else:  # pragma: no cover
         # argparse choices guards this; defensive narrowing.
         raise ValueError(f"unsupported arch: {arch}")
-    records_text = emitter.emit_records_x86_64(regions)
-    pins_text = emitter.emit_pins_x86_64(regions)
     out_records.parent.mkdir(parents=True, exist_ok=True)
     out_pins.parent.mkdir(parents=True, exist_ok=True)
     out_records.write_text(records_text, encoding="utf-8")
