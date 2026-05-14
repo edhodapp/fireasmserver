@@ -215,6 +215,13 @@
 
 
 .section .text, "ax"
+
+// D066 step 5 — `.memreq` records emitted by `memreq-codegen` from
+// arch/aarch64/platform/firecracker/regions.yaml. The included
+// file pushes `.memreq` section, emits records, and pops back to
+// the previously-active section so this `.text` is restored.
+.include "memreq_records.inc"
+
 .globl _start
 
 _start:
@@ -282,6 +289,11 @@ _entry:
     movk    x0, #0x2000              // x0 = UART_BASE
 
     bl      init_memory_layout
+
+    // Hot-tier register pins emitted by `memreq-codegen` (D066 Q-B
+    // aarch64 pool: x19-x25). Loaded AFTER init_memory_layout
+    // populates each region's assigned_addr.
+    .include "memreq_pin_hot.inc"
 
     // Emit "LAYOUT-OK\n" — D060 step 4.2 success marker. Reached only
     // when init_memory_layout returned cleanly; the function halts

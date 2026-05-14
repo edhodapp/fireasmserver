@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Memreq regions for x86_64/qemu — intentionally empty.
+#
+# Per D066 Q-E + Q-F: "QEMU cells (x86_64/qemu, aarch64/qemu) get
+# NOTHING — they don't have virtio init today; their `.memreq`
+# stays empty until they grow virtio content." This file exists
+# so the per-platform codegen target has a deterministic input;
+# the emitter produces a zero-region `.inc` and the linker
+# resolves `__memreq_start == __memreq_end` for an empty range
+# the allocator iterates cleanly.
+
+regions: []

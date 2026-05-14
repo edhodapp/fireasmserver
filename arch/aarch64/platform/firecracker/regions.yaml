@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Memreq regions for aarch64/firecracker (D066 step 5 — aarch64
+# replication of the x86_64 path, deferred per D066 task #29 until
+# x86_64 stabilized).
+#
+# Source-of-truth for the regions placed in the `.memreq` ELF
+# section. The codegen at `tooling/src/memreq_codegen/` reads this
+# file and emits two .inc files under `arch/aarch64/build/firecracker/`:
+#
+#   memreq_records.inc — 48-byte records (one per region) in
+#                        the .memreq section, consumed by the
+#                        init-time bump allocator.
+#   memreq_pin_hot.inc — register pins for hot-tier regions
+#                        (per D066 Q-B aarch64 pool: x19-x25),
+#                        included at kernel entry post-init.
+#
+# Mirrors arch/x86_64/platform/firecracker/regions.yaml. Same
+# logical regions, same sizes, same lifetimes.
+
+regions:
+  - name: smoke_test
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 4096
+    align: 4096
+    doc: >
+      Trivial test region (D066 step 5a equivalent on aarch64).
+      Allocated by init_memory_layout but never consumed by boot.S.
+      Validates codegen → .memreq section → bytecode VM execution
+      → bump allocator → assigned_addr/assigned_size written in
+      place on the aarch64 side.
+
+  - name: rx_buffer
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 524288   # 256 buffers × 2048 bytes (0x80000)
+    align: 4096
+    doc: >
+      RX buffer pool for virtio-net — 256 × 2048-byte slots.
+      Replaces the hardcoded RX_BUFFER_BASE constant. Cold-tier
+      because the RX fill loop runs once at boot and the RX
+      completion path's per-frame lookup is acceptable cost.
+
+  - name: virtq
+    tier: hot
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 24576    # 2 queues × 0x3000 (VIRTQ_STRIDE) = 0x6000
+    align: 4096
+    doc: >
+      Virtqueue memory for the virtio-net device — RX queue at
+      [base + 0], TX queue at [base + VIRTQ_STRIDE]. x19 (first
+      slot of the AAPCS64 hot-tier pool) is pinned to assigned_addr
+      at kernel entry by memreq_pin_hot.inc; subsequent RX/TX
+      queue accesses use [x19 + offset] or [x19 + VIRTQ_STRIDE +
+      offset] instead of the hardcoded VIRTQ_BASE constant.
+
+  - name: kstack_boot
+    tier: cold
+    lifetime: stack
+    owner: 0
+    writable: true
+    size: 16384    # 16 KiB — matches x86_64 sibling
+    align: 16      # AAPCS64: SP 16-byte aligned at function entry
+    doc: >
+      Per-core kernel stack for the boot core. D066 step 5d:
+      first lifetime=stack region on aarch64, exercising the
+      allocator's reverse-bump path from __ram_top per AL-002.
+      _entry switches SP from the linker-script bootstrap stack
+      to this region's top (assigned_addr + assigned_size, since
+      aarch64 grows down) immediately after init_memory_layout
+      returns and before any further `bl`. The bootstrap stack is
+      only needed for init_memory_layout itself per MR-003; the
+      kernel-proper stack lives here.
