@@ -19,144 +19,126 @@
 # address in this file. Regenerate wholesale rather than trying to
 # patch in place.
 
-# ---- boot.S: dead branches in the always-present code paths ----
-#
-# cbnz x5, .Ldone — secondary-CPU entry. vcpu_count=1 in our config,
-#   so the primary always falls through. Only "taken" is missing.
-# cbz w2, .Lemit_done — emit_bytes early-return for empty buffers.
-#   All call sites pass a non-empty buffer, so only "taken" is missing.
-# tbnz w3, #5, .Lemit_loop — wait-while-FIFO-full. QEMU's PL011
-#   emulation drains instantly, so TXFF==1 never observed.
-#   Only "taken" is missing.
+# Regen history:
+#   2026-05-13: allocator wire-up landed (init_memory_layout calls
+#     memlayout_run_allocator; aarch64/qemu's regions.yaml is the
+#     empty stub per D066 Q-F "QEMU cells get NOTHING"). The bytecode
+#     VM and allocator bodies are now reachable BUT iterate a zero-
+#     length .memreq range, so the per-record branches (size_bc /
+#     align_bc eval, bump arithmetic, lifetime dispatch) stay
+#     uncovered at tracer-bullet runtime. Diff-harness coverage in
+#     tooling/tests/test_memlayout_*_diff.py exercises every opcode
+#     + two-pass allocator path under user-mode QEMU; these gaps
+#     reflect that the kernel-side tracer doesn't visit them.
 
-# ---- memlayout VM + allocator dead-code branches -------------------
-#
-# arch/aarch64/memory/bytecode_vm.S (D060 step 3A) and
-# arch/aarch64/memory/allocator.S (step 3B) are linked into the
-# kernel image and reachable via D060 step 4.2's wire-up
-# (boot.S → init_memory_layout). However init_memory_layout is
-# still a return-immediately stub (.memreq section is empty until
-# step 5 declares regions), so the bytecode VM and allocator
-# bodies stay dead at tracer-bullet runtime. Will close in step 5
-# once a module declares a region. The ratchet will then notice
-# the closed gaps, fail, and force a re-baseline — exactly the
-# mechanism the ratchet is designed to provide.
-#
-# Out-of-band coverage of the same code happens in
-# tooling/tests/test_memlayout_diff.py and test_memlayout_alloc_
-# diff.py, which exercise every opcode + every two-pass allocator
-# path under user-mode QEMU.
-
-0x114 not_taken
-0x114 taken
-0x120 not_taken
-0x120 taken
-0x128 not_taken
-0x128 taken
-0x138 not_taken
-0x138 taken
-0x14c not_taken
-0x14c taken
-0x154 not_taken
-0x154 taken
-0x160 not_taken
-0x160 taken
-0x168 not_taken
-0x168 taken
-0x178 not_taken
-0x178 taken
-0x180 not_taken
-0x180 taken
-0x1a0 not_taken
-0x1a0 taken
-0x1ac not_taken
-0x1ac taken
-0x1bc not_taken
-0x1bc taken
-0x1d0 not_taken
-0x1d0 taken
-0x1d8 not_taken
-0x1d8 taken
-0x1e4 not_taken
-0x1e4 taken
-0x1ec not_taken
-0x1ec taken
-0x200 not_taken
-0x200 taken
-0x2e0 not_taken
-0x2e0 taken
-0x2e4 not_taken
-0x2e4 taken
-0x30c not_taken
-0x30c taken
-0x31c not_taken
-0x31c taken
-0x324 not_taken
-0x324 taken
-0x32c not_taken
-0x32c taken
-0x334 not_taken
-0x334 taken
-0x33c not_taken
-0x33c taken
-0x344 not_taken
-0x344 taken
-0x34c not_taken
-0x34c taken
-0x354 not_taken
-0x354 taken
-0x36c not_taken
-0x36c taken
-0x3a4 not_taken
-0x3a4 taken
-0x3c8 not_taken
-0x3c8 taken
-0x3d8 not_taken
-0x3d8 taken
-0x3e4 not_taken
-0x3e4 taken
-0x408 not_taken
-0x408 taken
-0x418 not_taken
-0x418 taken
-0x424 not_taken
-0x424 taken
-0x440 not_taken
-0x440 taken
-0x45c not_taken
-0x45c taken
-0x480 not_taken
-0x480 taken
-0x488 not_taken
-0x488 taken
 0x48 taken
-0x4ac not_taken
-0x4ac taken
-0x4b8 not_taken
-0x4b8 taken
-0x4bc not_taken
-0x4bc taken
-0x4e0 not_taken
-0x4e0 taken
-0x4fc not_taken
-0x4fc taken
-0x518 not_taken
-0x518 taken
-0x534 not_taken
-0x534 taken
-0x540 not_taken
-0x540 taken
-0x54c not_taken
-0x54c taken
-0x55c not_taken
-0x55c taken
-0x584 not_taken
-0x584 taken
-0x590 not_taken
-0x590 taken
-0x598 not_taken
-0x598 taken
 0x80 taken
 0x8c taken
-0xdc not_taken
 0xdc taken
+0x114 not_taken
+0x120 taken
+0x120 not_taken
+0x128 taken
+0x128 not_taken
+0x138 taken
+0x138 not_taken
+0x14c taken
+0x14c not_taken
+0x154 taken
+0x154 not_taken
+0x160 taken
+0x160 not_taken
+0x168 taken
+0x168 not_taken
+0x178 taken
+0x178 not_taken
+0x180 taken
+0x180 not_taken
+0x1a0 not_taken
+0x1ac taken
+0x1ac not_taken
+0x1bc taken
+0x1bc not_taken
+0x1d0 taken
+0x1d0 not_taken
+0x1d8 taken
+0x1d8 not_taken
+0x1e4 taken
+0x1e4 not_taken
+0x1ec taken
+0x1ec not_taken
+0x200 taken
+0x200 not_taken
+0x2e0 taken
+0x2e0 not_taken
+0x2e4 taken
+0x2e4 not_taken
+0x30c taken
+0x30c not_taken
+0x31c taken
+0x31c not_taken
+0x324 taken
+0x324 not_taken
+0x32c taken
+0x32c not_taken
+0x334 taken
+0x334 not_taken
+0x33c taken
+0x33c not_taken
+0x344 taken
+0x344 not_taken
+0x34c taken
+0x34c not_taken
+0x354 taken
+0x354 not_taken
+0x36c taken
+0x36c not_taken
+0x3a4 taken
+0x3a4 not_taken
+0x3c8 taken
+0x3c8 not_taken
+0x3d8 taken
+0x3d8 not_taken
+0x3e4 taken
+0x3e4 not_taken
+0x408 taken
+0x408 not_taken
+0x418 taken
+0x418 not_taken
+0x424 taken
+0x424 not_taken
+0x440 taken
+0x440 not_taken
+0x45c taken
+0x45c not_taken
+0x480 taken
+0x480 not_taken
+0x488 taken
+0x488 not_taken
+0x4ac taken
+0x4ac not_taken
+0x4b8 taken
+0x4b8 not_taken
+0x4bc taken
+0x4bc not_taken
+0x4e0 taken
+0x4e0 not_taken
+0x4fc taken
+0x4fc not_taken
+0x518 taken
+0x518 not_taken
+0x534 taken
+0x534 not_taken
+0x540 taken
+0x540 not_taken
+0x54c taken
+0x54c not_taken
+0x55c taken
+0x55c not_taken
+0x584 taken
+0x584 not_taken
+0x590 taken
+0x590 not_taken
+0x598 taken
+0x598 not_taken
+0x688 taken
