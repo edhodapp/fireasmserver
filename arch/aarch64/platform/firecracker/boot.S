@@ -71,11 +71,19 @@
 // queue: page-aligned slots for descriptor table, available ring,
 // used ring. Firecracker zero-inits guest RAM, so idx=0 across
 // every ring at boot.
-.equ VIRTQ_BASE,        0x80400000
+// Virtqueue layout — the base address is allocator-placed via the
+// `virtq` region in regions.yaml (D066 step 5c, hot-tier); x19 is
+// pinned to assigned_addr at kernel entry by memreq_pin_hot.inc.
+// Queue addressing under the migration:
+//   RX queue base = x19 + RX_QUEUE_OFF  (= x19)
+//   TX queue base = x19 + TX_QUEUE_OFF  (= x19 + VIRTQ_STRIDE)
+// Within each queue: + VIRTQ_OFF_{DESC,AVAIL,USED}.
 .equ VIRTQ_STRIDE,      0x3000
 .equ VIRTQ_OFF_DESC,    0x0000
 .equ VIRTQ_OFF_AVAIL,   0x1000
 .equ VIRTQ_OFF_USED,    0x2000
+.equ RX_QUEUE_OFF,      0 * VIRTQ_STRIDE
+.equ TX_QUEUE_OFF,      1 * VIRTQ_STRIDE
 
 // Largest queue size this layout supports: 256 descriptors at
 // 16 B each = 4096 B, filling the descriptor-table page. Device
@@ -83,20 +91,17 @@
 // our allocated memory can back (Virtio 1.2 §4.1.4.3 permits
 // any power-of-2 ≤ QueueNumMax).
 .equ VIRTQ_MAX_SIZE,    0x100
-.equ RX_QUEUE_BASE,     VIRTQ_BASE + 0 * VIRTQ_STRIDE
-.equ TX_QUEUE_BASE,     VIRTQ_BASE + 1 * VIRTQ_STRIDE
 
 // Virtqueue descriptor flag bits (Virtio 1.2 §2.7.5.1).
 .equ VIRTQ_DESC_F_NEXT,     1    // buffer continues via next field
 .equ VIRTQ_DESC_F_WRITE,    2    // device may write (RX buffer)
 .equ VIRTQ_DESC_F_INDIRECT, 4    // descriptor points at a chain
 
-// RX buffer pool. 256 buffers × 2 KiB = 512 KiB. Placed directly
-// above the virtqueue pages (which end at VIRTQ_BASE + 2 × stride
-// = 0x80406000). At 0x80500000 we have comfortable padding; ends
-// at 0x80580000, well within the 128 MiB guest RAM ceiling of
-// 0x88000000.
-.equ RX_BUFFER_BASE,    0x80500000
+// RX buffer pool. 256 buffers × 2 KiB = 512 KiB. Allocator-placed
+// via the `rx_buffer` region in regions.yaml (D066 step 5b);
+// consumers load `__memreq_addr__rx_buffer` for the base address.
+// The per-buffer size stays a .equ constant — protocol-level slot
+// width, not a region.
 .equ RX_BUFFER_SIZE,    0x800     // 2 KiB
 
 // Device Status bit values (Virtio 1.2 §2.1). Bit-position numbering
@@ -127,16 +132,21 @@
 // 2026-04-22 (Gemini LOW on x86_64 program_queue's implicit
 // scope coupling).
 //
-// Parameters (GNU as macro args; addresses are constant
-// expressions evaluated at assembly time via `ldr w, =expr`):
+// Parameters (GNU as macro args; queue base + offset compose
+// at the call site, x19 is the memreq virtq pin per D066 Q-B):
 //   \index        queue index (0 = RX, 1 = TX)
-//   \desc_addr    descriptor table physical address (u32)
-//   \avail_addr   available ring physical address (u32)
-//   \used_addr    used ring physical address (u32)
+//   \queue_off    offset within the virtq region (RX_QUEUE_OFF /
+//                 TX_QUEUE_OFF — 0 and VIRTQ_STRIDE respectively)
 //   \fail_label   label to branch to on QueueReady read-back mismatch
 //
-// Clobbers: w5, w7, x10, flags. Preserves x0, x6, x8, x30.
-.macro program_queue index, desc_addr, avail_addr, used_addr, fail_label
+// x19 carries the allocator-placed VIRTQ_BASE (< 4 GiB by
+// design — guest RAM ceiling is 0x88000000) so the low 32
+// bits in w19 are the full address; `add w7, w19, #imm` gives
+// the 32-bit MMIO value, `add x10, x19, #imm` gives the
+// 64-bit pointer for the ring-header zeros.
+//
+// Clobbers: w5, w7, x10, flags. Preserves x0, x6, x8, x19, x30.
+.macro program_queue index, queue_off, fail_label
     // Select queue \index.
     mov     w5, #\index
     dsb     sy
@@ -156,11 +166,11 @@
     str     w7, [x6, #VIRTIO_MMIO_QUEUE_NUM]
     dsb     sy
 
-    // Descriptor base (low / high). `ldr w, =expr` assembles to
-    // movz + movk for constant < 2^32; the addresses are all
-    // under 0x80580000 so this is always a movz+movk pair, no
-    // literal pool fetch.
-    ldr     w7, =\desc_addr
+    // Descriptor base = x19 + queue_off + VIRTQ_OFF_DESC, low 32
+    // bits to QUEUE_DESC_LOW. All offsets are < 0x6000, well
+    // within imm12-lsl-12 range, so `add w, w, #imm` encodes
+    // as a single instruction.
+    add     w7, w19, #(\queue_off + VIRTQ_OFF_DESC)
     dsb     sy
     str     w7, [x6, #VIRTIO_MMIO_QUEUE_DESC_LOW]
     dsb     sy
@@ -168,7 +178,7 @@
     dsb     sy
 
     // Avail ring base.
-    ldr     w7, =\avail_addr
+    add     w7, w19, #(\queue_off + VIRTQ_OFF_AVAIL)
     dsb     sy
     str     w7, [x6, #VIRTIO_MMIO_QUEUE_DRIVER_LOW]
     dsb     sy
@@ -176,27 +186,20 @@
     dsb     sy
 
     // Used ring base.
-    ldr     w7, =\used_addr
+    add     w7, w19, #(\queue_off + VIRTQ_OFF_USED)
     dsb     sy
     str     w7, [x6, #VIRTIO_MMIO_QUEUE_DEVICE_LOW]
     dsb     sy
     str     wzr, [x6, #VIRTIO_MMIO_QUEUE_DEVICE_HIGH]
     dsb     sy
 
-    // Explicit ring-header zeroing before QueueReady = 1.
-    // Avail header is u16 flags + u16 idx; Used header is same.
-    // Firecracker zero-inits but spec (§2.7.11) doesn't mandate
-    // it; safer to write explicit zeros.
-    //
-    // Load into w10 (not x10): addresses are < 2^32 so `ldr w,
-    // =expr` assembles to movz + movk in-place (no literal-pool
-    // dependency). w10→x10 zero-extends, so `str wzr, [x10]`
-    // still hits the right byte. Keeps the 32-bit addressing
-    // guarantee consistent with the other `ldr w7, =` uses in
-    // the macro.
-    ldr     w10, =\avail_addr
+    // Explicit ring-header zeroing before QueueReady = 1
+    // (Avail header u16 flags + u16 idx; same for Used). Use the
+    // 64-bit register form (`add x10, x19, #imm`) because we
+    // dereference via `str wzr, [x10]`.
+    add     x10, x19, #(\queue_off + VIRTQ_OFF_AVAIL)
     str     wzr, [x10]
-    ldr     w10, =\used_addr
+    add     x10, x19, #(\queue_off + VIRTQ_OFF_USED)
     str     wzr, [x10]
     dsb     sy
 
@@ -292,8 +295,30 @@ _entry:
 
     // Hot-tier register pins emitted by `memreq-codegen` (D066 Q-B
     // aarch64 pool: x19-x25). Loaded AFTER init_memory_layout
-    // populates each region's assigned_addr.
+    // populates each region's assigned_addr. x19 = virtq base.
     .include "memreq_pin_hot.inc"
+
+    // D066 step 5d — switch SP from the linker-reserved bootstrap
+    // stack to the allocator-placed kernel stack. The bootstrap
+    // stack was only needed for init_memory_layout itself
+    // (REQ MR-003); kstack_boot is lifetime=stack so the allocator
+    // reverse-bumped it down from __ram_top per AL-002. AArch64
+    // grows down — SP = assigned_addr + assigned_size.
+    //
+    // PC-relative loads (adrp + add) for the .memreq-internal
+    // labels per the same reason as init_memory_layout: those
+    // labels carry file-offset values, not runtime addresses.
+    //
+    // Safe to switch here: init_memory_layout's return already
+    // consumed its bootstrap-stack frame, and we've not yet made
+    // any post-allocator `bl` that would expect a return address
+    // on the bootstrap stack (the memreq_pin_hot.inc above is
+    // pure register loads).
+    adrp    x10, __memreq_assigned__kstack_boot
+    add     x10, x10, :lo12:__memreq_assigned__kstack_boot
+    ldp     x11, x12, [x10]                  // x11=addr, x12=size
+    add     x11, x11, x12
+    mov     sp, x11
 
     // Emit "LAYOUT-OK\n" — D060 step 4.2 success marker. Reached only
     // when init_memory_layout returned cleanly; the function halts
@@ -532,8 +557,10 @@ _entry:
     // GNU as doesn't process backslash-newline continuation
     // across macro invocations the way NASM does, so each
     // program_queue call sits on a single line.
-    program_queue 0, (RX_QUEUE_BASE + VIRTQ_OFF_DESC), (RX_QUEUE_BASE + VIRTQ_OFF_AVAIL), (RX_QUEUE_BASE + VIRTQ_OFF_USED), .Lqueue_ready_fail
-    program_queue 1, (TX_QUEUE_BASE + VIRTQ_OFF_DESC), (TX_QUEUE_BASE + VIRTQ_OFF_AVAIL), (TX_QUEUE_BASE + VIRTQ_OFF_USED), .Lqueue_ready_fail
+    // x19 (memreq virtq pin) holds VIRTQ_BASE; the macro composes
+    // per-queue desc/avail/used addresses as x19-relative offsets.
+    program_queue 0, RX_QUEUE_OFF, .Lqueue_ready_fail
+    program_queue 1, TX_QUEUE_OFF, .Lqueue_ready_fail
 
     adr     x1, queues_ready_msg
     mov     w2, #(queues_ready_msg_end - queues_ready_msg)
@@ -590,28 +617,36 @@ _entry:
     //   6. Write 0 to VIRTIO_MMIO_QUEUE_NOTIFY (kick RX)
     //
     // Register use inside the loop:
-    //   x11 = RX_QUEUE_BASE (u32 loaded via ldr w11,= + zext to x11)
+    //   x11 = VIRTQ_BASE (= RX_QUEUE_BASE since RX_QUEUE_OFF = 0),
+    //         copied from the x19 memreq pin into x11 so the
+    //         loop body and subsequent AvailRing publish keep
+    //         the existing x11 addressing.
+    //   x9  = __memreq_addr__rx_buffer (cold-tier lookup,
+    //         loaded once outside the loop and added per-iter)
     //   x10 = loop counter i (0..255)
     //   x12 = descriptor entry pointer
     //   x13 = buffer physical address
     //   x14, x15 = scratch
     // None live across the subsequent emit_bytes call.
-    ldr     w11, =RX_QUEUE_BASE
-    // Hoist RX_BUFFER_BASE out of the loop; we add the per-iter
-    // offset on each pass. Saves 256 redundant movz+movk pairs
-    // at init time.
-    ldr     w9, =RX_BUFFER_BASE
+    mov     x11, x19
+    // Cold-tier rx_buffer lookup. PC-relative load of the
+    // __memreq_addr__rx_buffer symbol (file-offset domain on
+    // aarch64 per the linker-script convention), then ldr to
+    // pick up the allocator-written assigned_addr value. Hoisted
+    // out of the loop; per-iter cost stays one add.
+    adrp    x9, __memreq_addr__rx_buffer
+    add     x9, x9, :lo12:__memreq_addr__rx_buffer
+    ldr     x9, [x9]
     mov     x10, xzr
 
 .Lrx_fill_loop:
-    // desc[i] at RX_QUEUE_BASE + VIRTQ_OFF_DESC + 16*i.
-    // (VIRTQ_OFF_DESC = 0 so the add is a no-op; left explicit
-    // for symmetry with avail/used ring addressing below.)
+    // desc[i] at x11 + VIRTQ_OFF_DESC + 16*i (VIRTQ_OFF_DESC = 0;
+    // left implicit in the lsl + add below).
     lsl     x12, x10, #4
     add     x12, x11, x12
 
-    // buffer_i = RX_BUFFER_BASE + 2048*i. w9 holds the hoisted
-    // base; x14 is the per-iter byte offset.
+    // buffer_i = __memreq_addr__rx_buffer + 2048*i. x9 holds the
+    // pre-loaded base; x14 is the per-iter byte offset.
     lsl     x14, x10, #11
     add     x13, x9, x14
 
