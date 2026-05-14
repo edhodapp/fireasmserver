@@ -32,6 +32,8 @@
 #     reflect that the kernel-side tracer doesn't visit them.
 
 0x48 taken
+
+0x48 taken
 0x80 taken
 0x8c taken
 0xdc taken
@@ -141,4 +143,4 @@
 0x590 not_taken
 0x598 taken
 0x598 not_taken
-0x688 taken
+0x690 taken

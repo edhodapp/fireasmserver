@@ -265,16 +265,22 @@ def _emit_one_record_aarch64(region: RegionDecl) -> str:
 
 
 def _emit_one_pin_aarch64(slot: str, region: RegionDecl) -> str:
-    """Emit one `ldr xN, =assigned; ldr xN, [xN]` pin.
+    """Emit one PC-relative pin: `adrp+add` for the symbol address,
+    then `ldr` to pick up the allocator-written assigned_addr value.
 
-    First instruction loads the symbol's address into the slot;
-    second dereferences to pick up the allocator-written addr.
-    GNU as resolves `ldr xN, =sym` via the literal pool — an 8-byte
-    qword (the symbol's 64-bit address) placed at the next `.ltorg`
-    or end of the current section.
+    PC-relative (not `ldr xN, =sym`) is load-bearing on aarch64:
+    the firecracker linker script uses `. = 0x0` convention so
+    every label inside .memreq has a link-time value equal to its
+    FILE OFFSET, not its runtime address. `ldr xN, =sym` would put
+    the file offset into xN; the subsequent dereference would
+    bus-fault on unmapped low physical memory. `adrp+add` computes
+    the symbol's address from the current PC, which is correct
+    regardless of the link-time addressing convention.
     """
     return (
-        f"    ldr     {slot}, =__memreq_assigned__{region.name}\n"
+        f"    adrp    {slot}, __memreq_assigned__{region.name}\n"
+        f"    add     {slot}, {slot}, "
+        f":lo12:__memreq_assigned__{region.name}\n"
         f"    ldr     {slot}, [{slot}]"
         f"   // pin {region.name}\n"
     )

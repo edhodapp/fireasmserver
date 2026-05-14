@@ -41,9 +41,26 @@ init_memory_layout:
 
     // Populate the struct. x0 is scratch from here through the
     // call; it's restored from the saved slot before ret.
-    ldr     x0, =__memreq_start
+    //
+    // PC-relative addressing (adrp + add) for __memreq_start /
+    // __memreq_end is load-bearing: the firecracker linker
+    // script uses `. = 0x0` convention so these labels carry a
+    // file-offset value, not a runtime address. `ldr x0, =sym`
+    // would put the file offset (e.g. 0xd90) into x0; the
+    // allocator would then bus-fault dereferencing low physical
+    // memory. `adrp + add` computes the runtime address from
+    // PC, correct regardless of the link-time convention.
+    //
+    // __heap_start and __ram_top come from explicit linker
+    // expressions (linker.ld lines 87, 111-112) that already
+    // include the RAM_BASE + text_offset adjustment, so `ldr
+    // =sym` is correct for those — the symbol's value IS the
+    // runtime address.
+    adrp    x0, __memreq_start
+    add     x0, x0, :lo12:__memreq_start
     str     x0, [sp, #0]
-    ldr     x0, =__memreq_end
+    adrp    x0, __memreq_end
+    add     x0, x0, :lo12:__memreq_end
     str     x0, [sp, #8]
     str     xzr, [sp, #16]              // cpu_values  (unused)
     str     xzr, [sp, #24]              // cpu_count

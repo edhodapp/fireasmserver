@@ -220,7 +220,10 @@ class TestEmitPinsAarch64:
 
     def test_one_hot_region_pins_x19(self) -> None:
         out = emit_pins_aarch64([_region(tier="hot")])
-        assert "ldr     x19, =__memreq_assigned__rx_buffer" in out
+        assert "adrp    x19, __memreq_assigned__rx_buffer" in out
+        assert (
+            "add     x19, x19, :lo12:__memreq_assigned__rx_buffer"
+        ) in out
         assert "ldr     x19, [x19]" in out
 
     def test_second_hot_region_pins_x20(self) -> None:
@@ -228,8 +231,8 @@ class TestEmitPinsAarch64:
             _region(name="a", tier="hot"),
             _region(name="b", tier="hot"),
         ])
-        assert "ldr     x19, =__memreq_assigned__a" in out
-        assert "ldr     x20, =__memreq_assigned__b" in out
+        assert "adrp    x19, __memreq_assigned__a" in out
+        assert "adrp    x20, __memreq_assigned__b" in out
 
     def test_hot_count_over_pool_raises(self) -> None:
         # aarch64 pool has 7 slots; 8 hot regions must raise.
@@ -246,4 +249,4 @@ class TestEmitPinsAarch64:
         ]
         out = emit_pins_aarch64(regions)
         for slot in ("x19", "x20", "x21", "x22", "x23", "x24", "x25"):
-            assert f"ldr     {slot}, =" in out
+            assert f"adrp    {slot}, __memreq_assigned__" in out
