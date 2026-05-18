@@ -4,27 +4,36 @@
 # AArch64 Firecracker tracer bullet.
 #
 # Builds arch/aarch64/platform/firecracker/guest.bin on the laptop,
-# stages it on the Pi via scp, runs Firecracker with a minimal JSON
-# config, captures serial output, and verifies the expected "READY"
-# marker appears within the timeout.
+# ensures tap0 exists on the Pi (ephemeral or pre-persistent), stages
+# the guest binary, runs Firecracker on the Pi with virtio-net wired
+# to tap0, pulls the serial log back, and validates the L2-init
+# marker chain through TX:RECLAIMED.
 #
-# This is the first end-to-end proof that:
-#   laptop ↔ Pi 5 bridge (D024)
-#   SSH + passwordless sudo (D023)
-#   apt-cacher-ng package flow (D035)
-#   Pi 5 kernel with CONFIG_KVM=y (D023/D033)
-#   Firecracker installed on Pi (D037)
-#   aarch64 boot stub (arch/aarch64)
-# are all wired up correctly. If this script exits 0, the pipeline is live.
+# This script asserts the same marker sequence x86_64/firecracker
+# does in run_local.sh — READY → VIRTIO:OK → STATUS:DRIVER →
+# FEATURES:OK → QUEUES:RX/TX → QUEUES:READY → DRIVER_OK →
+# RX:POPULATED → RX:FRAME or RX:TIMEOUT (either is a PASS for
+# VIO-R-003/004) → optionally RX:RETURNED + TX:SUBMITTED +
+# TX:RECLAIMED on the RX:FRAME path.
 #
-# Pi stays up throughout — no SD handling, no image rebuild.
+# Pi-side prereqs: SSH key auth (D023), passwordless sudo for the
+# tap0 setup (D023), Firecracker v1.15.1 (D037).
 
 set -euo pipefail
 
 PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
-TIMEOUT="${TIMEOUT:-10}"  # seconds to wait for READY before giving up
+TIMEOUT="${TIMEOUT:-60}"     # aarch64 needs more wall clock than the
+                             # laptop x86_64 path — dsb sy overhead
+                             # in the RX/TX poll loops dominates
+                             # (~15-25s wall to complete 100M iters
+                             # on Cortex-A76). H5 (fence audit) will
+                             # narrow these and let this drop. With
+                             # SIGTERM landing mid-poll, Firecracker
+                             # shutdown returns descriptors with
+                             # used_len=0 / num_bufs=0 — looks like a
+                             # protocol violation but is just a race.
 READY_MARKER="${READY_MARKER:-READY}"
 
 if [[ $EUID -eq 0 ]]; then
@@ -43,6 +52,33 @@ SSH_OPTS=(
 REPO_ROOT="$(realpath -m "$(cd "$(dirname "$0")/../.." && pwd)")"
 cd "$REPO_ROOT"
 
+TMPDIR="$(mktemp -d)"
+PI_TMP=""
+PI_TAP_CREATED=0
+
+cleanup() {
+    if [[ -n "$PI_TMP" ]]; then
+        if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+                "rm -rf '$PI_TMP'" 2>/dev/null; then
+            echo "--- cleanup: removed $PI_USER@$PI_HOST:$PI_TMP ---"
+        else
+            echo "--- cleanup: could not reach Pi to remove $PI_TMP ---"
+        fi
+    fi
+    if [[ "$PI_TAP_CREATED" == "1" ]]; then
+        if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+                "sudo ip link del tap0" 2>/dev/null; then
+            echo "--- cleanup: removed ephemeral tap0 on Pi ---"
+        fi
+    fi
+    if [[ -d "$TMPDIR" ]]; then
+        rm -rf "$TMPDIR"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+SERIAL="$TMPDIR/serial.log"
+
 echo "=== AArch64 Firecracker tracer bullet ==="
 echo "  Pi:            $PI_USER@$PI_HOST"
 echo "  ready-marker:  $READY_MARKER"
@@ -60,41 +96,53 @@ GUEST_BIN="arch/aarch64/build/firecracker/guest.bin"
 }
 echo "    $(stat -c '%n (%s bytes)' "$GUEST_BIN")"
 
-### 2. Stage a fresh workdir on the Pi ##############################
+### 2. Ensure tap0 on the Pi ########################################
+# Mirror laptop run_local.sh's pre-persistent / ephemeral pattern.
+# Pre-persistent: user (or a boot helper) created tap0 once with
+# `sudo ip tuntap add dev tap0 mode tap user $USER && sudo ip link
+# set tap0 up`; subsequent runs reuse it without touching sudo.
+# Ephemeral: tap0 missing → we create it via sudo (D023 grants
+# passwordless sudo for this), record state, and tear it down in
+# cleanup.
+echo "--- ensuring tap0 on Pi ---"
+PI_TAP_STATE=$(ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
+    set -u
+    if [[ -d /sys/class/net/tap0 ]]; then
+        echo 'reused'
+    else
+        sudo ip tuntap add dev tap0 mode tap user '$PI_USER' >&2 || exit 1
+        sudo ip link set tap0 up >&2 || exit 1
+        echo 'ephemeral'
+    fi
+")
+case "$PI_TAP_STATE" in
+    reused)     echo "    tap0 on Pi exists — reusing" ;;
+    ephemeral)  echo "    tap0 on Pi created (ephemeral; will tear down)"
+                PI_TAP_CREATED=1 ;;
+    *)
+        echo "ERROR: unexpected tap0 setup state on Pi: '$PI_TAP_STATE'" >&2
+        exit 1
+        ;;
+esac
+
+### 3. Stage a fresh workdir on the Pi ##############################
 PI_TMP="$(ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" 'mktemp -d /tmp/fireasm-tracer.XXXXXXXX')"
 [[ "$PI_TMP" =~ ^/tmp/fireasm-tracer\.[A-Za-z0-9]+$ ]] || {
     echo "ERROR: Pi returned unexpected mktemp -d path: '$PI_TMP'" >&2
     exit 1
 }
-
-cleanup() {
-    # Best-effort: if SSH is down or the Pi rebooted mid-run, we still
-    # want the script to exit; a stale /tmp/fireasm-tracer.*/ on the Pi
-    # is a minor leak, not a crisis. Next run of this script or any
-    # boot-time /tmp sweep handles it.
-    if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
-            "rm -rf '$PI_TMP'" 2>/dev/null; then
-        echo "--- cleanup: removed $PI_USER@$PI_HOST:$PI_TMP ---"
-    else
-        echo "--- cleanup: could not reach Pi to remove $PI_TMP (Pi may be down) ---"
-    fi
-}
-trap cleanup EXIT INT TERM
-
 echo "--- staging on Pi at $PI_TMP ---"
 scp "${SSH_OPTS[@]}" "$GUEST_BIN" "$PI_USER@$PI_HOST:$PI_TMP/guest.bin" >/dev/null
 
-### 3. Write the Firecracker config on the Pi #######################
-# Inline heredoc sent over SSH so the kernel_image_path points at the
-# Pi-side copy. vcpu_count=1 matches the aarch64 stub's MPIDR gate
-# (secondary vCPUs would just park in WFE anyway, but no need to spawn them).
+### 4. Write the Firecracker config on the Pi #######################
+# boot_args must contain "console=" — without that, Firecracker
+# v1.15.1's attach_legacy_devices_aarch64 skips register_mmio_serial
+# and the UART is never mapped. "console=ttyS0" is purely a trigger
+# token; the stub doesn't parse cmdline.
 #
-# boot_args must contain "console=" — without that substring,
-# Firecracker v1.15.1's aarch64 device_manager.attach_legacy_devices_aarch64
-# skips register_mmio_serial and the UART is never mapped. We pass
-# "console=ttyS0" so the serial device registers at SERIAL_MEM_START
-# (0x4000_2000). The stub doesn't parse cmdline, so the token value is
-# purely a trigger.
+# network-interfaces wires virtio-net at the first post-SERIAL MMIO
+# slot (0x4000_3000) so the VIO probe can find it. iface_id is
+# opaque to the guest; host_dev_name binds to the tap on the Pi.
 ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "cat > '$PI_TMP/config.json'" <<EOF
 {
   "boot-source": {
@@ -105,46 +153,145 @@ ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "cat > '$PI_TMP/config.json'" <<EOF
     "vcpu_count": 1,
     "mem_size_mib": 128
   },
-  "drives": []
+  "drives": [],
+  "network-interfaces": [
+    { "iface_id": "eth0", "host_dev_name": "tap0" }
+  ]
 }
 EOF
 
-### 4. Run Firecracker with a time budget; grep for READY ###########
-# Firecracker's aarch64 serial (PL011) output lands on its own stdout
-# with --no-api. We redirect that into serial.log, then grep.
-#
-# The stub WFE-halts forever, so Firecracker never exits on its own —
-# `timeout` sends SIGTERM after $TIMEOUT seconds. timeout exits 124
-# on the timeout path, which we discard (the READY check is authoritative).
-echo "--- launching Firecracker (SIGTERM after ${TIMEOUT}s) ---"
-# Two markers required:
-#   READY      — boot reached the kernel image (existing).
-#   LAYOUT-OK  — D060 step 4.2 success: init_memory_layout returned
-#                cleanly. Halt-on-overflow per its contract, so
-#                reaching the marker proves the allocator pass landed.
-if ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
+### 5. Run Firecracker on the Pi, pull serial.log back ##############
+# Firecracker's framework log lines and per-component errors share
+# the YYYY-MM-DDTHH:MM:SS.NS [tracer:...] prefix and land on stdout
+# mixed with the guest's serial stream. Same race observed laptop-
+# side splitting marker lines mid-emit. Strip them post-hoc, on
+# the laptop, after pulling the raw log back.
+echo "--- launching Firecracker on Pi (SIGTERM after ${TIMEOUT}s) ---"
+ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
     set -u
     cd '$PI_TMP'
-    # Separate Firecracker's own stderr (host-side logger output)
-    # from the guest's serial stream so they can't interleave mid-
-    # marker — observed in laptop x86_64 CI on 2026-04-29 splitting
-    # 'STATUS:DRIVER' across a Firecracker log line. Same race is
-    # latent on the Pi; pre-empt it.
     timeout ${TIMEOUT}s firecracker \
         --no-api \
         --config-file config.json \
         --id tracer \
         > serial.log 2> firecracker-stderr.log || true
-    grep -qE '^${READY_MARKER}\$' serial.log && grep -qE '^LAYOUT-OK\$' serial.log
-"; then
-    echo
-    echo "=== tracer bullet PASSED ==="
-    echo "  '$READY_MARKER' and 'LAYOUT-OK' observed in guest serial within ${TIMEOUT}s."
-    exit 0
-else
+" >/dev/null
+
+scp "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST:$PI_TMP/serial.log" "$SERIAL" >/dev/null
+
+# Strip Firecracker's own log lines (timestamp prefix) so subsequent
+# grep -qE assertions match the guest-emitted marker lines only.
+STRIPPED="$TMPDIR/serial.stripped"
+grep -vE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+' "$SERIAL" > "$STRIPPED" || true
+mv "$STRIPPED" "$SERIAL"
+
+### 6. Validate the marker chain ####################################
+fail() {
     echo
     echo "=== tracer bullet FAILED ==="
-    echo "  '$READY_MARKER' or 'LAYOUT-OK' not observed. Dumping Pi-side serial.log:"
-    ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "sed 's/^/    /' '$PI_TMP/serial.log'" || true
+    echo "  $1"
+    echo "=== serial.log (stripped) ==="
+    sed 's/^/    /' "$SERIAL"
     exit 1
+}
+
+# READY (boot reached the kernel image).
+grep -qE "^${READY_MARKER}\$" "$SERIAL" \
+    || fail "READY marker not observed"
+echo "READY observed — kernel entry verified"
+
+# LAYOUT-OK (D060 step 4.2 allocator pass).
+grep -qE '^LAYOUT-OK$' "$SERIAL" \
+    || fail "LAYOUT-OK not observed (allocator pass did not return cleanly)"
+echo "LAYOUT-OK observed — D060 step 4.2 allocator pass verified"
+
+# VIRTIO:OK (MagicValue == 0x74726976).
+grep -qE '^VIRTIO:OK$' "$SERIAL" \
+    || fail "VIRTIO:OK not observed (virtio-mmio magic mismatch?)"
+echo "VIRTIO:OK observed — virtio-mmio magic verified"
+
+# STATUS:DRIVER (VIO-001..003 init prefix).
+grep -qE '^STATUS:DRIVER$' "$SERIAL" \
+    || fail "STATUS:DRIVER not observed (init prefix VIO-001..003 failed?)"
+echo "STATUS:DRIVER observed — VIO-001..003 init prefix verified"
+
+# FEATURES:OK (VIO-004..006 feature negotiation).
+if ! grep -qE '^FEATURES:OK$' "$SERIAL"; then
+    fail_line=$(grep -E '^FEATURES:FAIL ' "$SERIAL" | head -1 || true)
+    if [[ -n "$fail_line" ]]; then
+        fail "feature negotiation rejected — $fail_line"
+    else
+        fail "FEATURES:OK not observed (guest did not reach VIO-004..006)"
+    fi
 fi
+echo "FEATURES:OK observed — VIO-004..006 feature negotiation verified"
+
+# QUEUES:RX/TX (VIO-007 part 1, discovery).
+queues_line=$(grep -E '^QUEUES:RX=[0-9A-F]{8} TX=[0-9A-F]{8}$' \
+    "$SERIAL" | head -1 || true)
+if [[ -z "$queues_line" ]]; then
+    fail_line=$(grep -E '^QUEUES:FAIL ' "$SERIAL" | head -1 || true)
+    if [[ -n "$fail_line" ]]; then
+        fail "virtqueue discovery — $fail_line"
+    else
+        fail "QUEUES:RX/TX not observed (guest did not reach VIO-007 discovery)"
+    fi
+fi
+echo "${queues_line} observed — VIO-007 discovery verified"
+
+# QUEUES:READY (VIO-007 part 2, init).
+if ! grep -qE '^QUEUES:READY$' "$SERIAL"; then
+    fail_line=$(grep -E '^QUEUES:FAIL queue-not-ready' "$SERIAL" | head -1 || true)
+    if [[ -n "$fail_line" ]]; then
+        fail "virtqueue init — $fail_line"
+    else
+        fail "QUEUES:READY not observed (guest did not reach VIO-007 init)"
+    fi
+fi
+echo "QUEUES:READY observed — VIO-007 init verified"
+
+# DRIVER_OK (VIO-008).
+if ! grep -qE '^DRIVER_OK$' "$SERIAL"; then
+    fail_line=$(grep -E '^DRIVER_OK:FAIL ' "$SERIAL" | head -1 || true)
+    if [[ -n "$fail_line" ]]; then
+        fail "DRIVER_OK transition — $fail_line"
+    else
+        fail "DRIVER_OK not observed (guest did not reach VIO-008)"
+    fi
+fi
+echo "DRIVER_OK observed — VIO-008 live-device transition verified"
+
+# RX:POPULATED (VIO-R-002).
+grep -qE '^RX:POPULATED$' "$SERIAL" \
+    || fail "RX:POPULATED not observed (guest did not reach VIO-R-002)"
+echo "RX:POPULATED observed — VIO-R-002 descriptor fill + notify verified"
+
+# VIO-R-003/004: either RX:FRAME or RX:TIMEOUT is a PASS. Active
+# traffic injection isn't part of this MVP — the polling code path
+# is what's being validated.
+rx_line=$(grep -E '^RX:(FRAME |TIMEOUT$)' "$SERIAL" | head -1 || true)
+[[ -n "$rx_line" ]] \
+    || fail "neither RX:FRAME nor RX:TIMEOUT observed (guest did not reach VIO-R-003/004)"
+echo "RX poll observed — VIO-R-003/004: $rx_line"
+
+# On the RX:FRAME path, RX:RETURNED + TX:SUBMITTED + TX:RECLAIMED
+# must follow. On the RX:TIMEOUT path nothing further runs.
+if grep -qE '^RX:FRAME ' "$SERIAL"; then
+    grep -qE '^RX:RETURNED$' "$SERIAL" \
+        || fail "RX:FRAME observed but RX:RETURNED missing (VIO-R-006/007 cycle incomplete)"
+    echo "RX:RETURNED observed — VIO-R-006/007 return + notify verified"
+
+    grep -qE '^TX:SUBMITTED$' "$SERIAL" \
+        || fail "TX:SUBMITTED not observed (VIO-T-002..005 submit did not run)"
+    echo "TX:SUBMITTED observed — VIO-T-002..005 submit verified"
+
+    tx_line=$(grep -E '^TX:(RECLAIMED |TIMEOUT$)' "$SERIAL" | head -1 || true)
+    [[ -n "$tx_line" ]] \
+        || fail "neither TX:RECLAIMED nor TX:TIMEOUT observed (VIO-T-006 poll did not complete)"
+    echo "TX poll observed — VIO-T-006: $tx_line"
+fi
+
+echo
+echo "=== tracer bullet PASSED ==="
+echo "  Full L2-init marker chain verified."
+exit 0

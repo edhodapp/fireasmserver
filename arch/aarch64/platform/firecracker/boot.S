@@ -276,6 +276,26 @@ _entry:
     ldr     x5, =__bootstrap_stack_top
     mov     sp, x5
 
+    // UART base in x0, preserved across emit_bytes / emit_hex32
+    // calls AND across init_memory_layout (which preserves its
+    // callers' state by contract). Set BEFORE the first emit so
+    // READY lands before the allocator pass — cross-arch parity
+    // with x86_64, whose PVH [bits 32] prologue emits READY before
+    // mode-switching into kernel_main_64. On aarch64 there's no
+    // mode-switch constraint, so the ordering is a free choice;
+    // emit READY first to keep the rule "READY is the earliest
+    // reachable marker" intact across both arches.
+    movz    x0, #0x4000, lsl #16
+    movk    x0, #0x2000              // x0 = UART_BASE
+
+    // Emit "READY\n" — kernel image started executing. If
+    // init_memory_layout ever hangs (overflow halt today, future
+    // regression could deadlock), READY's prior emission marks
+    // the boundary for the harness.
+    adr     x1, ready_msg
+    mov     w2, #(ready_msg_end - ready_msg)
+    bl      emit_bytes
+
     // Run the init-time static memory allocator (D060 step 4.2).
     // Pre-bootstrap-stack-safe contract: callee may use SP it was
     // handed, must not assume a kernel boot stack is in place. With
@@ -283,14 +303,6 @@ _entry:
     // the wire-up exists so the call site stops being a no-op the
     // moment a module declares a region (step 5). Symmetric to the
     // x86_64 platforms once D062's mode switch lands.
-    // UART base in x0, preserved across emit_bytes / emit_hex32 calls.
-    // Set BEFORE bl init_memory_layout so we can emit LAYOUT-OK
-    // immediately on return (D060 step 4.2 success signal). emit_bytes
-    // doesn't write x0; init_memory_layout doesn't either (preserves
-    // its callers' state by contract).
-    movz    x0, #0x4000, lsl #16
-    movk    x0, #0x2000              // x0 = UART_BASE
-
     bl      init_memory_layout
 
     // Hot-tier register pins emitted by `memreq-codegen` (D066 Q-B
@@ -326,11 +338,6 @@ _entry:
     // can assert on this to know the allocator pass landed.
     adr     x1, layout_ok_msg
     mov     w2, #(layout_ok_msg_end - layout_ok_msg)
-    bl      emit_bytes
-
-    // Emit "READY\n".
-    adr     x1, ready_msg
-    mov     w2, #(ready_msg_end - ready_msg)
     bl      emit_bytes
 
     // --- VIRTIO probe ---
@@ -691,6 +698,232 @@ _entry:
     adr     x1, rx_populated_msg
     mov     w2, #(rx_populated_msg_end - rx_populated_msg)
     bl      emit_bytes
+
+    // --- VIO-R-003/004: poll RX Used Ring for first completion ---
+    // Mirrors x86_64 boot.S lines 657-732 in aarch64 idioms.
+    //
+    // Block-local register allocation across this and the subsequent
+    // TX submit/reclaim sub-block. x20-x25 are AAPCS64 callee-saved,
+    // so they survive emit_bytes / emit_hex32 calls without stack
+    // spilling. Cleaner than x86_64's push/pop staging because
+    // aarch64 has more callee-saved GPRs to spend.
+    //
+    //   x19 = RX virtq base (memreq hot-tier pin, pre-existing)
+    //   x6  = VIRTIO_MMIO_BASE (pre-existing)
+    //   x0  = UART base (pre-existing)
+    //   x20 = id from used ring (consumed across RX:FRAME emit,
+    //         then reused across TX:RECLAIMED emit)
+    //   x21 = used_len from used ring (RX then TX)
+    //   x22 = hdr_len (RX only)
+    //   x23 = num_buffers (RX only)
+    //   x24 = next_avail shadow (analog of x86_64 r14); initialised
+    //         to N after the RX populate completes since AvailRing.idx
+    //         was just published as N. Advances on each return.
+    //   x25 = mask = N - 1; AvailRing slot = next_avail & mask.
+    //         Valid because VIRTQ_MAX_SIZE is a power of 2 per
+    //         Virtio 1.2 §4.1.4.3.
+    //   x26 = RX UsedRing base (x19 + VIRTQ_OFF_USED). Hoisted as a
+    //         callee-saved pin because VIRTQ_OFF_USED = 0x2000 puts
+    //         the USED-header fields (+2, +4, +8) past the scaled
+    //         LDRH/LDR imm12 windows from x19 directly.
+    //   x27 = TX UsedRing base (x19 + TX_QUEUE_OFF + VIRTQ_OFF_USED).
+    //         Same reason; computed before the TX poll loop.
+    mov     w24, #VIRTQ_MAX_SIZE
+    mov     w25, #(VIRTQ_MAX_SIZE - 1)
+    add     x26, x19, #VIRTQ_OFF_USED
+
+    ldr     w9, =100000000               // wait budget (matches x86_64)
+.Lrx_wait_loop:
+    yield
+    dsb     sy
+    ldrh    w10, [x26, #2]               // UsedRing.idx
+    dsb     sy
+    cbnz    w10, .Lrx_received
+    subs    w9, w9, #1
+    b.ne    .Lrx_wait_loop
+
+    adr     x1, rx_timeout_msg
+    mov     w2, #(rx_timeout_msg_end - rx_timeout_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Lrx_received:
+    // UsedRing.ring[0]: id (u32 @ +4), len (u32 @ +8).
+    dsb     sy
+    ldr     w20, [x26, #4]               // id
+    ldr     w21, [x26, #8]               // used_len
+    dsb     sy
+
+    // Bounds check id < VIRTQ_MAX_SIZE.
+    cmp     w20, #VIRTQ_MAX_SIZE
+    b.hs    .Lrx_bad_id_fail
+
+    // Buffer addr: __memreq_addr__rx_buffer + id * 2048 (cold-tier
+    // lookup). One load per frame on the completion hot path; could
+    // become a hot-tier pin later (would require extending the
+    // x86_64 budget too — see #30).
+    adrp    x9, __memreq_addr__rx_buffer
+    add     x9, x9, :lo12:__memreq_addr__rx_buffer
+    ldr     x9, [x9]                              // pool base
+    lsl     x10, x20, #11                         // id * 2048
+    add     x9, x9, x10                           // buffer addr
+
+    // Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
+    dsb     sy
+    ldrh    w22, [x9, #2]                         // hdr_len
+    ldrh    w23, [x9, #10]                        // num_buffers
+    dsb     sy
+
+    // Validate num_buffers == 1 under MVP no-MRG_RXBUF policy.
+    cmp     w23, #1
+    b.ne    .Lrx_num_bufs_fail
+
+    // Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
+    adr     x1, rx_frame_prefix_msg
+    mov     w2, #(rx_frame_prefix_msg_end - rx_frame_prefix_msg)
+    bl      emit_bytes
+    mov     w5, w20
+    bl      emit_hex32
+
+    adr     x1, rx_frame_hdr_len_msg
+    mov     w2, #(rx_frame_hdr_len_msg_end - rx_frame_hdr_len_msg)
+    bl      emit_bytes
+    mov     w5, w22
+    bl      emit_hex32
+
+    adr     x1, rx_frame_num_bufs_msg
+    mov     w2, #(rx_frame_num_bufs_msg_end - rx_frame_num_bufs_msg)
+    bl      emit_bytes
+    mov     w5, w23
+    bl      emit_hex32
+
+    adr     x1, rx_frame_used_len_msg
+    mov     w2, #(rx_frame_used_len_msg_end - rx_frame_used_len_msg)
+    bl      emit_bytes
+    mov     w5, w21
+    bl      emit_hex32
+
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+
+    // --- VIO-R-006/007: return consumed descriptor + notify ---
+    // Slot = next_avail mod N via mask. AvailRing.ring[slot] = id.
+    and     w10, w24, w25                         // slot = x24 & mask
+    add     x11, x19, #VIRTQ_OFF_AVAIL
+    add     x11, x11, #4                          // skip flags + idx
+    strh    w20, [x11, x10, lsl #1]               // ring[slot] = id
+
+    // Barrier before idx bump.
+    dsb     sy
+
+    // Advance shadow + publish AvailRing.idx.
+    add     w24, w24, #1
+    add     x11, x19, #VIRTQ_OFF_AVAIL
+    strh    w24, [x11, #2]
+
+    // Barrier before notify.
+    dsb     sy
+
+    // Kick RX (queue 0).
+    str     wzr, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
+    dsb     sy
+
+    adr     x1, rx_returned_msg
+    mov     w2, #(rx_returned_msg_end - rx_returned_msg)
+    bl      emit_bytes
+
+    // --- VIO-T-002..005: submit one canary Ethernet frame on TX ---
+    // TX queue base = x19 + TX_QUEUE_OFF. Descriptor[0] points at
+    // tx_test_pkt with len = tx_test_pkt_end - tx_test_pkt, flags = 0
+    // (device-readable, no F_WRITE since TX buffers are driver→device).
+    //
+    // x11 holds the TX descriptor base across the descriptor write.
+    // Subsequent AvailRing accesses use a second temporary in x12
+    // since TX_QUEUE_OFF + VIRTQ_OFF_AVAIL = 0x4000 exceeds the
+    // ADD 12-bit-with-LSL-12 immediate range from x19 in one step.
+    adrp    x10, tx_test_pkt
+    add     x10, x10, :lo12:tx_test_pkt           // runtime addr (< 4 GiB)
+    add     x11, x19, #TX_QUEUE_OFF               // TX queue base (0x3000 = 3<<12)
+    str     w10, [x11, #0]                        // desc.addr_lo
+    str     wzr, [x11, #4]                        // desc.addr_hi
+    mov     w12, #(tx_test_pkt_end - tx_test_pkt)
+    str     w12, [x11, #8]                        // desc.len
+    strh    wzr, [x11, #12]                       // desc.flags = 0
+    strh    wzr, [x11, #14]                       // desc.next  = 0
+
+    // TX AvailRing base = TX_QUEUE_BASE + VIRTQ_OFF_AVAIL.
+    add     x12, x11, #VIRTQ_OFF_AVAIL            // 0x1000 = 1<<12
+
+    // AvailRing.ring[0] = 0 (single-desc head). Slot at +4 past
+    // flags + idx header.
+    strh    wzr, [x12, #4]
+
+    // Barrier before idx bump.
+    dsb     sy
+
+    // Publish TX AvailRing.idx = 1 at +2.
+    mov     w13, #1
+    strh    w13, [x12, #2]
+
+    // Barrier before notify.
+    dsb     sy
+
+    // Kick TX (queue 1).
+    str     w13, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
+    dsb     sy
+
+    adr     x1, tx_submitted_msg
+    mov     w2, #(tx_submitted_msg_end - tx_submitted_msg)
+    bl      emit_bytes
+
+    // --- VIO-T-006: poll TX Used Ring for completion ---
+    // x27 = TX UsedRing base; offsets +2/+4/+8 then fit imm12.
+    // Computed via two adds since TX_QUEUE_OFF + VIRTQ_OFF_USED =
+    // 0x5000 doesn't fit a single ADD imm12-with-LSL-12 from x19.
+    add     x27, x19, #TX_QUEUE_OFF
+    add     x27, x27, #VIRTQ_OFF_USED
+
+    ldr     w9, =100000000
+.Ltx_wait_loop:
+    yield
+    dsb     sy
+    ldrh    w10, [x27, #2]               // TX UsedRing.idx
+    dsb     sy
+    cbnz    w10, .Ltx_reclaimed
+    subs    w9, w9, #1
+    b.ne    .Ltx_wait_loop
+
+    adr     x1, tx_timeout_msg
+    mov     w2, #(tx_timeout_msg_end - tx_timeout_msg)
+    bl      emit_bytes
+    b       .Lflush
+
+.Ltx_reclaimed:
+    dsb     sy
+    ldr     w20, [x27, #4]               // id
+    ldr     w21, [x27, #8]               // used_len
+    dsb     sy
+
+    cmp     w20, #VIRTQ_MAX_SIZE
+    b.hs    .Ltx_bad_id_fail
+
+    // Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX
+    adr     x1, tx_reclaimed_prefix_msg
+    mov     w2, #(tx_reclaimed_prefix_msg_end - tx_reclaimed_prefix_msg)
+    bl      emit_bytes
+    mov     w5, w20
+    bl      emit_hex32
+
+    adr     x1, tx_used_len_msg
+    mov     w2, #(tx_used_len_msg_end - tx_used_len_msg)
+    bl      emit_bytes
+    mov     w5, w21
+    bl      emit_hex32
+
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
     b       .Lflush
 
 .Ldriver_ok_fail:
@@ -781,6 +1014,15 @@ _entry:
 
 .Lvirtio_fail:
     // Emit "VIRTIO:FAIL magic=XXXXXXXX\n".
+    // Falls through to .Lflush deliberately — a MagicValue
+    // mismatch leaves the device's register layout unverified,
+    // so a VIRTIO_STATUS_FAILED write through .Lset_failed
+    // would be blind. The explicit `b .Lflush` below is load-
+    // bearing because subsequent fail-path labels were inserted
+    // between this point and .Lflush; without it the path would
+    // fall into .Lrx_bad_id_fail, emit spurious "RX:FAIL bad_id="
+    // with whatever happened to be in w20, then hit .Lset_failed
+    // via the wrong door.
     adr     x1, virtio_fail_msg
     mov     w2, #(virtio_fail_msg_end - virtio_fail_msg)
     bl      emit_bytes
@@ -789,6 +1031,48 @@ _entry:
     adr     x1, newline_msg
     mov     w2, #(newline_msg_end - newline_msg)
     bl      emit_bytes
+    b       .Lflush
+
+.Lrx_bad_id_fail:
+    // RX UsedRing.ring[0].id is out of range (>= VIRTQ_MAX_SIZE).
+    // w20 holds the observed id.
+    adr     x1, rx_bad_id_msg
+    mov     w2, #(rx_bad_id_msg_end - rx_bad_id_msg)
+    bl      emit_bytes
+    mov     w5, w20
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lset_failed
+
+.Lrx_num_bufs_fail:
+    // virtio_net_hdr.num_buffers != 1 — MRG_RXBUF wasn't
+    // negotiated under the VIO-F-001 MVP subset, so a multi-
+    // buffer RX is a protocol-level violation. w23 holds the
+    // observed value.
+    adr     x1, rx_num_bufs_msg
+    mov     w2, #(rx_num_bufs_msg_end - rx_num_bufs_msg)
+    bl      emit_bytes
+    mov     w5, w23
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lset_failed
+
+.Ltx_bad_id_fail:
+    // TX UsedRing.ring[0].id is out of range. w20 holds the
+    // observed id. Symmetric with .Lrx_bad_id_fail.
+    adr     x1, tx_bad_id_msg
+    mov     w2, #(tx_bad_id_msg_end - tx_bad_id_msg)
+    bl      emit_bytes
+    mov     w5, w20
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lset_failed
 
 .Lflush:
     dsb     sy
@@ -964,10 +1248,68 @@ driver_ok_fail_msg_end:
 rx_populated_msg:
     .ascii  "RX:POPULATED\n"
 rx_populated_msg_end:
+rx_timeout_msg:
+    .ascii  "RX:TIMEOUT\n"
+rx_timeout_msg_end:
+
+rx_frame_prefix_msg:
+    .ascii  "RX:FRAME id="
+rx_frame_prefix_msg_end:
+rx_frame_hdr_len_msg:
+    .ascii  " hdr_len="
+rx_frame_hdr_len_msg_end:
+rx_frame_num_bufs_msg:
+    .ascii  " num_bufs="
+rx_frame_num_bufs_msg_end:
+rx_frame_used_len_msg:
+    .ascii  " used_len="
+rx_frame_used_len_msg_end:
+
+rx_bad_id_msg:
+    .ascii  "RX:FAIL bad_id="
+rx_bad_id_msg_end:
+rx_num_bufs_msg:
+    .ascii  "RX:FAIL num_bufs="
+rx_num_bufs_msg_end:
+
+rx_returned_msg:
+    .ascii  "RX:RETURNED\n"
+rx_returned_msg_end:
+
+tx_submitted_msg:
+    .ascii  "TX:SUBMITTED\n"
+tx_submitted_msg_end:
+tx_timeout_msg:
+    .ascii  "TX:TIMEOUT\n"
+tx_timeout_msg_end:
+tx_reclaimed_prefix_msg:
+    .ascii  "TX:RECLAIMED id="
+tx_reclaimed_prefix_msg_end:
+tx_used_len_msg:
+    .ascii  " used_len="
+tx_used_len_msg_end:
+tx_bad_id_msg:
+    .ascii  "TX:FAIL bad_id="
+tx_bad_id_msg_end:
 
 newline_msg:
     .ascii  "\n"
 newline_msg_end:
+
+// Canary Ethernet frame submitted on TX for VIO-T MVP. Layout:
+//   12 B virtio_net_hdr (all zero — no GSO/CSUM features negotiated)
+//   14 B Ethernet header (broadcast dst, local-admin src, EtherType
+//        0x88B5 = IEEE 802.1 local experimental EthType #1)
+//   46 B 0xAB canary payload (pads to the 60-byte Ethernet minimum)
+// Total wire bytes seen by virtio: 72. Frame matches x86_64
+// tx_test_pkt at arch/x86_64/.../boot.S:1178-1184.
+tx_test_pkt:
+    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0          // virtio_net_hdr
+    .byte   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF          // dst MAC broadcast
+    .byte   0x02, 0x00, 0x00, 0x00, 0x00, 0x01          // src MAC local-admin
+    .byte   0x88, 0xB5                                  // EtherType 0x88B5
+    .fill   46, 1, 0xAB                                 // 46-byte canary
+tx_test_pkt_end:
 
 // _image_end is defined in the linker script (placed after both .text
 // and .rodata) so the Image header's image_size covers the entire file.
