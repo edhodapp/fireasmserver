@@ -105,3 +105,116 @@ class TestRegionFile:
                 "regions": [],
                 "spurious": 1,
             })
+
+
+class TestRegionDeclExpressions:
+    """Non-literal size/align — discriminated-union op lists."""
+
+    def test_lit_op_alone(self) -> None:
+        r = RegionDecl.model_validate(_valid_region(
+            size=[{"kind": "lit", "value": 524288}],
+        ))
+        assert isinstance(r.size, list)
+        assert len(r.size) == 1
+
+    def test_cpu_field_resolves(self) -> None:
+        r = RegionDecl.model_validate(_valid_region(
+            size=[{"kind": "cpu", "field": "l1d_line_bytes"}],
+        ))
+        assert isinstance(r.size, list)
+        # field name preserved on the model for round-trip clarity;
+        # encoder converts it to the positional id at emit time.
+        assert r.size[0].field == "l1d_line_bytes"  # type: ignore[union-attr]
+
+    def test_cpu_unknown_field_rejected(self) -> None:
+        with pytest.raises(
+            ValidationError, match="unknown CpuCharacteristics",
+        ):
+            RegionDecl.model_validate(_valid_region(
+                size=[{"kind": "cpu", "field": "no_such_field"}],
+            ))
+
+    def test_tuning_field_resolves(self) -> None:
+        r = RegionDecl.model_validate(_valid_region(
+            align=[{"kind": "tuning", "field": "rx_queue_depth"}],
+        ))
+        assert isinstance(r.align, list)
+        assert r.align[0].field == "rx_queue_depth"  # type: ignore[union-attr]
+
+    def test_tuning_unknown_field_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="unknown TuningProfile"):
+            RegionDecl.model_validate(_valid_region(
+                align=[{"kind": "tuning", "field": "bogus"}],
+            ))
+
+    def test_full_expression_lit_lit_mul(self) -> None:
+        r = RegionDecl.model_validate(_valid_region(
+            size=[
+                {"kind": "lit", "value": 256},
+                {"kind": "lit", "value": 2048},
+                {"kind": "mul"},
+            ],
+        ))
+        assert isinstance(r.size, list)
+        assert len(r.size) == 3
+
+    def test_cpu_mul_alignup_expression(self) -> None:
+        # Realistic shape: cores_sharing_l3 * 4096, aligned up to 4 KiB.
+        r = RegionDecl.model_validate(_valid_region(
+            size=[
+                {"kind": "cpu", "field": "cores_sharing_l3"},
+                {"kind": "lit", "value": 4096},
+                {"kind": "mul"},
+                {"kind": "lit", "value": 4096},
+                {"kind": "align_up"},
+            ],
+        ))
+        assert len(r.size) == 5  # type: ignore[arg-type]
+
+    def test_div_lit_op(self) -> None:
+        r = RegionDecl.model_validate(_valid_region(
+            size=[
+                {"kind": "lit", "value": 4096},
+                {"kind": "div_lit", "divisor": 4},
+            ],
+        ))
+        assert len(r.size) == 2  # type: ignore[arg-type]
+
+    def test_div_lit_zero_rejected(self) -> None:
+        # divisor=0 is meaningless and the VM raises on it — catch
+        # at YAML load instead of letting it reach the interpreter.
+        with pytest.raises(ValidationError):
+            RegionDecl.model_validate(_valid_region(
+                size=[
+                    {"kind": "lit", "value": 4096},
+                    {"kind": "div_lit", "divisor": 0},
+                ],
+            ))
+
+    def test_call_thunk_op(self) -> None:
+        r = RegionDecl.model_validate(_valid_region(
+            size=[{"kind": "call_thunk", "thunk_id": 0x12345678}],
+        ))
+        assert len(r.size) == 1  # type: ignore[arg-type]
+
+    def test_unknown_kind_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            RegionDecl.model_validate(_valid_region(
+                size=[{"kind": "xor"}],
+            ))
+
+    def test_extra_field_on_op_rejected(self) -> None:
+        # `extra="forbid"` on each op model — typos surface clearly.
+        with pytest.raises(ValidationError):
+            RegionDecl.model_validate(_valid_region(
+                size=[{"kind": "lit", "value": 4096, "extra": 1}],
+            ))
+
+    def test_empty_op_list_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="empty op list"):
+            RegionDecl.model_validate(_valid_region(size=[]))
+
+    def test_literal_shortcut_still_works(self) -> None:
+        # Backward-compatible path: integer size unchanged.
+        r = RegionDecl.model_validate(_valid_region(size=4096))
+        assert r.size == 4096

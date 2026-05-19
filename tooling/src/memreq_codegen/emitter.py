@@ -20,10 +20,11 @@ from __future__ import annotations
 from memreq_codegen.encoding import (
     ALIGN_BYTECODE_BYTES,
     SIZE_BYTECODE_BYTES,
+    encode_bytecode,
     encode_lit_bytecode,
     fnv1a_32,
 )
-from memreq_codegen.schema import RegionDecl
+from memreq_codegen.schema import RegionDecl, SizeExpr, to_op
 
 # x86_64 hot-tier register pool from D066 Q-B. The allocator's
 # reverse-bump pointer also uses r15 during init, but the allocator
@@ -54,6 +55,19 @@ _LIFETIME_BYTE = {
 # in arch/x86_64/memory/allocator.S:58. Used by the hot-tier pin
 # emitter when loading via the `__memreq_assigned__<name>` symbol.
 _MR_OFF_ASSIGNED_ADDR_FROM_ASSIGNED = 0
+
+
+def _encode_size_or_align(value: SizeExpr, buffer_bytes: int) -> bytes:
+    """Encode a `size` or `align` (literal int or op list) to wire.
+
+    Centralizes the dispatch on the discriminated `SizeExpr` so
+    each per-arch record emitter stays unaware of whether a given
+    region uses the literal shortcut or the full op-list form.
+    """
+    if isinstance(value, int):
+        return encode_lit_bytecode(value, buffer_bytes)
+    ops = [to_op(op_model) for op_model in value]
+    return encode_bytecode(ops, buffer_bytes)
 
 
 def emit_records_x86_64(regions: list[RegionDecl]) -> str:
@@ -111,8 +125,8 @@ def emit_pins_x86_64(regions: list[RegionDecl]) -> str:
 def _emit_one_record_x86_64(region: RegionDecl) -> str:
     """Emit one 48-byte memreq record as NASM directives."""
     name_hash = fnv1a_32(region.name)
-    size_bc = encode_lit_bytecode(region.size, SIZE_BYTECODE_BYTES)
-    align_bc = encode_lit_bytecode(region.align, ALIGN_BYTECODE_BYTES)
+    size_bc = _encode_size_or_align(region.size, SIZE_BYTECODE_BYTES)
+    align_bc = _encode_size_or_align(region.align, ALIGN_BYTECODE_BYTES)
     lifetime_byte = _LIFETIME_BYTE[region.lifetime]
     writable_byte = 1 if region.writable else 0
     return (
@@ -221,8 +235,8 @@ def emit_pins_aarch64(regions: list[RegionDecl]) -> str:
 def _emit_one_record_aarch64(region: RegionDecl) -> str:
     """Emit one 48-byte memreq record as GNU-as directives."""
     name_hash = fnv1a_32(region.name)
-    size_bc = encode_lit_bytecode(region.size, SIZE_BYTECODE_BYTES)
-    align_bc = encode_lit_bytecode(region.align, ALIGN_BYTECODE_BYTES)
+    size_bc = _encode_size_or_align(region.size, SIZE_BYTECODE_BYTES)
+    align_bc = _encode_size_or_align(region.align, ALIGN_BYTECODE_BYTES)
     lifetime_byte = _LIFETIME_BYTE[region.lifetime]
     writable_byte = 1 if region.writable else 0
     return (

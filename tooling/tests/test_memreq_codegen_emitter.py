@@ -250,3 +250,38 @@ class TestEmitPinsAarch64:
         out = emit_pins_aarch64(regions)
         for slot in ("x19", "x20", "x21", "x22", "x23", "x24", "x25"):
             assert f"adrp    {slot}, __memreq_assigned__" in out
+
+
+class TestNonLiteralExpressionInEmitter:
+    """Non-literal size/align reaches _encode_size_or_align."""
+
+    def test_x86_64_emits_expression_size(self) -> None:
+        # CPU(0) * LIT(1024) — size as an op list, NOT an int.
+        # Wire encoding: OP_CPU(0x03), id 0x00,
+        #                OP_LIT(0x01), 0x00 0x04 0x00 0x00,
+        #                OP_MUL(0x04),
+        #                OP_END(0x00).
+        region = _region(
+            name="cpu_derived",
+            size=[
+                {"kind": "cpu", "field": "l1d_line_bytes"},
+                {"kind": "lit", "value": 1024},
+                {"kind": "mul"},
+            ],
+        )
+        out = emit_records_x86_64([region])
+        # Confirm the encoded bytes land in the NASM db directive
+        # for size_bc. The exact substring is the first three
+        # operands plus zero pad — a quick prefix check is enough.
+        assert "0x03, 0x00, 0x01, 0x00, 0x04, 0x00, 0x00, 0x04, 0x00" in out
+
+    def test_aarch64_emits_expression_align(self) -> None:
+        # TUNING(rx_queue_depth=id 0) — single op on align.
+        # Wire: OP_TUNING(0x02), id 0x00, OP_END(0x00) + 5 zero pad.
+        region = _region(
+            name="tuning_derived",
+            align=[{"kind": "tuning", "field": "rx_queue_depth"}],
+        )
+        out = emit_records_aarch64([region])
+        # GNU-as .byte form for align_bc.
+        assert "0x02, 0x00, 0x00" in out
