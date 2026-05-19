@@ -89,6 +89,29 @@ class TestEncodeLitBytecode:
         with pytest.raises(ValueError):
             encode_lit_bytecode(0x100000000, SIZE_BYTECODE_BYTES)
 
+    def test_golden_bytes_lit_4096_in_size_buffer(self) -> None:
+        # Backward-compat regression test: encode_lit_bytecode(4096,
+        # SIZE_BYTECODE_BYTES) must produce exactly these wire bytes.
+        # Pinned in this test so any refactor of the shortcut path
+        # (or its underlying encode_bytecode) trips here BEFORE
+        # downstream binaries silently drift.
+        expected = bytes([
+            OP_LIT, 0x00, 0x10, 0x00, 0x00,  # LIT 0x00001000
+            OP_END,                           # END
+            # 10 bytes zero pad to fill SIZE_BYTECODE_BYTES (16).
+            0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ])
+        assert encode_lit_bytecode(4096, SIZE_BYTECODE_BYTES) == expected
+        # And the same for the ALIGN buffer width.
+        expected_align = bytes([
+            OP_LIT, 0x00, 0x10, 0x00, 0x00,
+            OP_END,
+            0x00, 0x00,                       # 2 bytes pad to 8
+        ])
+        got_align = encode_lit_bytecode(4096, ALIGN_BYTECODE_BYTES)
+        assert got_align == expected_align
+
 
 class TestOpcodeConstantsParity:
     """Wire-level opcode constants match `memlayout.types.Opcode`.
@@ -163,8 +186,8 @@ class TestEncodeBytecode:
             OP_LIT, 0x40, 0x00, 0x00, 0x00,
             OP_MUL,
             OP_LIT, 0x00, 0x10, 0x00, 0x00,
-        ]) + bytes()
-        # The above shows the OPs; check ALIGN_UP + END land at +13/+14
+        ])
+        # ALIGN_UP + END land at +13/+14.
         assert out[13] == OP_ALIGN_UP
         assert out[14] == OP_END
 

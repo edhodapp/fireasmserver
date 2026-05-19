@@ -113,9 +113,21 @@ def _check_payload_range(opcode: int, payload: int, width: int) -> None:
     Width is bytes (1 or 4 for the current opcode set). The asm
     interpreters consume exactly this many bytes after the opcode
     byte, so a Python-side range check catches authoring mistakes
-    before they reach the VM.
+    before they reach the VM. Explicit width dispatch — any future
+    op width must be added here, never fall through to a default.
     """
-    mask = _U8_MASK if width == 1 else _U32_MASK
+    if width == 1:
+        mask = _U8_MASK
+    elif width == 4:
+        mask = _U32_MASK
+    else:  # pragma: no cover
+        # Defensive: every entry in _PAYLOAD_WIDTH today is 0/1/4.
+        # Reachable only via a dispatch-table edit that adds a new
+        # width without updating this branch.
+        raise ValueError(
+            f"opcode 0x{opcode:02x} has unsupported payload "
+            f"width {width}"
+        )
     if not 0 <= payload <= mask:
         raise ValueError(
             f"opcode 0x{opcode:02x} payload {payload} out of "

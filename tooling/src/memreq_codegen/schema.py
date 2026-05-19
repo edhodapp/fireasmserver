@@ -48,18 +48,69 @@ from memreq_codegen.encoding import (
 # with a letter to avoid leading-digit identifiers.
 _NAME_PATTERN = r"^[a-z][a-z0-9_]*$"
 
-# Snapshot the field order from the layered models so an unknown
-# field name in regions.yaml fails validation at load time rather
-# than at codegen time. The id a CPU/TUNING opcode emits IS this
-# index — reordering CpuCharacteristics or TuningProfile is a
-# binary-incompatible change (already documented on those models).
+# Pinned expected field order. Mirrors the declaration order in
+# `tooling/src/memlayout/models.py`; the wire ABI binds CPU/TUNING
+# opcode u8 ids to these positions, so a silent reorder upstream
+# would mis-encode every region using these ops. The asserts below
+# catch drift at codegen-import time rather than letting it surface
+# as a runtime LAYOUT-INVALID under the asm interpreter.
+_EXPECTED_CPU_FIELDS: tuple[str, ...] = (
+    "l1d_line_bytes",
+    "l1d_bytes",
+    "l1i_bytes",
+    "l2_bytes",
+    "l3_bytes_per_cluster",
+    "cores_sharing_l2",
+    "cores_sharing_l3",
+    "hw_prefetcher_stride_lines",
+    "detected_model_id",
+)
+_EXPECTED_TUNING_FIELDS: tuple[str, ...] = (
+    "rx_queue_depth",
+    "tx_queue_depth",
+    "rx_buffer_bytes_hint",
+    "actor_pool_size_per_core",
+    "tls_session_cache_entries",
+    "worker_core_count",
+)
+
+
+def _check_field_order(
+    label: str,
+    expected: tuple[str, ...],
+    actual: tuple[str, ...],
+) -> None:
+    if actual != expected:  # pragma: no cover
+        # Defensive: reachable only via an actual upstream reorder
+        # of CpuCharacteristics or TuningProfile in
+        # tooling/src/memlayout/models.py. The error path is the
+        # whole point of this guard — there's no value in
+        # synthetically forcing it from a test.
+        raise RuntimeError(
+            f"{label} field order drifted from codegen's pinned "
+            f"snapshot. Pinned: {expected}. Actual: {actual}. "
+            f"Reordering this model is a wire-incompatible change; "
+            f"update _EXPECTED_{label.upper()}_FIELDS only after "
+            f"auditing every regions.yaml that uses {label} ops."
+        )
+
+
+_check_field_order(
+    "cpu",
+    _EXPECTED_CPU_FIELDS,
+    tuple(CpuCharacteristics.model_fields.keys()),
+)
+_check_field_order(
+    "tuning",
+    _EXPECTED_TUNING_FIELDS,
+    tuple(TuningProfile.model_fields.keys()),
+)
+
 _CPU_FIELD_IDS: dict[str, int] = {
-    name: idx
-    for idx, name in enumerate(CpuCharacteristics.model_fields.keys())
+    name: idx for idx, name in enumerate(_EXPECTED_CPU_FIELDS)
 }
 _TUNING_FIELD_IDS: dict[str, int] = {
-    name: idx
-    for idx, name in enumerate(TuningProfile.model_fields.keys())
+    name: idx for idx, name in enumerate(_EXPECTED_TUNING_FIELDS)
 }
 
 
