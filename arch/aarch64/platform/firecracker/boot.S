@@ -893,11 +893,11 @@ _entry:
     bl      emit_bytes
 
     // --- VIO-T-006: poll TX Used Ring for completion ---
-    // x27 = TX UsedRing base; offsets +2/+4/+8 then fit imm12.
-    // Computed via two adds since TX_QUEUE_OFF + VIRTQ_OFF_USED =
-    // 0x5000 doesn't fit a single ADD imm12-with-LSL-12 from x19.
-    add     x27, x19, #TX_QUEUE_OFF
-    add     x27, x27, #VIRTQ_OFF_USED
+    // x27 = TX UsedRing base; offsets +2/+4/+8 then fit LDR/LDRH
+    // scaled imm12. The composed constant TX_QUEUE_OFF +
+    // VIRTQ_OFF_USED = 0x5000 = 5<<12 fits the ADD imm12-with-
+    // LSL-12 encoding (imm12=5, shift=12) in one instruction.
+    add     x27, x19, #(TX_QUEUE_OFF + VIRTQ_OFF_USED)
 
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
