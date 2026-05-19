@@ -305,10 +305,19 @@ if grep -qE '^RX:FRAME ' "$SERIAL"; then
         || fail "TX:SUBMITTED not observed (VIO-T-002..005 submit did not run)"
     echo "TX:SUBMITTED observed — VIO-T-002..005 submit verified"
 
-    tx_line=$(grep -E '^TX:(RECLAIMED |TIMEOUT$)' "$SERIAL" | head -1 || true)
-    [[ -n "$tx_line" ]] \
-        || fail "neither TX:RECLAIMED nor TX:TIMEOUT observed (VIO-T-006 poll did not complete)"
-    echo "TX poll observed — VIO-T-006: $tx_line"
+    # VIO-T-006: TX:RECLAIMED is required once TX:SUBMITTED has fired —
+    # the device must process the submitted descriptor. TX:TIMEOUT and
+    # TX:FAIL are both failures (Codex P2 finding on H1 push range).
+    tx_line=$(grep -E '^TX:RECLAIMED ' "$SERIAL" | head -1 || true)
+    if [[ -z "$tx_line" ]]; then
+        fail_line=$(grep -E '^TX:(TIMEOUT$|FAIL )' "$SERIAL" | head -1 || true)
+        if [[ -n "$fail_line" ]]; then
+            fail "TX failed to reclaim — $fail_line"
+        else
+            fail "TX:RECLAIMED not observed (VIO-T-006 poll did not complete)"
+        fi
+    fi
+    echo "TX completion observed — VIO-T-006: $tx_line"
 fi
 
 echo

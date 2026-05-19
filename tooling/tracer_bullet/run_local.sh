@@ -376,10 +376,12 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         # VIO-T-002..006 (TX submit + reclaim). Only expected on
         # the RX:FRAME path — TX runs after RX:RETURNED, which
         # itself only runs after RX:FRAME. TX:SUBMITTED is
-        # unconditional once we reach this code; TX:RECLAIMED
-        # follows when the device marks the descriptor USED.
-        # TX:TIMEOUT is defensive (should not fire in Firecracker
-        # — device marks USED near-immediately once kicked).
+        # unconditional once we reach this code; TX:RECLAIMED is
+        # REQUIRED once submitted (the device must process the
+        # descriptor). TX:TIMEOUT and TX:FAIL are both failures —
+        # tightened 2026-05-18 from a Codex finding on the H1
+        # push range that the prior "accept TIMEOUT silently"
+        # behavior masked broken TX paths.
         if ! grep -qE '^TX:SUBMITTED$' "$SERIAL"; then
             echo "FAIL: TX:SUBMITTED not observed (guest did not reach VIO-T-005)"
             echo "=== serial.log ==="
@@ -388,17 +390,15 @@ if [[ "$ARCH/$PLATFORM" == "x86_64/firecracker" ]]; then
         fi
         echo "TX:SUBMITTED observed — VIO-T-002..005 frame submit verified"
 
-        tx_line=$(grep -E '^TX:(RECLAIMED |TIMEOUT$|FAIL )' "$SERIAL" \
-            | head -1 || true)
+        tx_line=$(grep -E '^TX:RECLAIMED ' "$SERIAL" | head -1 || true)
         if [[ -z "$tx_line" ]]; then
-            echo "FAIL: no TX:RECLAIMED / TX:TIMEOUT / TX:FAIL observed" \
-                 "(guest did not reach VIO-T-006)"
-            echo "=== serial.log ==="
-            sed 's/^/    /' "$SERIAL"
-            exit 1
-        fi
-        if [[ "$tx_line" == TX:FAIL* ]]; then
-            echo "FAIL: TX-path failure — $tx_line"
+            fail_line=$(grep -E '^TX:(TIMEOUT$|FAIL )' "$SERIAL" \
+                | head -1 || true)
+            if [[ -n "$fail_line" ]]; then
+                echo "FAIL: TX failed to reclaim — $fail_line"
+            else
+                echo "FAIL: TX:RECLAIMED not observed (guest did not reach VIO-T-006)"
+            fi
             echo "=== serial.log ==="
             sed 's/^/    /' "$SERIAL"
             exit 1
