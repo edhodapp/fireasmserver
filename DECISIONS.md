@@ -11,60 +11,84 @@ Review this log before making new decisions to avoid re-litigating settled quest
 ## 2026-04-09
 
 ### D001: License — AGPL-3.0-or-later
+
+**Requirements:** N/A — governance (license terms)
 Single-author project (SQLite model). No outside contributions accepted.
 Private commercial licenses sold at Ed's discretion for OEM income.
 Ed retains unconditional right to refuse commercial licenses.
 
 ### D002: Directory structure — arch-primary, platform-subordinate
+
+**Requirements:** N/A — framing (directory layout, not runtime behavior)
 `arch/<isa>/` is a self-contained project root with its own Makefile and
 linker script. Platform-specific code (boot, virtio, device access) lives
 under `arch/<isa>/platform/<vm>/`. Pure computation (HTTP parsing, TCP)
 lives at the arch level. Each arch directory is analogous to ws_pi5's root.
 
 ### D003: 100% assembly — no C, no stdlib
+
+**Requirements:** ENG-001
 The "Assembly of Fire" brand commits to this. ISA-idiomatic code that maps
 ISA abstractions directly to the problem. Two implementations (x86_64 +
 AArch64), one design.
 
 ### D004: Corporation name — Assembly of Fire, Inc.
+
+**Requirements:** N/A — governance (corporate structure)
 Delaware C corp, structured for QSBS qualification. Name confirmed after
 namespace saturation check: no USPTO marks, no Delaware entities, no GitHub
 repos, no cultural uses, all major domain variants unregistered.
 
 ### D005: CD pipeline — two-tier local + CI
+
+**Requirements:** N/A — development process (CD pipeline)
 Pre-commit hook gates local commits (quality gates blocking, reviews
 advisory). GitHub Actions runs arch x platform matrix. Functional gates
 block; performance gates advise.
 
 ### D006: GNU as for both arches
+
+**Requirements:** N/A — tooling choice (assembler selection)
 x86_64 uses Intel syntax via `.intel_syntax noprefix`. AArch64 uses UAL.
 No NASM, no LLVM integrated assembler.
 
 ### D007: OSACA for static pipeline analysis
+
+**Requirements:** N/A — tooling choice (static-pipeline analysis)
 Forked to edhodapp/OSACA. Covers both x86_64 and AArch64.
 llvm-mca as x86_64 fallback. Both are CI-only advisory.
 
 ### D008: Python >= 3.11, always venv
+
+**Requirements:** N/A — tooling choice (Python version + venv discipline)
 Pi 5 PiOS Bookworm ships 3.11; laptop has 3.12. All Python packages
 installed in project venv, never system-wide.
 
 ### D009: Coding-agent workflow (blocked on API billing)
+
+**Requirements:** N/A — development process (coding-agent workflow)
 Python tooling handed off to coding-agent from python_agent via devpi.
 `--dag-file` added to pass ontology as design context. Blocked until
 Agent SDK supports Max plan auth.
 
 ### D010: Brand family — fireasm
+
+**Requirements:** N/A — governance (brand family)
 fireasm is the house mark, fireasmserver is the first product.
 Future fireasm[X] products use the same namespace.
 
 ## 2026-04-10
 
 ### D011: Two-reviewer code review pipeline
+
+**Requirements:** N/A — development process (two-reviewer code review)
 Independent Gemini CLI review + clean Claude subagent review before
 every commit. Both are advisory but both are required. Agreement between
 reviewers is high-confidence signal. Findings addressed before committing.
 
 ### D012: VMIO automaton engine architecture (Astier)
+
+**Requirements:** FSA-001, FSA-002, FSA-003
 fireasmserver's core is a VMIO automaton engine per J.Y. Astier's FSA
 I/O Container paper. Main loop + priority wait queues + transition tables
 per automaton (virtio driver, TCP protocol, HTTP service). Each connection
@@ -72,6 +96,8 @@ is a "way" with its own state variable and context. Handlers are
 transactional (run to completion). No OS, no threads, no semaphores.
 
 ### D013: Foundational abstractions (Lextrait)
+
+**Requirements:** ABS-001
 Build correct foundational abstractions first; the path upward composes.
 Grothendieck's "rising sea" approach: bottom-up layered abstractions that
 dissolve problems. Abstraction is not automation, not refactoring, not
@@ -79,33 +105,45 @@ conciseness. Get the event format, queue structure, transition table
 layout, and context struct right from the start.
 
 ### D014: QEMU machine type — pc (not microvm)
+
+**Requirements:** N/A — operational (QEMU test-harness machine type)
 Multiboot1 protocol for initial QEMU testing. microvm requires PVH boot.
 Standard PC machine accepts multiboot ELF via -kernel. Will revisit when
 PVH boot is implemented for Firecracker.
 
 ### D015: Toolchain class for arch-specific build flags
+
+**Requirements:** N/A — tooling (Toolchain class for arch-specific flags)
 guest_builder uses a Toolchain object with per-arch as_flags and ld_flags.
 x86_64 multiboot requires --32 and -m elf_i386. Clean Claude review
 caught the mismatch between Makefile and Python harness.
 
 ### D016: Vendored pylintrc
+
+**Requirements:** N/A — tooling (vendored pylintrc)
 Google Python Style Guide pylintrc vendored into repo as .pylintrc.
 Clean Claude review flagged curling it at CI time as a HIGH severity
 RCE vector via load-plugins. CI uses the vendored copy.
 
 ### D017: Quality gates in pre-commit (blocking)
+
+**Requirements:** N/A — development process (pre-commit quality gates)
 flake8, pylint, mypy --strict, pytest run on staged Python files before
 every commit. Both Claude Code hook and git pre-commit hook enforce this.
 Commit blocked if any gate fails. Gemini review runs after gates pass
 (advisory, not blocking).
 
 ### D018: Gemini batched review for speed
+
+**Requirements:** N/A — development process (Gemini batched review)
 Gemini review script batches all files into a single prompt instead of
 one API call per file. Reduces review time from minutes to seconds.
 
 ## 2026-04-11
 
 ### D019: FAT32 read-only for virtio-block content filesystem (04:15 UTC)
+
+**Requirements:** FS-001, FS-002
 **Decision:** Web content served by fireasmserver is stored on a FAT32
 filesystem on the Firecracker virtio-block device. The guest implements
 a read-only FAT32 driver — no write support needed since the guest only
@@ -135,6 +173,8 @@ serves what's on the disk.
   storage; a typical static site fits in the 10GB free tier.
 
 ### D020: PVH boot protocol for Firecracker (x86_64) — confirmed
+
+**Requirements:** BS-001, BS-002
 **Decision:** Firecracker x86_64 guests boot via the PVH (Xen Para-Virtualized
 Hardware) protocol. The guest ELF carries an `XEN_ELFNOTE_PHYS32_ENTRY` (type
 18) note in a `PT_NOTE` program header pointing at a 32-bit protected-mode
@@ -171,6 +211,8 @@ entry. Linker emits both `PT_LOAD` (containing `.note.Xen` and `.text`) and
 ## 2026-04-12
 
 ### D021: Ontology-driven gates with incremental constraint discovery
+
+**Requirements:** N/A — development process (ontology-driven gates)
 
 **Decision:** Domain constraints in the project ontology (`tooling/qemu-harness.json`)
 drive the quality gate runner. The gate runner reads the ontology, extracts domain
@@ -241,6 +283,8 @@ to build in `aofire-asm-agent`.
 
 ### D022: Pi 5 as local-only AArch64 test host
 
+**Requirements:** N/A — superseded by D061
+
 **DEPRECATED 2026-04-26T04:18Z — superseded by D061.** The
 local-only AArch64 test-host posture stands; only the IP-address
 specifics are revised. Pi 5 moves to `10.0.2.2/24` on a new USB
@@ -268,6 +312,8 @@ setup" item previously listed under "Future decisions."
   broadcast traffic, no DHCP, no NAT between laptop and VMs.
 
 ### D023: Pi 5 image via pi-gen at pinned tag plus one custom stage
+
+**Requirements:** N/A — operational (Pi 5 image via pi-gen)
 
 **Decision:** The Pi 5 boot image is PiOS Lite 64-bit, built via pi-gen pinned
 to a specific git tag, running on the laptop (x86_64; pi-gen uses
@@ -305,6 +351,8 @@ decision entry if/when it happens.
 
 ### D024: VM network — isolated bridge, routed, no NAT
 
+**Requirements:** N/A — operational (test-VM network topology)
+
 **Decision:** Firecracker guests on the Pi 5 attach to a Linux bridge `br1`
 (network `10.0.1.0/24`, Pi as gateway at `10.0.1.1`). The Pi sets
 `net.ipv4.ip_forward=1`. The laptop adds a static route
@@ -325,6 +373,8 @@ reaches each guest directly by IP.
 
 ### D025: Flexible VM parallelism with opt-in CPU pinning
 
+**Requirements:** N/A — operational (test-harness VM parallelism)
+
 **Decision:** The number of concurrent Firecracker VMs is a runtime parameter
 of the test harness, not baked into the image. Functional tests run unpinned
 — kernel scheduler places vCPUs across the Pi's four cores. Performance tests
@@ -341,6 +391,8 @@ does **not** set `isolcpus`.
   `taskset` provide the same isolation on demand without the host-wide cost.
 
 ### D026: Firecracker built from upstream source, pinned tags, multi-version
+
+**Requirements:** N/A — operational (Firecracker build from source)
 
 **Decision:** Firecracker is built from `github.com/firecracker-microvm/
 firecracker` at specific release tags. Both architectures are produced on the
@@ -370,6 +422,8 @@ stays off the Pi.
 
 ### D027: Alpine minimal rootfs for meta-testing, both arches
 
+**Requirements:** N/A — operational (Alpine minimal rootfs for meta-testing)
+
 **Decision:** The minimal guest Linux rootfs used for meta-testing is Alpine
 Linux (musl libc, busybox userspace), built for both AArch64 (Firecracker on
 Pi 5) and x86_64 (Firecracker on laptop). Image built from `alpine-minirootfs`
@@ -392,6 +446,8 @@ and the forthcoming AArch64 ARM64 Linux boot protocol decision).
   second meta-rootfs if glibc-specific behavior ever needs to be tested.
 
 ### D028: Python provisioning — apt + laptop-built aarch64 wheelhouse
+
+**Requirements:** N/A — operational (Pi 5 Python provisioning)
 
 **Decision:** Pi 5 image gets a working Python venv from first boot, populated
 without ever needing internet on the Pi. Layered approach:
@@ -421,6 +477,8 @@ without ever needing internet on the Pi. Layered approach:
   Python packages, often well behind PyPI.
 
 ### D029: Layer-by-layer network bring-up toolchain on Pi 5
+
+**Requirements:** N/A — operational (Pi 5 network-diagnostic toolchain)
 
 **Decision:** Pi 5 image includes a comprehensive network diagnostic toolchain
 that exercises each OSI layer in isolation. Bring-up and debugging proceed
@@ -453,6 +511,8 @@ for programmatic L2/L3/L4 packet crafting from harness code.
   disk pressure, and missing tools at debug time cost more than the disk.
 
 ### D030: Full GNU dev env on Pi 5 + BPF observability
+
+**Requirements:** N/A — operational (Pi 5 dev/observability environment)
 
 **Decision:** Pi 5 image includes a complete native dev environment, enabling
 "scp source and build" as a recovery path for any tool we discover we need.
@@ -493,6 +553,8 @@ Installed via apt during pi-gen.
   pinned binaries.
 
 ### D031: TLS scope — production-ready TLS 1.2 + 1.3 stack, 2013-onwards compatibility
+
+**Requirements:** TLS-001, TLS-002, TLS-003, TLS-004, TLS-005, TLS-006, TLS-007, TLS-008, TLS-009, TLS-010, TLS-011
 
 **Decision:** fireasmserver implements a production-ready TLS server stack in
 100% assembly per D003. Full feature set from the start; no scope deferrals.
@@ -584,6 +646,8 @@ forward-secrecy-only is the recommended default.
 
 ### D032: Crypto math implementation strategy — ISA-idiomatic, macros-first, constant-time, cache-aware
 
+**Requirements:** CRYPTO-001, CRYPTO-002, CRYPTO-003, CRYPTO-004
+
 **Decision:** Cryptographic primitives for fireasmserver (supporting D031's
 TLS stack) are implemented under four binding design principles:
 
@@ -652,6 +716,8 @@ relative cache behavior, not absolute state from cycle 0.
 
 ### D033: PiOS Trixie base image — supersedes D023's Bookworm clause
 
+**Requirements:** N/A — operational (PiOS Trixie base-image version pin)
+
 **Decision:** D023's "PiOS Lite 64-bit *Bookworm*" clause is superseded by
 "PiOS Lite 64-bit *Trixie*" to follow the current-stable pi-gen, which
 stopped advancing Bookworm tags in November 2025 and now targets only
@@ -685,6 +751,8 @@ carry forward unchanged.
 - Python 3.13 is a quiet upgrade with no project-level blockers.
 
 ### D034: Hardware platform profiles — parameterized cache and ISA features
+
+**Requirements:** PROFILE-001, PROFILE-002
 
 **Decision:** Cache constants and ISA feature gates in fireasmserver crypto
 code are parameterized by a build-time hardware *profile*, not hardcoded.
@@ -764,6 +832,8 @@ conservative builds.
 
 ### D035: Pi 5 package source — apt-cacher-ng on the laptop
 
+**Requirements:** N/A — operational (apt-cacher-ng proxy on laptop)
+
 **Decision:** The Pi 5 gets Debian packages through an `apt-cacher-ng` proxy
 running on the laptop at `10.0.0.1:3142`. The Pi's APT configuration
 (`/etc/apt/apt.conf.d/00proxy`) points at that proxy. Laptop has internet;
@@ -805,6 +875,8 @@ reachability remains blocked per D024; apt-cacher-ng does not open a general
 outbound path.
 
 ### D036: Pi 5 backup strategy — two-tier rsync + hot-dd over SSH
+
+**Requirements:** N/A — operational (Pi 5 backup strategy)
 
 **Decision:** Pi 5 backups are taken over SSH from the laptop with the Pi
 running. No SD card removal for routine backup operations. Two tools cover
@@ -860,6 +932,8 @@ replacement already implies.
 
 ### D037: Firecracker install — prebuilt binary for now, build-from-source deferred
 
+**Requirements:** N/A — operational (Firecracker install via prebuilt binary)
+
 **Decision:** Install Firecracker on the Pi 5 (and reuse the same upstream
 tarball convention on the laptop when needed) from the **official GitHub
 release tarball**, not from source. This amends — does not supersede —
@@ -895,6 +969,8 @@ sanity check on the Pi post-install.
 ## 2026-04-19
 
 ### D038: L2 implementation methodology
+
+**Requirements:** N/A — development process (L2 implementation methodology)
 
 **Decision:** L2 (Ethernet/MAC layer) — and by extension every subsequent
 protocol layer — follows this fixed sequence. No skipping forward; no
@@ -944,6 +1020,8 @@ ships a NIC that nobody can plug into. The order is load-bearing.
 
 ### D039: L2 design-doc must explicitly state these five properties
 
+**Requirements:** N/A — development process (L2 design-doc standards)
+
 **Decision:** The L2 design doc (`docs/l2/DESIGN.md`, per D038) must
 state, upfront, each of the following — absence is a review-blocking
 bug in the doc, not a runtime surprise to fix later.
@@ -974,6 +1052,8 @@ bug in the doc, not a runtime surprise to fix later.
 the five properties explicitly?" — yes/no per property.
 
 ### D040: Perf regression ratchet — baselines per cell
+
+**Requirements:** N/A — development process (perf regression ratchet policy)
 
 **Decision:** After L2 functional passes, establish per-cell
 performance baselines that ratchet the same way branch-cov's
@@ -1006,6 +1086,8 @@ lets regressions slip in one %-point at a time until the compounding
 ships a product that is slow. Branch-cov's pattern worked — reuse it.
 
 ### D041: Production deployment pipeline requirements
+
+**Requirements:** N/A — development process (production deployment gating)
 
 **Decision:** The "real deployment" phase of the CD pipeline (unlocks
 per the trigger in
@@ -1054,6 +1136,8 @@ level, cross-region coordination for fly.io. Defer to the deployment-
 phase trigger.
 
 ### D042: L2 interop matrix — free / on-demand / deferred (supersedes D038 §6)
+
+**Requirements:** N/A — development process (L2 interop matrix)
 
 **Decision:** Replace D038 stage 6's single "one enterprise switch
 (Cisco or Juniper sample)" line with a tiered plan that matches
@@ -1106,6 +1190,8 @@ write the replacement as a new numbered entry that cites the
 section being superseded. Bidirectional references beat unidirectional.
 
 ### D043: FSA runtime model — statically-allocated per-type pools, cooperative dispatch
+
+**Requirements:** FSA-001, FSA-002, FSA-003, FSA-004, FSA-005, FSA-006, FSA-007
 
 **Decision:** fireasmserver's FSA runtime (the concrete realization of
 the VMIO automaton engine per D012) uses **per-FSA-type static slot
@@ -1241,6 +1327,8 @@ not a quiet feature addition.
 
 ### D044: VLAN (802.1Q and successors) — out of scope for fireasmserver L2 MVP
 
+**Requirements:** N/A — superseded by D045
+
 **~~DEPRECATED 2026-04-19T09:30Z — see D045.~~** Ed pushed back on
 the deferral on assembly-retrofit-cost grounds: VLAN parsing
 reshapes the hot-path EtherType dispatch (offset 12 untagged vs. 16
@@ -1300,6 +1388,8 @@ DEPRECATED per the D042 convention.
 
 ### D045: VLAN + other hot-path-shaping features — designed in, runtime-inert by default (supersedes D044, applies D046)
 
+**Requirements:** L2-001, L2-002, L2-003 (this repo's REQUIREMENTS.md); VLAN-001..VLAN-007 + ETH-018 (docs/l2/REQUIREMENTS.md)
+
 **Decision:** L2 is architected from MVP to accommodate every feature
 whose later addition would reshape the hot path, even when the MVP
 runtime disables the feature by default. The deferred-until-customer
@@ -1349,6 +1439,8 @@ because they're additive on an already-designed interface):**
 - D044 gets a DEPRECATED marker citing D045 per the D042 convention.
 
 ### D046: Assembly-deferral bar — hot-path-shaping features are designed in at MVP
+
+**Requirements:** N/A — meta-principle (assembly-deferral bar)
 
 **Principle (meta-rule for future L-layer scoping decisions):**
 
@@ -1400,6 +1492,8 @@ eventually?" Features that don't meet the bar (LACP, PFC,
 background-control-queue operations) stay deferred.
 
 ### D047: GAS intel-syntax `OFFSET` convention for MOV sources (x86_64)
+
+**Requirements:** N/A — superseded by D048
 
 **~~DEPRECATED 2026-04-19T14:00Z — see D048.~~** The convention held
 for a few hours and one commit (`f44e294`) before Ed and I concluded
@@ -1475,6 +1569,8 @@ CI or interactive use.
   GAS's operand-interpretation quirks.
 
 ### D048: Switch x86_64 to NASM (supersedes D006 for x86_64; AArch64 stays on GNU as)
+
+**Requirements:** N/A — tooling choice (NASM on x86_64)
 
 **Decision (2026-04-19):** x86_64 assembly sources move from
 `x86_64-linux-gnu-as` (GAS `.intel_syntax noprefix`) to NASM. AArch64
@@ -1555,6 +1651,8 @@ series):
   languages.
 
 ### D049: Ontology as formal verifiable requirements — SysE-grade schema with preserved DAG history, git-cross-referenced
+
+**Requirements:** N/A — development process (ontology as formal requirements)
 
 **Decision (2026-04-19):** the ontology at `tooling/qemu-harness.json`
 (produced by `tooling/build_qemu_harness_ontology.py`) is the
@@ -1716,6 +1814,8 @@ Two related sub-decisions:
 
 ### D050: Fold-by-N with `pslldq 4` reuses fold-by-1 reduction constants
 
+**Requirements:** CRYPTO-005
+
 **Decision (2026-04-19):** the x86_64 PCLMULQDQ fold-by-N CRC-32
 path in `arch/x86_64/crypto/crc32_ieee.S` uses the 33-bit constant
 form with `pslldq xmm, 4` as its alignment step, and under that
@@ -1830,6 +1930,8 @@ as-is per Ed's disposition).
 
 ### D051: Ontology audit as closing pre-push gate
 
+**Requirements:** N/A — development process (ontology audit pre-push gate)
+
 **Decision (2026-04-19):** every push to `origin/main` must pass
 `audit-ontology --exit-nonzero-on-gap`, which verifies that
 every `implementation_refs` / `verification_refs` entry in the
@@ -1894,6 +1996,8 @@ wire-up landed by the main session in the same window.
 ## 2026-04-20
 
 ### D052: Side-session isolation via `git worktree` — supersedes branch-and-merge-only rule
+
+**Requirements:** N/A — development process (side-session worktree isolation)
 
 **Decision (2026-04-20):** concurrent Claude Code sessions on
 this repo run in separate `git worktree` instances, not in the
@@ -2002,6 +2106,8 @@ follow-up tool but not in scope for the first cut.
 
 ### D053: MVP ships single-queue; virtio multi-queue (`VIRTIO_NET_F_MQ`) deferred beyond first release
 
+**Requirements:** VIO-MVP-001
+
 **Decision (2026-04-21):** the first-release L2 driver negotiates
 a single RX queue (queue 0) + single TX queue (queue 1) and does
 NOT negotiate `VIRTIO_NET_F_MQ` (bit 22). Multi-queue support is
@@ -2056,6 +2162,8 @@ L2 requirements-formalization pass (ontology commit bundles this
 D-entry with the 70 stub constraint rows it authors).
 
 ### D054: QEMU fork as the crypto-runtime sandbox for ISA-extension testing
+
+**Requirements:** N/A — tooling choice (QEMU fork crypto-runtime sandbox)
 
 **Decision (2026-04-22):** the canonical QEMU used to exercise
 ISA-extension-dependent code paths (SHA-NI, AES-NI, PCLMULQDQ,
@@ -2149,6 +2257,8 @@ session during the SHA-256 dispatch.
 
 ### D055: External-input length clamp at the public crypto API boundary
 
+**Requirements:** BOUNDARY-001
+
 **Decision (2026-04-22):** every public crypto primitive in this
 project presents a trusted-`len` contract matching established
 C hash APIs (OpenSSL, libsodium, nettle, libgcrypt) — the
@@ -2210,6 +2320,8 @@ session's post-Gemini security walkthrough.
 
 
 ### D056: Use the ISA's overflow-detection primitives on every external-input arithmetic step
+
+**Requirements:** BOUNDARY-002
 
 **Decision (2026-04-22):** because this project is 100% assembly
 (per D003), every arithmetic operation that crosses an
@@ -2284,6 +2396,8 @@ SHA-256 side-session security walkthrough; formalized
 
 
 ### D057: AES-NI required at runtime on x86_64; no scalar fallback
+
+**Requirements:** CRYPTO-006
 
 **Decision (2026-04-23):** the x86_64 AES primitive requires
 Intel AES New Instructions (AES-NI) at runtime. If
@@ -2367,6 +2481,8 @@ deliberate no-fallback implementation choice.
 
 
 ### D058: No mutable state crosses a core or VM boundary — queue-passing actor model
+
+**Requirements:** MR-001, MR-004, BC-005, FSA-001, FSA-002, FSA-003, FSA-004, FSA-005
 
 **Decision (2026-04-23):** mutable state in fireasmserver lives
 inside exactly one process (one core within a VM; or one VM
@@ -2515,6 +2631,8 @@ mutable sharing now; use queues between processes" framing.
 
 
 ### D059: Init-time static memory layout — modules declare, init-code assigns, then freeze
+
+**Requirements:** MR-002, MR-003, MR-004, MR-005, MR-006, MR-007, MR-008, AL-001, AL-002, AL-004, AL-005, CP-002, PR-001
 
 **Decision (2026-04-23):** memory in fireasmserver is statically
 allocated, but the layout is computed at boot time rather than
@@ -2702,6 +2820,8 @@ cache-topology tuning, split off as D060.
 
 
 ### D060: Layered tuning model — CPU characteristics, build-time profiles, bytecode expression language
+
+**Requirements:** MR-007, MR-008, AL-001, AL-002, AL-003, AL-004, AL-005, BC-001, BC-002, BC-003, BC-004, BC-005, CP-001, CP-002, PR-001, PR-002
 
 **Decision (2026-04-23):** memory layout and tunable-behavior
 parameters in fireasmserver are organized in four layers, each
@@ -2955,6 +3075,8 @@ three-arch-multiplication cost and audit-drift risk were sized.
 
 ### D061: Pi 5 laptop-link network migrated to `10.0.2.0/24`
 
+**Requirements:** N/A — operational (Pi 5 laptop-link network migration)
+
 **Supersedes:** D022 (deprecated 2026-04-26T04:18Z). The Pi 5
 local-test-host *posture* is unchanged — D022's whole rationale
 (no self-hosted runner, no GitHub from the Pi, scp-delivered
@@ -3052,6 +3174,8 @@ made.
 ## 2026-04-28
 
 ### D062: x86_64 stage-1 boot identity map — long-mode handoff in `boot.S`
+
+**Requirements:** BS-001, BS-002
 
 **DEPRECATED 2026-04-29 — superseded by D063 (coverage clause
 only).** Stage-1 identity-map coverage extended from low 1 GiB
@@ -3256,6 +3380,8 @@ asymmetry.
 
 ### D063: Stage-1 boot identity-map extended to low 4 GiB
 
+**Requirements:** BS-001, BS-002
+
 **Supersedes:** D062 (deprecated 2026-04-29 — coverage clause
 only). The "boot.S as the home of the x86_64 mode switch"
 decision is unchanged. The stage-1-only scope (does not bind
@@ -3424,6 +3550,8 @@ for shape continuity and CPUID-dependency avoidance.
 
 ### D064: EFER.NXE enabled at stage 1 alongside EFER.LME
 
+**Requirements:** BS-002, BS-003
+
 **Context.** D062 + D063 specify the stage-1 mode-switch sequence
 in `arch/x86_64/memory/mode_switch.S`: zero page tables, populate
 identity map (low 4 GiB, 2 MiB pages), `lgdt`, `CR4.PAE`, `CR3`,
@@ -3511,6 +3639,8 @@ file's MSR-bits block.
 ## 2026-05-01
 
 ### D065: `.memreq` macro shape, Python codegen, hot/cold tier system
+
+**Requirements:** N/A — superseded by D066
 
 **DEPRECATED 2026-05-11 08:48 UTC — superseded by D066.** D065 was
 drafted from memory without consulting the existing implementation.
@@ -3929,6 +4059,8 @@ decisions, especially the ones we are deferring."
 ## 2026-05-11
 
 ### D066: `.memreq` design — supersede D065, adopt existing 48-byte format, restore per-core stacks to step 5 scope
+
+**Requirements:** see `REQ-IDs` block below for the full list (MR-001..MR-008 with cross-references to AL-001/002/003/005)
 
 **Supersedes:** D065 (deprecated 2026-05-11 08:48 UTC). D065 was
 drafted from memory without consulting the in-tree implementation

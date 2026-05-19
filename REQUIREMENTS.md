@@ -874,3 +874,729 @@ with `EFER.LME`.
   stage-1 mode switch and downstream virtio init)
 
 **Status:** implemented
+
+---
+
+## Engineering authoring rules (ENG-NNN)
+
+### ENG-001: Production runtime is 100% assembly
+
+All code in `arch/<isa>/` that is linked into a guest artifact
+shall be authored in arch-specific assembly per the project's
+ISA toolchain (NASM on x86_64 per D048; GNU as on aarch64 per
+D006). The guest artifact shall contain no compiled C, no
+runtime linkage against libc or any other C standard library,
+and no machine code originating from a high-level-language
+compiler.
+
+Tooling, codegen, and test harnesses outside `arch/` are
+explicitly out of scope — Python, shell, and host C drivers
+are permitted in `tooling/` per their established roles.
+
+**Derived from:** D003.
+
+**Implementation refs:**
+
+- `arch/x86_64/` — NASM source tree.
+- `arch/aarch64/` — GNU as source tree.
+
+**Verification refs:**
+
+- Pre-commit gates reject non-asm production sources by virtue
+  of the build targeting these directories exclusively.
+
+**Status:** implemented
+
+
+---
+
+## Astier FSA / VMIO automaton runtime (FSA-NNN)
+
+### FSA-001: Single cooperative dispatcher per actor
+
+Each per-core actor shall run a single cooperative dispatcher
+loop. The dispatcher shall pull the next pending event from the
+actor's priority wait queues and invoke the matching transition
+handler. Preemption, kernel-thread scheduling, and operating-
+system context switches shall not appear in the dispatcher path.
+
+**Derived from:** D012 (VMIO automaton engine per Astier), D043
+(FSA runtime model — statically-allocated per-type pools,
+cooperative dispatch).
+
+**Implementation refs:** (none — gap; dispatcher to land in a
+later commit)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### FSA-002: Priority wait queues per automaton
+
+Each automaton instance shall expose a priority-ordered wait
+queue. Pending events shall be enqueued by their priority class
+and dequeued by the dispatcher in priority order.
+
+**Derived from:** D012.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### FSA-003: Transition atomicity
+
+A transition handler shall either complete fully or shall be
+treated as if it never started. On any fault inside a
+transition, the affected slot shall be rolled back to its pre-
+transition state before control returns to the dispatcher.
+
+**Derived from:** D012, D043.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### FSA-004: Per-type static slot pools
+
+Each FSA species (L2 connection, L3 ARP entry, L4 TCB, HTTP
+request, TLS context, future timers, etc.) shall reserve its
+slot pool as a contiguous static array sized by a build-time
+`.equ` constant. The full runtime memory footprint shall be
+the sum across pool types and shall be known at link time.
+
+**Derived from:** D043.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### FSA-005: No heap allocation in the steady state
+
+After the init-complete fence (per D059), the dispatcher and
+all transition handlers shall perform no heap allocation, no
+heap deallocation, and no slot recycling that requires an
+allocator decision. Slot reuse shall be drawn exclusively from
+the per-type static pools (FSA-004) and shall zero the
+reclaimed slot before returning it to a subsequent caller.
+
+**Derived from:** D003, D043.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap; future static-analysis gate
+shall reject `malloc`/`free` symbol references in linked output)
+
+**Status:** spec-only
+
+
+### FSA-006: Bounded-work transitions
+
+Each transition handler shall complete within
+`FSA_TRANSITION_BUDGET_NS` wall-clock nanoseconds. Handlers
+whose worst-case bound cannot be proven to fit shall be split
+into multiple transitions with interleaved dispatcher passes.
+
+**Derived from:** D043.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap; perf-ratchet baseline shall
+include the transition-time budget per D040)
+
+**Status:** spec-only
+
+
+### FSA-007: Per-layer pool-exhaustion behavior
+
+Each FSA layer shall declare its response to a "pool full"
+condition at design time. The dispatcher shall not produce
+silent drops outside of explicitly-named layers (ARP,
+reassembly per D043's backpressure table).
+
+**Derived from:** D043.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+---
+
+## Foundational abstractions (ABS-NNN)
+
+### ABS-001: Bottom-up layered abstractions
+
+The project shall build foundational abstractions (event
+formats, queue structures, transition-table layouts, context
+struct shapes) in the lowest applicable layer before any
+higher-layer code consumes them. Higher-layer designs shall not
+reach across an abstraction boundary to inspect or mutate
+lower-layer state.
+
+**Derived from:** D013 (foundational abstractions, Lextrait).
+
+**Implementation refs:** (cross-cutting — applies to every new
+module)
+
+**Verification refs:** (none — non-mechanical; enforced through
+review)
+
+**Status:** spec-only
+
+
+---
+
+## Filesystem and content storage (FS-NNN)
+
+### FS-001: FAT32 content filesystem
+
+Web content served by the guest shall be stored on a FAT32
+filesystem on the Firecracker virtio-block device. The guest
+shall not parse any other filesystem format for content
+delivery.
+
+**Derived from:** D019 (FAT32 read-only for virtio-block content
+filesystem).
+
+**Implementation refs:** (none — gap; FAT32 reader to land
+post-L2)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### FS-002: Content filesystem is read-only
+
+The guest's FAT32 driver shall implement read-only access. The
+driver shall not implement any write, allocation, journaling,
+or directory-mutation path.
+
+**Derived from:** D019.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+---
+
+## TLS protocol stack (TLS-NNN)
+
+### TLS-001: TLS 1.3 and TLS 1.2 are both supported
+
+The TLS implementation shall support TLS 1.3 (RFC 8446) and
+TLS 1.2 (RFC 5246) negotiation. The implementation shall not
+negotiate SSL 3.0, TLS 1.0, or TLS 1.1.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap; primitives only today,
+no protocol layer yet)
+
+**Verification refs:** (none — gap; eventual interop:
+`openssl s_client` matrix, `gnutls-cli`, `testssl.sh`)
+
+**Status:** spec-only
+
+
+### TLS-002: Key-exchange algorithm set
+
+The TLS implementation shall support the following key-exchange
+algorithms and shall not negotiate any algorithm outside this
+set:
+
+- ECDHE over x25519, secp256r1, secp384r1.
+- FFDHE over ffdhe2048, ffdhe3072, ffdhe4096 (RFC 7919).
+- RSA key-exchange in TLS 1.2 only (required for 2013-onwards
+  client compatibility).
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-003: Cipher-suite set
+
+The TLS implementation shall negotiate cipher suites only from
+the following set:
+
+- TLS 1.3: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
+  `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_128_CCM_SHA256`,
+  `TLS_AES_128_CCM_8_SHA256`.
+- TLS 1.2: ECDHE-ECDSA / ECDHE-RSA / DHE-RSA with AES-GCM,
+  AES-CBC-HMAC-SHA, or ChaCha20-Poly1305.
+
+The implementation shall not negotiate RC4, 3DES, EXPORT,
+anonymous, or static-DH suites.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-004: Signature-algorithm set
+
+The TLS implementation shall support the following signature
+algorithms: ECDSA over P-256 / P-384 / P-521, RSA-PSS,
+RSA-PKCS1 v1.5 (TLS 1.2 compatibility only), and Ed25519.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-005: SNI, ALPN, OCSP stapling, secure renegotiation
+
+The TLS implementation shall support: Server Name Indication
+(RFC 6066), Application-Layer Protocol Negotiation (RFC 7301),
+OCSP stapling, secure renegotiation (RFC 5746), and TLS 1.3
+key update.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-006: Certificate lifecycle
+
+The TLS implementation shall include an ACMEv2 client
+(RFC 8555) for certificate issuance against Let's Encrypt and
+other ACME-compatible CAs, a private-CA injection path for OEM
+provisioning, full chain validation against configurable trust
+anchors, and hostname matching per RFC 6125.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-007: Mutual TLS (client certificate authentication)
+
+The TLS implementation shall support client-certificate
+authentication (mTLS), including validation of the client
+chain against configurable trust anchors and signature
+verification against the negotiated signature-algorithm set
+(TLS-004).
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-008: Session resumption
+
+The TLS implementation shall support session resumption: PSK
+resumption in TLS 1.3, session ID and session tickets in
+TLS 1.2.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-009: 0-RTT early data with replay protection
+
+The TLS 1.3 implementation shall support 0-RTT early data,
+shall implement single-use ticket replay protection, and shall
+enforce a per-deployment replay window.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-010: Extended Master Secret and Encrypt-then-MAC
+
+The TLS 1.2 implementation shall support Extended Master Secret
+(RFC 7627) and shall negotiate Encrypt-then-MAC (RFC 7366) for
+CBC cipher suites when the peer advertises support.
+
+**Derived from:** D031.
+
+**Implementation refs:** (none — gap)
+
+**Verification refs:** (none — gap)
+
+**Status:** spec-only
+
+
+### TLS-011: Heartbeat extension explicitly excluded
+
+The TLS implementation shall not implement the Heartbeat
+extension (RFC 6520) and shall not negotiate it under any
+configuration.
+
+**Derived from:** D031.
+
+**Implementation refs:** (Heartbeat code is absent by
+construction; nothing to point at)
+
+**Verification refs:** (eventual `testssl.sh` interop sweep
+shall confirm no `heartbeat_enabled`)
+
+**Status:** spec-only
+
+
+---
+
+## Crypto math implementation (CRYPTO-NNN)
+
+### CRYPTO-001: ISA-idiomatic primitives
+
+Each crypto primitive shall be implemented to use its target
+arch's native instruction set. Implementations shall not write
+to a least-common-denominator interface across arches.
+
+**Derived from:** D031, D032.
+
+**Implementation refs:**
+
+- `arch/x86_64/crypto/aes128.S` — AES-NI path.
+- `arch/x86_64/crypto/sha256.S` — SHA-NI / AVX2 fallback.
+- `arch/x86_64/crypto/aes128_gcm.S` — PCLMULQDQ for GHASH.
+- `arch/x86_64/crypto/crc32_ieee.S` — PCLMULQDQ fold-by-4.
+- `arch/aarch64/crypto/aes128.S` — ARMv8 AES.
+- `arch/aarch64/crypto/sha256.S` — ARMv8 SHA-256.
+- `arch/aarch64/crypto/aes128_gcm.S` — PMULL for GHASH.
+- `arch/aarch64/crypto/crc32_ieee.S` — PMULL fold path.
+
+**Verification refs:**
+
+- `tooling/tests/test_aes128.py`, `tooling/tests/test_sha256.py`,
+  `tooling/tests/test_aes128_gcm.py`,
+  `tooling/tests/test_crc32_ieee.py`
+
+**Status:** implemented
+
+
+### CRYPTO-002: Macros-first implementation
+
+Performance-critical bignum and crypto routines shall be
+authored as assembler macros that inline at each call site,
+not as subroutines that take an ABI cost. The default policy
+shall be macros; subroutine refactoring shall be deferred until
+a specific instruction-cache or deployment-footprint constraint
+is identified.
+
+**Derived from:** D032.
+
+**Implementation refs:** (cross-cutting — every primitive)
+
+**Verification refs:** (verified by review against D032)
+
+**Status:** partial
+
+
+### CRYPTO-003: Constant-time discipline
+
+Crypto primitives shall not branch on data values derived from
+secret inputs and shall not access memory addresses derived
+from secret inputs. T-table-based AES is explicitly forbidden;
+implementations shall use the hardware AES instructions
+instead.
+
+**Derived from:** D032, D057.
+
+**Implementation refs:**
+
+- AES implementations use hardware AES instructions; no
+  S-box tables.
+
+**Verification refs:**
+
+- Manual review during commit; constant-time checks against
+  Wycheproof corpus during interop tier.
+
+**Status:** partial
+
+
+### CRYPTO-004: Cache-aware data layout
+
+Hot crypto state shall be aligned to a cache line boundary
+(`.balign 64`). Hot/cold field separation shall keep
+per-connection working sets minimized relative to L1D capacity
+in the active hardware profile.
+
+**Derived from:** D032.
+
+**Implementation refs:**
+
+- `.balign 64` on AES round keys and SHA state in the existing
+  crypto sources.
+
+**Verification refs:** (manual review against D032 + D034)
+
+**Status:** partial
+
+
+### CRYPTO-005: PCLMULQDQ fold-by-4 constant set
+
+The x86_64 PCLMULQDQ fold-by-4 path shall reuse the fold-by-1
+reduction constants. The on-chip constants table shall contain
+exactly four exponents: `x^576 mod P`, `x^512 mod P`,
+`x^192 mod P`, and `x^128 mod P`.
+
+**Derived from:** D050.
+
+**Implementation refs:**
+
+- `arch/x86_64/crypto/crc32_ieee.S` — fold-by-4 main loop and
+  reduction, constants in `.rodata.crc32_pclmul_consts`.
+- `tooling/crypto_tests/derive_fold_constants.py` — derivation
+  + verification against `zlib.crc32`.
+
+**Verification refs:**
+
+- `tooling/tests/test_derive_fold_constants.py` (361 tests).
+- `tooling/crypto_tests/crc32_test.c` (264 lengths × 3 code
+  paths per arch under pre-push integration gate).
+
+**Status:** implemented
+
+
+### CRYPTO-006: AES-NI required at runtime on x86_64
+
+The x86_64 AES primitive shall refuse to run on a host CPU
+that does not advertise `CPUID.(EAX=1):ECX[bit 25]` (AES-NI).
+The implementation shall not provide a scalar fallback path.
+
+**Derived from:** D057.
+
+**Implementation refs:**
+
+- `arch/x86_64/crypto/aes128.S:aes128_has_aesni` — CPUID probe.
+- `arch/x86_64/crypto/aes128.S:aes128_encrypt_block` and
+  `aes128_decrypt_block` — AES-NI-only.
+
+**Verification refs:**
+
+- `tooling/tests/test_aes128.py` (covers AES128-001).
+
+**Status:** implemented
+
+
+---
+
+## Hardware platform profiles (PROFILE-NNN)
+
+### PROFILE-001: Build-time profile selection
+
+Each guest artifact shall be built against exactly one hardware
+profile. The selected profile shall be embedded in `.rodata` and
+shall determine the values exposed in `cpu_characteristics`
+(per D034). Runtime CPU-dispatch shall not appear in the initial
+implementation; profile selection shall happen at
+`make ARCH=<arch> PROFILE=<name>` time.
+
+**Derived from:** D034.
+
+**Implementation refs:** (gap — profile tables not yet
+declared as `.S` includes; `make PROFILE=…` not yet wired)
+
+**Verification refs:** (gap)
+
+**Status:** spec-only
+
+
+### PROFILE-002: Crypto-extension profile conformance floor
+
+Every aarch64 production profile shall expose `HAS_ARMV8_AES`,
+`HAS_ARMV8_SHA256`, and `HAS_PMULL`. Every x86_64 production
+profile shall expose `HAS_AES_NI` and `HAS_PCLMULQDQ`. Profiles
+without these features shall not be considered production
+profiles.
+
+**Derived from:** D034.
+
+**Implementation refs:** (gap — flags not yet declared)
+
+**Verification refs:** (gap)
+
+**Status:** spec-only
+
+
+---
+
+## VirtIO MVP scope (VIO-MVP-NNN)
+
+### VIO-MVP-001: Single-queue MVP
+
+The first-release L2 driver shall negotiate one RX queue
+(queue 0) and one TX queue (queue 1). The driver shall not
+negotiate `VIRTIO_NET_F_MQ` (bit 22). The RX path shall hard-
+code queue 0 and the TX path shall hard-code queue 1.
+
+**Derived from:** D053.
+
+**Implementation refs:**
+
+- `arch/x86_64/platform/firecracker/boot.S` and
+  `arch/aarch64/platform/firecracker/boot.S` — `program_queue
+  0, …` and `program_queue 1, …`.
+
+**Verification refs:**
+
+- `tooling/tracer_bullet/run_local.sh` x86_64/firecracker cell
+  observes `QUEUES:RX=0x100 TX=0x100 / QUEUES:READY`.
+
+**Status:** implemented
+
+
+---
+
+## L2 architectural accommodations (L2-NNN)
+
+The L2-specific conformance requirement table at
+`docs/l2/REQUIREMENTS.md` carries the per-standard rows
+(ETH-NNN, VLAN-NNN, VIO-NNN, etc.). The L2-NNN entries below
+are the architectural-shape requirements that D045 codified —
+the requirements that say "the hot-path data layout shall
+accommodate feature X even when MVP runtime defaults X off."
+
+### L2-001: VLAN-tagged RX frames accepted
+
+The L2 RX parser shall accept tagged frames (EtherType
+`0x8100` or `0x88A8`), shall strip the tag, and shall expose
+the VID to the L3 handoff metadata. No filter enforcement
+shall run by default at MVP runtime.
+
+**Derived from:** D045 (supersedes D044's VLAN-out-of-scope
+clause).
+
+**Implementation refs:** (gap — L2 RX parser not yet
+implemented)
+
+**Verification refs:** (gap; eventual: `docs/l2/REQUIREMENTS.md`
+`VLAN-001..VLAN-005`)
+
+**Status:** spec-only
+
+
+### L2-002: Multi-queue framework designed in
+
+The L2 dispatcher shall index pools by queue, with RX/TX
+pools represented as per-queue arrays. The MVP runtime shall
+build with `NUM_QUEUES = 1` and shall expose the per-queue
+indirection to retrofit-free MQ enablement.
+
+**Derived from:** D045.
+
+**Implementation refs:** (gap)
+
+**Verification refs:** (gap)
+
+**Status:** spec-only
+
+
+### L2-003: Checksum and GSO metadata passthrough
+
+The L2 parser shall populate `virtio_net_hdr.flags`,
+`csum_start`, `csum_offset`, `gso_type`, `hdr_len`, and
+`gso_size` on RX and shall pass the populated header struct
+intact to the L4 handoff metadata. The L2 layer shall not
+gate on metadata values; gating shall happen at L4.
+
+**Derived from:** D045.
+
+**Implementation refs:** (gap)
+
+**Verification refs:** (gap)
+
+**Status:** spec-only
+
+
+---
+
+## External-input boundary discipline (BOUNDARY-NNN)
+
+### BOUNDARY-001: Length clamp at the public crypto API boundary
+
+The trusted-`len` contract for every public crypto primitive
+shall live with the caller, at the trust boundary where the
+length first crosses from external input into the guest.
+Public crypto primitives shall not re-validate `len` at every
+invocation. The project-wide bound shall be
+`FIREASMSERVER_MAX_HASH_LEN = 1 << 40` bytes (1 TiB).
+
+**Derived from:** D055.
+
+**Implementation refs:**
+
+- `arch/<isa>/crypto/sha256.S` documents the trusted-`len`
+  contract.
+
+**Verification refs:** (gap; protocol-layer callers will
+verify the clamp in their respective test suites)
+
+**Status:** spec-only
+
+
+### BOUNDARY-002: ISA overflow detection on external-input arithmetic
+
+Every arithmetic step that operates on external-input-derived
+values (length math, offset computation, index multiplication,
+size accumulation from network or untrusted input) shall use
+the ISA's overflow-detection primitives (`jc` / `jo` on
+x86_64; `adds` / `subs` + `b.cs` / `b.vs` and `umulh` /
+`smulh` on aarch64). Silent-truncate arithmetic shall not be
+used at external-input boundaries.
+
+**Derived from:** D055, D056.
+
+**Implementation refs:**
+
+- `arch/x86_64/crypto/sha256.S` and the SHA-NI siblings carry
+  the pattern; new primitives inherit the discipline by review.
+
+**Verification refs:** (manual review during commit;
+constant-time + overflow-discipline review of every new
+primitive)
+
+**Status:** partial
