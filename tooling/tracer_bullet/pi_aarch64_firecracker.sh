@@ -42,6 +42,19 @@ if [[ $EUID -eq 0 ]]; then
 fi
 [[ -f "$SSH_KEY" ]] || { echo "ERROR: SSH key missing at $SSH_KEY" >&2; exit 1; }
 
+# PI_USER and PI_HOST get interpolated into a heredoc that lands on
+# the Pi as a sudo invocation. Validate against conservative patterns
+# before any SSH/sudo call so a malicious env override can't inject
+# shell metacharacters into a privileged command.
+[[ "$PI_USER" =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || {
+    echo "ERROR: PI_USER '$PI_USER' fails [a-z_][a-z0-9_-]* validation" >&2
+    exit 1
+}
+[[ "$PI_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] || {
+    echo "ERROR: PI_HOST '$PI_HOST' fails host-format validation" >&2
+    exit 1
+}
+
 SSH_OPTS=(
     -i "$SSH_KEY"
     -o IdentitiesOnly=yes
@@ -102,25 +115,32 @@ echo "    $(stat -c '%n (%s bytes)' "$GUEST_BIN")"
 # `sudo ip tuntap add dev tap0 mode tap user $USER && sudo ip link
 # set tap0 up`; subsequent runs reuse it without touching sudo.
 # Ephemeral: tap0 missing → we create it via sudo (D023 grants
-# passwordless sudo for this), record state, and tear it down in
-# cleanup.
+# passwordless sudo) and tear it down in cleanup.
+#
+# Split into two SSH calls so cleanup state is set BEFORE the create.
+# If a partial-success failure mode (SSH disconnect mid-stream after
+# the create succeeded) prevents the second SSH from returning,
+# PI_TAP_CREATED is already 1 and the trap will tear down on exit.
 echo "--- ensuring tap0 on Pi ---"
-PI_TAP_STATE=$(ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" "
-    set -u
-    if [[ -d /sys/class/net/tap0 ]]; then
-        echo 'reused'
-    else
-        sudo ip tuntap add dev tap0 mode tap user '$PI_USER' >&2 || exit 1
-        sudo ip link set tap0 up >&2 || exit 1
-        echo 'ephemeral'
-    fi
-")
-case "$PI_TAP_STATE" in
-    reused)     echo "    tap0 on Pi exists — reusing" ;;
-    ephemeral)  echo "    tap0 on Pi created (ephemeral; will tear down)"
-                PI_TAP_CREATED=1 ;;
+PI_TAP_PROBE=$(ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+    '[[ -d /sys/class/net/tap0 ]] && echo present || echo missing')
+case "$PI_TAP_PROBE" in
+    present)
+        echo "    tap0 on Pi exists — reusing"
+        ;;
+    missing)
+        echo "    tap0 on Pi missing — creating ephemeral"
+        # Optimistically claim ownership BEFORE the create succeeds
+        # so the trap's cleanup runs even if the SSH that creates
+        # tap0 partially fails after the `ip tuntap add` lands.
+        PI_TAP_CREATED=1
+        ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+            "sudo ip tuntap add dev tap0 mode tap user '$PI_USER' \
+             && sudo ip link set tap0 up" \
+            || { echo "ERROR: failed to create tap0 on Pi" >&2; exit 1; }
+        ;;
     *)
-        echo "ERROR: unexpected tap0 setup state on Pi: '$PI_TAP_STATE'" >&2
+        echo "ERROR: unexpected tap0 probe result: '$PI_TAP_PROBE'" >&2
         exit 1
         ;;
 esac

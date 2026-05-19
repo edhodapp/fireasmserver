@@ -92,6 +92,15 @@
 // any power-of-2 ≤ QueueNumMax).
 .equ VIRTQ_MAX_SIZE,    0x100
 
+// Wait budget for RX / TX Used Ring polls. 100M iterations matches
+// the x86_64 boot.S literal. Wall-clock cost on Cortex-A76 is
+// dominated by two `dsb sy` per iteration (~15-25 s for the full
+// budget); the tracer-bullet TIMEOUT is sized accordingly. H5
+// (fence audit) will narrow the per-iteration cost and let this
+// drop, but the iteration count itself stays a parity invariant
+// with x86_64 until then.
+.equ POLL_BUDGET,       100000000
+
 // Virtqueue descriptor flag bits (Virtio 1.2 §2.7.5.1).
 .equ VIRTQ_DESC_F_NEXT,     1    // buffer continues via next field
 .equ VIRTQ_DESC_F_WRITE,    2    // device may write (RX buffer)
@@ -732,7 +741,7 @@ _entry:
     mov     w25, #(VIRTQ_MAX_SIZE - 1)
     add     x26, x19, #VIRTQ_OFF_USED
 
-    ldr     w9, =100000000               // wait budget (matches x86_64)
+    ldr     w9, =POLL_BUDGET             // wait budget (matches x86_64)
 .Lrx_wait_loop:
     yield
     dsb     sy
@@ -843,10 +852,16 @@ _entry:
     // since TX_QUEUE_OFF + VIRTQ_OFF_AVAIL = 0x4000 exceeds the
     // ADD 12-bit-with-LSL-12 immediate range from x19 in one step.
     adrp    x10, tx_test_pkt
-    add     x10, x10, :lo12:tx_test_pkt           // runtime addr (< 4 GiB)
+    add     x10, x10, :lo12:tx_test_pkt           // runtime addr (any aarch64 address)
     add     x11, x19, #TX_QUEUE_OFF               // TX queue base (0x3000 = 3<<12)
-    str     w10, [x11, #0]                        // desc.addr_lo
-    str     wzr, [x11, #4]                        // desc.addr_hi
+    // desc.addr is u64 at offset 0 (Virtio 1.2 §2.7.5.1) — write
+    // the full 64-bit address in one store. Robust regardless of
+    // where the linker places .rodata; diverges from x86_64 (which
+    // splits into two 32-bit stores because NASM's `mov dword [...]`
+    // is bounded by a 32-bit immediate). aarch64's xN store covers
+    // both halves atomically and removes the implicit < 4 GiB
+    // assumption.
+    str     x10, [x11, #0]                        // desc.addr (u64)
     mov     w12, #(tx_test_pkt_end - tx_test_pkt)
     str     w12, [x11, #8]                        // desc.len
     strh    wzr, [x11, #12]                       // desc.flags = 0
@@ -884,7 +899,7 @@ _entry:
     add     x27, x19, #TX_QUEUE_OFF
     add     x27, x27, #VIRTQ_OFF_USED
 
-    ldr     w9, =100000000
+    ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
     yield
     dsb     sy
