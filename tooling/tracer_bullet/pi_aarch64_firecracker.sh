@@ -24,16 +24,32 @@ set -euo pipefail
 PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
-TIMEOUT="${TIMEOUT:-60}"     # aarch64 needs more wall clock than the
-                             # laptop x86_64 path — dsb sy overhead
-                             # in the RX/TX poll loops dominates
-                             # (~15-25s wall to complete 100M iters
-                             # on Cortex-A76). H5 (fence audit) will
-                             # narrow these and let this drop. With
-                             # SIGTERM landing mid-poll, Firecracker
-                             # shutdown returns descriptors with
-                             # used_len=0 / num_bufs=0 — looks like a
-                             # protocol violation but is just a race.
+TIMEOUT="${TIMEOUT:-60}"     # Boot-to-TX:RECLAIMED on the success
+                             # path is ~100-200 ms on Pi 5. The
+                             # no-traffic path (poll budget exhausts
+                             # before RX:TIMEOUT fires) is the
+                             # dominator and stays in the 35-50s
+                             # band with high variance.
+                             #
+                             # P1 (post-H5) measurement: 8-run
+                             # samples at TIMEOUT=45/50/55 showed
+                             # 2/3 SIGTERM-mid-poll failures
+                             # respectively; TIMEOUT=60 held 5/5 in
+                             # H5 verification. The dsb sy → dsb
+                             # ishld narrowing in H5 was correct on
+                             # its own terms, but the wall-clock
+                             # impact under KVM is dominated by
+                             # `yield` + VMEXIT round-trips and
+                             # cross-cluster memory-system traffic,
+                             # not the dsb instruction class. So:
+                             # 60s stays as the conservative ceiling.
+                             #
+                             # The follow-up that would actually
+                             # move the needle is reducing
+                             # POLL_BUDGET (boot.S, per-arch) or
+                             # removing `yield` from the poll loop —
+                             # tracked separately, not folded into
+                             # tracer-bullet TIMEOUT.
 READY_MARKER="${READY_MARKER:-READY}"
 
 if [[ $EUID -eq 0 ]]; then
