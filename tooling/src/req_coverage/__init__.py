@@ -2,7 +2,9 @@
 
 Enforces the 1-to-many D→REQ coverage policy adopted 2026-05-01
 (`project_decisions_requirements_coverage_policy.md`). For every
-non-superseded D-class decision in `DECISIONS.md`:
+D-class decision in `DECISIONS.md` (including superseded entries
+— the #44 sweep landed `N/A — superseded by D0NN` annotations on
+those):
 
 1. A `**Requirements:**` annotation must exist immediately after
    the `### D...:` heading.
