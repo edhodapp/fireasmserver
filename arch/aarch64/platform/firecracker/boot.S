@@ -369,10 +369,14 @@ _entry:
     // x86_64 uses mfence / lfence around the MMIO read for barrier
     // envelope discipline; aarch64's equivalent is DSB SY which
     // ensures the MMIO access completes before / after adjacent
-    // memory ops. Strict-ordered device memory (if we'd configured
-    // MAIR for it) would make these DSBs redundant; under the
-    // tracer-bullet setup we're in Normal memory mode, so be
-    // explicit.
+    // memory ops. Device-nGnRnE memory (if MAIR were configured to
+    // mark MMIO that way under an enabled MMU) would order back-to-
+    // back accesses by ISA rule alone, making most DSBs redundant.
+    // This stub runs with the MMU disabled, so memory attribute is
+    // the architecture default — implementation-defined per the ARM
+    // ARM (D5.2 / B2.7) but on Cortex-A76 under AArch64 EL1 the
+    // default is Normal Non-Cacheable Outer-Shareable. Explicit
+    // DSB SY is therefore load-bearing here, not vestigial.
     movz    x6, #0x4000, lsl #16
     movk    x6, #0x3000              // x6 = VIRTIO_MMIO_BASE
     dsb     sy
@@ -399,11 +403,14 @@ _entry:
     // the probe above; emit_bytes preserves it.
     //
     // Barrier discipline mirrors the VIRTIO probe: dsb sy
-    // around each MMIO register access. Normal memory mode
-    // (no Device-memory MAIR configured in this stub) means
-    // we DO need the barriers explicitly; on a kernel that
-    // mapped MMIO as Device memory (nGnRE), most of these
-    // would be redundant.
+    // around each MMIO register access. Same rationale as the
+    // probe block above — MMU is disabled here, so the memory
+    // attribute is the AArch64 default (Normal NC OS on
+    // Cortex-A76 EL1) rather than Device-nGnRnE; back-to-back
+    // MMIO accesses are not auto-ordered by the ISA, and we
+    // make the barrier explicit. A future kernel that brings
+    // up the MMU and marks this MMIO region Device-nGnRnE via
+    // MAIR would render most of these DSBs redundant.
 
     // VIO-001: reset device — STATUS := 0.
     dsb     sy
