@@ -412,7 +412,10 @@ kernel_main_64:
     mov dword [r12 + VIRTIO_MMIO_STATUS], 0
     mfence
 
-    ; §4.2.4 reset wait — bounded.
+    ; §4.2.4 reset wait — bounded. H4: on timeout, emit an
+    ; explicit RESET:FAIL diagnostic rather than falling through
+    ; and conflating with the STATUS:FAIL path. eax holds the last
+    ; observed non-zero status value at timeout exit.
     mov ecx, 0x100000
 .reset_wait:
     lfence
@@ -422,6 +425,7 @@ kernel_main_64:
     jz  .reset_done
     dec ecx
     jnz .reset_wait
+    jmp .reset_fail
 .reset_done:
 
     ; VIO-002: RMW ACKNOWLEDGE.
@@ -655,13 +659,26 @@ kernel_main_64:
     call emit_bytes
 
     ; --- VIO-R-003/004: poll Used Ring for first RX completion ---
+    ; H2: maintain a consumer-shadow (rbp) tracking the last-consumed
+    ; UsedRing.idx, and compare incoming idx against the shadow. The
+    ; prior "test ax, ax; jnz" pattern triggered on any non-zero idx,
+    ; which is brittle against wrap-around. For the MVP single-frame
+    ; case shadow == 0 throughout the wait, so the comparison reduces
+    ; to the same first-frame behavior; the structural change buys
+    ; correctness for any future multi-frame work.
+    ;
+    ; rbp was previously used as a scratch for `num_buffers` inside
+    ; .rx_received; that consumer moves to r11d so rbp can carry the
+    ; persistent shadow across the emit chain (rbp is callee-saved
+    ; per SysV ABI and emit_bytes/emit_hex32 preserve it).
+    xor ebp, ebp                                 ; RX used_shadow = 0
     mov ecx, 100000000
 .rx_wait_loop:
     lfence
     mov ax, [r15 + VIRTQ_OFF_USED + 2]
     lfence
-    test ax, ax
-    jnz .rx_received
+    cmp ax, bp                                   ; H2: shadow-relative
+    jne .rx_received
     dec ecx
     jnz .rx_wait_loop
 
@@ -691,19 +708,21 @@ kernel_main_64:
     add rax, rcx
 
     ; Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
+    ; H2: num_buffers reads into r11d (was rbp) so rbp can hold the
+    ; used_shadow across the emit chain.
     lfence
     movzx esi, word [rax + 2]                        ; hdr_len
-    movzx ebp, word [rax + 10]                       ; num_buffers
+    movzx r11d, word [rax + 10]                      ; num_buffers
     lfence
 
     ; Validate num_buffers == 1 under MVP no-MRG_RXBUF policy.
-    cmp ebp, 1
+    cmp r11d, 1
     jne .rx_num_bufs_fail
 
     ; Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
     ; Push order: used_len, num_bufs, hdr_len, id (last → first pop = id).
     push rbx                                         ; used_len
-    push rbp                                         ; num_buffers
+    push r11                                         ; num_buffers (H2)
     push rsi                                         ; hdr_len
     push rdi                                         ; id
 
@@ -736,10 +755,12 @@ kernel_main_64:
     call emit_bytes
 
     ; --- VIO-R-006/007: return consumed descriptor + notify ---
+    ; H2: advance the consumer-shadow now that we've consumed ring[0].
     ; rdi is clobbered by the emit_hex32 chain above; re-read id from
-    ; ring[0].id. Safe in this one-shot MVP — the device's consumer
-    ; index advances only when we advance our consumer-shadow, which
-    ; we don't track here.
+    ; ring[(shadow_pre_inc) & mask] — for MVP that's still ring[0].
+    ; Tracking the shadow here keeps the structure correct against
+    ; multi-frame consumption that future iterations may add.
+    inc ebp                                          ; used_shadow_rx++
     lfence
     mov edi, [r15 + VIRTQ_OFF_USED + 4]
     lfence
@@ -809,13 +830,17 @@ kernel_main_64:
     call emit_bytes
 
     ; --- VIO-T-006: poll TX Used Ring for completion ---
+    ; H2: TX consumer-shadow restart for the TX wait. We just bumped
+    ; rbp to 1 after RX consume; the TX queue's shadow is a separate
+    ; logical counter starting at 0, so reset rbp before the wait.
+    xor ebp, ebp                                     ; TX used_shadow = 0
     mov ecx, 100000000
 .tx_wait_loop:
     lfence
     mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]
     lfence
-    test ax, ax
-    jnz .tx_reclaimed
+    cmp ax, bp                                       ; H2: shadow-relative
+    jne .tx_reclaimed
     dec ecx
     jnz .tx_wait_loop
 
@@ -880,7 +905,8 @@ kernel_main_64:
     jmp .set_failed
 
 .rx_num_bufs_fail:
-    push rbp
+    ; H2: num_buffers now lives in r11d (was rbp).
+    push r11
     lea rsi, [rel rx_num_bufs_msg]
     mov ecx, rx_num_bufs_len
     call emit_bytes
@@ -963,6 +989,23 @@ kernel_main_64:
     push rax
     lea rsi, [rel status_fail_msg]
     mov ecx, status_fail_len
+    call emit_bytes
+    pop rax
+    call emit_hex32
+    lea rsi, [rel newline]
+    mov ecx, 1
+    call emit_bytes
+    jmp .set_failed
+
+.reset_fail:
+    ; H4: bounded reset wait timed out. eax holds the last observed
+    ; non-zero status value. Distinct from .status_fail (which fires
+    ; on a post-ACK / FEATURES_OK / DRIVER_OK status mismatch) so
+    ; the diagnostic disambiguates "device never reset" from
+    ; "device reset but the next stage's status assertion failed".
+    push rax
+    lea rsi, [rel reset_fail_msg]
+    mov ecx, reset_fail_len
     call emit_bytes
     pop rax
     call emit_hex32
@@ -1107,6 +1150,9 @@ status_driver_len  equ $ - status_driver_msg
 
 status_fail_msg:   db 'STATUS:FAIL status='
 status_fail_len    equ $ - status_fail_msg
+
+reset_fail_msg:    db 'RESET:FAIL status='
+reset_fail_len     equ $ - reset_fail_msg
 
 features_ok_msg:       db 'FEATURES:OK', 10
 features_ok_len        equ $ - features_ok_msg

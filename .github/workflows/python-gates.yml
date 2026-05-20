@@ -12,6 +12,12 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.11"
+  # Opt into Node.js 24 for actions still pinned at major versions
+  # built on Node.js 20 (actions/checkout@v4, actions/setup-python@v5).
+  # See the matching block in cd-matrix.yml for the deprecation
+  # timeline reasoning.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 
 jobs:
   lint-and-typecheck:

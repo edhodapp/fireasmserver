@@ -254,12 +254,21 @@ _entry:
     // secondary CPU (any non-zero affinity) at the WFE loop — the
     // primary does the UART work alone to avoid interleaved writes.
     //
-    // Mask covers Aff0 | Aff1 | Aff2 (24 bits). Firecracker v1.15.1
-    // currently indexes vCPUs into Aff0 only, but Aff1/Aff2 are reserved
-    // for cluster/socket hierarchy; a wider mask is cheap insurance
-    // against a future hypervisor using them.
+    // Mask covers all four affinity fields: Aff0 (bits 7:0), Aff1
+    // (bits 15:8), Aff2 (bits 23:16), and Aff3 (bits 39:32) — the
+    // mask explicitly skips the MT bit (24), the U bit (30), and
+    // MPIDR's hardwired-to-1 reserved bit (31), which would
+    // otherwise make every core appear non-zero and prevent the
+    // boot core from passing the gate. The 0xFF00FFFFFF pattern is
+    // not encodable as a single AND immediate (non-contiguous
+    // 1-run), so the mask is loaded via the literal pool. H3:
+    // widened from the prior 24-bit Aff0..Aff2 mask to cover Aff3,
+    // which ARMv8.1+ hypervisors may populate for cluster/socket
+    // hierarchy. x6 is unused at this point in `_entry` and is
+    // free to clobber.
     mrs     x5, mpidr_el1
-    and     x5, x5, #0xffffff
+    ldr     x6, =0xFF00FFFFFF
+    and     x5, x5, x6
     cbnz    x5, .Ldone
 
     // Linux arm64 boot protocol leaves sp undefined at EL1 entry,
@@ -406,9 +415,11 @@ _entry:
     // Firecracker's MMIO is synchronous today so the first
     // read succeeds, but polling matches the spec and surfaces
     // if a future VMM ever goes async. Bounded iteration count
-    // survives a wedged device; on timeout we fall through and
-    // let the subsequent VIO-002 RMW catch the anomaly via
-    // .Lstatus_fail's equality-compare.
+    // survives a wedged device. H4: on timeout branch to
+    // .Lreset_fail with a dedicated RESET:FAIL marker so the
+    // diagnostic disambiguates "device never reset" from the
+    // post-ACK / FEATURES_OK / DRIVER_OK status-mismatch path
+    // handled by .Lstatus_fail.
     mov     w10, #0x100000
 .Lreset_wait:
     dsb     sy
@@ -417,6 +428,7 @@ _entry:
     cbz     w7, .Lreset_done
     subs    w10, w10, #1
     b.ne    .Lreset_wait
+    b       .Lreset_fail
 .Lreset_done:
 
     // VIO-002: RMW ACKNOWLEDGE.
@@ -737,9 +749,18 @@ _entry:
     //         LDRH/LDR imm12 windows from x19 directly.
     //   x27 = TX UsedRing base (x19 + TX_QUEUE_OFF + VIRTQ_OFF_USED).
     //         Same reason; computed before the TX poll loop.
+    // H2: w28 = used_shadow tracking the last-consumed UsedRing.idx.
+    // The prior cbnz-on-non-zero pattern was brittle against wrap-
+    // around; shadow-relative comparison is correct across wraps and
+    // future multi-frame consumption. For the MVP single-frame case
+    // shadow stays at 0 throughout the wait, so first-frame
+    // behavior is unchanged. x28 is AAPCS64 callee-saved and outside
+    // the memreq hot pool (x19-x25); emit_bytes / emit_hex32 preserve
+    // it by virtue of the AAPCS64 convention.
     mov     w24, #VIRTQ_MAX_SIZE
     mov     w25, #(VIRTQ_MAX_SIZE - 1)
     add     x26, x19, #VIRTQ_OFF_USED
+    mov     w28, #0                      // H2: RX used_shadow = 0
 
     ldr     w9, =POLL_BUDGET             // wait budget (matches x86_64)
 .Lrx_wait_loop:
@@ -747,7 +768,8 @@ _entry:
     dsb     sy
     ldrh    w10, [x26, #2]               // UsedRing.idx
     dsb     sy
-    cbnz    w10, .Lrx_received
+    cmp     w10, w28                     // H2: shadow-relative
+    b.ne    .Lrx_received
     subs    w9, w9, #1
     b.ne    .Lrx_wait_loop
 
@@ -838,6 +860,11 @@ _entry:
     str     wzr, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
     dsb     sy
 
+    // H2: advance used_shadow now that ring[0] has been consumed.
+    // For MVP single-frame this is the only consume; the increment
+    // is structural insurance against future multi-frame iteration.
+    add     w28, w28, #1
+
     adr     x1, rx_returned_msg
     mov     w2, #(rx_returned_msg_end - rx_returned_msg)
     bl      emit_bytes
@@ -899,13 +926,21 @@ _entry:
     // LSL-12 encoding (imm12=5, shift=12) in one instruction.
     add     x27, x19, #(TX_QUEUE_OFF + VIRTQ_OFF_USED)
 
+    // H2: TX consumer-shadow restart. The TX queue's used-idx
+    // counter is independent of the RX queue's, so reset w28 to 0
+    // before the TX wait. (For more concurrent queues we'd use
+    // separate registers; here re-using w28 is correct because
+    // RX consume is complete by this point.)
+    mov     w28, #0
+
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
     yield
     dsb     sy
     ldrh    w10, [x27, #2]               // TX UsedRing.idx
     dsb     sy
-    cbnz    w10, .Ltx_reclaimed
+    cmp     w10, w28                     // H2: shadow-relative
+    b.ne    .Ltx_reclaimed
     subs    w9, w9, #1
     b.ne    .Ltx_wait_loop
 
@@ -1019,6 +1054,21 @@ _entry:
     // Status. emit_bytes preserves w7; then render via emit_hex32.
     adr     x1, status_fail_msg
     mov     w2, #(status_fail_msg_end - status_fail_msg)
+    bl      emit_bytes
+    mov     w5, w7
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #(newline_msg_end - newline_msg)
+    bl      emit_bytes
+    b       .Lset_failed
+
+.Lreset_fail:
+    // H4: bounded reset wait timed out. w7 holds the last observed
+    // non-zero status value. Distinct marker so the diagnostic
+    // disambiguates "device never reset" from the post-RMW status-
+    // mismatch path handled by .Lstatus_fail above.
+    adr     x1, reset_fail_msg
+    mov     w2, #(reset_fail_msg_end - reset_fail_msg)
     bl      emit_bytes
     mov     w5, w7
     bl      emit_hex32
@@ -1217,6 +1267,10 @@ status_driver_msg_end:
 status_fail_msg:
     .ascii  "STATUS:FAIL status="
 status_fail_msg_end:
+
+reset_fail_msg:
+    .ascii  "RESET:FAIL status="
+reset_fail_msg_end:
 
 features_ok_msg:
     .ascii  "FEATURES:OK\n"

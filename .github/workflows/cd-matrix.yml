@@ -31,6 +31,16 @@ concurrency:
 
 env:
   FIRECRACKER_VERSION: v1.15.1
+  # Opt into Node.js 24 for actions still pinned at major versions
+  # built on Node.js 20 (actions/checkout@v4, actions/cache@v4,
+  # actions/setup-python@v5). GitHub's 2025-09-19 deprecation
+  # notice deprecates Node.js 20 on the runners on 2026-09-16, with
+  # the forced-default switching 2026-06-02. Setting this env var
+  # opts in now and keeps the action pins stable until the upstream
+  # repos cut newer major releases. (Per GHA docs, the env var
+  # works at workflow / job / step level; workflow level applies to
+  # all jobs in this file.)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   pytest:
