@@ -392,6 +392,26 @@ kernel_main_64:
     mov r12d, VIRTIO_MMIO_BASE
 
     ; --- Probe virtio-MMIO MagicValue register ---
+    ; ============================================================
+    ; P4 (H5 part 2) — x86_64 init-path barrier policy.
+    ;
+    ; The init / probe / negotiation / queue-setup / notify
+    ; sequence uses mfence around stores and lfence around loads
+    ; per the Virtio 1.2 §4.2.2 envelope. Under x86 TSO most of
+    ; these are conservative — stores from a single core are
+    ; observed in program order by other observers without an
+    ; explicit fence — but the strongest envelope is the least-
+    ; surprising choice for one-shot init hand-off sequences.
+    ;
+    ; Unlike aarch64 there's no narrower mfence variant on x86
+    ; (lfence/mfence/sfence are domain-flat). The notify path
+    ; (cacheable virtqueue store → mfence → MMIO notify write) is
+    ; the only place mfence is genuinely load-bearing; the rest
+    ; could be sfence or removed under careful analysis. Same
+    ; trade-off as aarch64 — not worth the churn for a one-shot
+    ; init that already runs in a few microseconds.
+    ; ============================================================
+
     ; Virtio 1.2 §4.2.2: barrier before/after MMIO. x86 TSO:
     ; lfence around loads, mfence around stores.
     lfence

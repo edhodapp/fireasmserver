@@ -358,6 +358,34 @@ _entry:
     mov     w2, #(layout_ok_msg_end - layout_ok_msg)
     bl      emit_bytes
 
+    // ============================================================
+    // P4 (H5 part 2) — init / notify path barrier policy.
+    //
+    // The init / probe / negotiation / queue-setup / notify
+    // sequence below uses `dsb sy` throughout, in contrast to the
+    // hot RX/TX wait loops (which H5 narrowed to `dsb ishld`) and
+    // the UART `emit_bytes` poll (which H5 narrowed to `dsb nsh`).
+    //
+    // The asymmetry is INTENTIONAL. Init / notify path:
+    //   - runs exactly once per boot;
+    //   - has ~80 `dsb sy` instances total — ~4 µs aggregate cost
+    //     at 2 GHz, swamped by the surrounding MMIO write latency
+    //     (each MMIO write to virtio-mmio is a VMEXIT round-trip);
+    //   - the strongest barrier class is the least-surprising
+    //     choice for hand-off sequences that need both completion
+    //     and cross-domain visibility to the host-side virtio
+    //     device thread.
+    //
+    // A focused audit could narrow many of these to `dsb ish` or
+    // remove the redundant pre-barriers (places where the prior
+    // op is a register-only computation with no memory ordering
+    // implication). The wall-clock win would be in the
+    // single-digit microseconds; the churn would be ~80 surgical
+    // edits + per-site analysis + three-reviewer attention. Not
+    // worth the risk-budget trade today. Tracked for the future
+    // if init-time perf ever becomes a real constraint.
+    // ============================================================
+
     // --- VIRTIO probe ---
     // Read the 32-bit MagicValue register at VIRTIO_MMIO_BASE and
     // compare against "virt" little-endian (0x74726976). On a match
