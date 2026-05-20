@@ -765,15 +765,17 @@ _entry:
     ldr     w9, =POLL_BUDGET             // wait budget (matches x86_64)
 .Lrx_wait_loop:
     yield
-    // H5: narrowed from dsb sy. The poll loop's only memory op is
-    // the ldrh below; dmb ishld provides load-ordering within the
-    // inner-shareable domain (sufficient — UART/virtio MMIO lives
-    // on the same SoC fabric on Pi 5 / Firecracker hosts) without
-    // the cross-domain completion-wait that dominated wall-clock
-    // on Cortex-A76 (~10-25 s for the full 100M-iter budget).
-    dmb     ishld
+    // H5: narrowed from dsb sy → dsb nshld. Keeps completion-wait
+    // semantics (essential for Device memory ordering per ARM ARM
+    // B2.3.7 — dmb with inner/outer-shareable Normal-memory
+    // attribute does NOT order Device-memory accesses) while
+    // dropping cross-cluster outer-shareability cost that
+    // dominated wall-clock on Cortex-A76. nsh covers the local PE,
+    // and `ld` constrains to load-direction since the loop body
+    // does only loads.
+    dsb     nshld
     ldrh    w10, [x26, #2]               // UsedRing.idx
-    dmb     ishld
+    dsb     nshld
     cmp     w10, w28                     // H2: shadow-relative
     b.ne    .Lrx_received
     subs    w9, w9, #1
@@ -942,10 +944,10 @@ _entry:
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
     yield
-    // H5: narrowed from dsb sy — see .Lrx_wait_loop comment.
-    dmb     ishld
+    // H5: narrowed from dsb sy → dsb nshld — see .Lrx_wait_loop.
+    dsb     nshld
     ldrh    w10, [x27, #2]               // TX UsedRing.idx
-    dmb     ishld
+    dsb     nshld
     cmp     w10, w28                     // H2: shadow-relative
     b.ne    .Ltx_reclaimed
     subs    w9, w9, #1
@@ -1196,17 +1198,26 @@ emit_bytes:
 .Lemit_loop:
     yield
     ldrb    w3, [x0, #0x05]             // LSR — THRE status
-    dmb     ish                          // H5: narrower than dsb sy.
-                                         // Ordering only (no completion-
-                                         // wait) within the inner-
-                                         // shareable domain is sufficient
-                                         // here: LSR read orders against
-                                         // any subsequent THR write, no
-                                         // cross-domain completion needed.
+    dsb     nsh                          // H5: narrowed from dsb sy →
+                                         // dsb nsh. UART MMIO is Device
+                                         // memory; ARM ARM B2.3.7
+                                         // disqualifies inner/outer-
+                                         // shareable Normal-memory dmb
+                                         // for Device-access ordering,
+                                         // so the original dsb's
+                                         // completion-wait stays.
+                                         // Domain narrows from sy
+                                         // (full system) to nsh (local
+                                         // PE), which is the right
+                                         // coverage for "this CPU's
+                                         // UART accesses sequence with
+                                         // each other" and removes the
+                                         // cross-cluster-coordination
+                                         // cost.
     tbz     w3, #5, .Lemit_loop
     ldrb    w4, [x1], #1
     strb    w4, [x0]                     // THR — byte out
-    dmb     ish                          // H5: same — THR write orders
+    dsb     nsh                          // H5: same — THR write orders
                                          // against next LSR read.
     subs    w2, w2, #1
     b.ne    .Lemit_loop
