@@ -33,6 +33,7 @@ audit-ontology = "audit_ontology.cli:main"
 side-session-bootstrap = "side_session_bootstrap.cli:main"
 discipline-print = "discipline.cli:main"
 memreq-codegen = "memreq_codegen.cli:main"
+req-coverage = "req_coverage.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["tooling/src"]
