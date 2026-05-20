@@ -765,17 +765,21 @@ _entry:
     ldr     w9, =POLL_BUDGET             // wait budget (matches x86_64)
 .Lrx_wait_loop:
     yield
-    // H5: narrowed from dsb sy → dsb nshld. Keeps completion-wait
-    // semantics (essential for Device memory ordering per ARM ARM
-    // B2.3.7 — dmb with inner/outer-shareable Normal-memory
-    // attribute does NOT order Device-memory accesses) while
-    // dropping cross-cluster outer-shareability cost that
-    // dominated wall-clock on Cortex-A76. nsh covers the local PE,
-    // and `ld` constrains to load-direction since the loop body
-    // does only loads.
-    dsb     nshld
+    // H5: narrowed from dsb sy → dsb ishld. Inner-shareable
+    // domain (covers the host-side VMM device thread under KVM —
+    // the actual observer writing UsedRing.idx) is the minimum
+    // sufficient shareability; the prior `sy` extended to the
+    // outer-shareable / system domain at a per-iteration cost
+    // that dominated wall clock on Cortex-A76. `ld` direction
+    // narrows further to load-only ordering, which is correct
+    // because the loop body does only loads. Completion-wait
+    // semantics are preserved (still `dsb` not `dmb`) — required
+    // here because the prior post-notify path's completion
+    // depends on this barrier class even though the immediate
+    // hot-path ordering need is load-load.
+    dsb     ishld
     ldrh    w10, [x26, #2]               // UsedRing.idx
-    dsb     nshld
+    dsb     ishld
     cmp     w10, w28                     // H2: shadow-relative
     b.ne    .Lrx_received
     subs    w9, w9, #1
@@ -944,10 +948,10 @@ _entry:
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
     yield
-    // H5: narrowed from dsb sy → dsb nshld — see .Lrx_wait_loop.
-    dsb     nshld
+    // H5: narrowed from dsb sy → dsb ishld — see .Lrx_wait_loop.
+    dsb     ishld
     ldrh    w10, [x27, #2]               // TX UsedRing.idx
-    dsb     nshld
+    dsb     ishld
     cmp     w10, w28                     // H2: shadow-relative
     b.ne    .Ltx_reclaimed
     subs    w9, w9, #1
