@@ -688,10 +688,19 @@ kernel_main_64:
     jmp .halt
 
 .rx_received:
-    ; ring[0]: id (u32 @ +4), len (u32 @ +8). edi ← id, ebx ← len.
+    ; P2: slot-indexed read using H2 consumer-shadow (ebp). Slot =
+    ; shadow & (N-1); ring entry base = r15 + VIRTQ_OFF_USED +
+    ; slot*8 lands id at +4 and used_len at +8. For MVP shadow=0
+    ; the address resolves to the prior `[r15 + VIRTQ_OFF_USED + 4]`
+    ; / `[r15 + VIRTQ_OFF_USED + 8]` byte-for-byte. eax / ecx /
+    ; r10 are caller-saved scratch with no live value at this point.
+    mov eax, ebp                                     ; eax = shadow
+    lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
+    and eax, ecx                                     ; eax = slot
+    lea r10, [r15 + rax*8 + VIRTQ_OFF_USED]          ; entry base
     lfence
-    mov edi, [r15 + VIRTQ_OFF_USED + 4]
-    mov ebx, [r15 + VIRTQ_OFF_USED + 8]
+    mov edi, [r10 + 4]                               ; ring[slot].id
+    mov ebx, [r10 + 8]                               ; ring[slot].len
     lfence
 
     ; Bounds check id < VIRTQ_MAX_SIZE.
@@ -850,9 +859,16 @@ kernel_main_64:
     jmp .halt
 
 .tx_reclaimed:
+    ; P2: same slot-indexed pattern as .rx_received. The TX wait
+    ; loop reset ebp to 0 before polling so for MVP slot=0 and the
+    ; address is identical to the prior hardcoded form.
+    mov eax, ebp                                     ; eax = shadow
+    lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
+    and eax, ecx                                     ; eax = slot
+    lea r10, [r15 + rax*8 + TX_QUEUE_OFF + VIRTQ_OFF_USED]
     lfence
-    mov edi, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 4]    ; id
-    mov ebx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 8]    ; len
+    mov edi, [r10 + 4]                               ; ring[slot].id
+    mov ebx, [r10 + 8]                               ; ring[slot].len
     lfence
 
     ; Bounds-check id symmetrically with RX.

@@ -798,10 +798,19 @@ _entry:
     b       .Lflush
 
 .Lrx_received:
-    // UsedRing.ring[0]: id (u32 @ +4), len (u32 @ +8).
+    // P2: index the ring slot via the H2 consumer-shadow rather
+    // than hardcoded ring[0]. Each UsedRing entry is 8 bytes;
+    // entry_base = x26 + slot*8 puts id at +4 and len at +8
+    // (matching the prior hardcoded offsets for slot=0, so MVP
+    // single-frame byte-for-byte unchanged). Mask is w25 = N-1,
+    // valid because VIRTQ_MAX_SIZE is a power of 2 per Virtio
+    // 1.2 §4.1.4.3. x9 is caller-saved scratch with no live value
+    // at this point.
+    and     w9, w28, w25                 // slot = used_shadow & mask
+    add     x9, x26, x9, lsl #3          // entry_base = x26 + slot*8
     dsb     sy
-    ldr     w20, [x26, #4]               // id
-    ldr     w21, [x26, #8]               // used_len
+    ldr     w20, [x9, #4]                // ring[slot].id
+    ldr     w21, [x9, #8]                // ring[slot].len
     dsb     sy
 
     // Bounds check id < VIRTQ_MAX_SIZE.
@@ -970,9 +979,15 @@ _entry:
     b       .Lflush
 
 .Ltx_reclaimed:
+    // P2: same slot-indexed read as .Lrx_received. The TX wait
+    // loop reset w28 to 0 before the poll, so for MVP slot=0
+    // (= TX ring[0]) — identical bytes to the prior `[x27, #4]` /
+    // `[x27, #8]` hardcoded form. x9 is caller-saved scratch.
+    and     w9, w28, w25                 // slot = used_shadow & mask
+    add     x9, x27, x9, lsl #3          // entry_base = x27 + slot*8
     dsb     sy
-    ldr     w20, [x27, #4]               // id
-    ldr     w21, [x27, #8]               // used_len
+    ldr     w20, [x9, #4]                // ring[slot].id
+    ldr     w21, [x9, #8]                // ring[slot].len
     dsb     sy
 
     cmp     w20, #VIRTQ_MAX_SIZE
