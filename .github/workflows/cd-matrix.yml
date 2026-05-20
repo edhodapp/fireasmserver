@@ -259,6 +259,32 @@ jobs:
             sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user-static
           fi
 
+      # The Build guest step's Makefile invokes
+      # `../../.venv/bin/memreq-codegen` (per D066's Python-codegen
+      # build path). The OSACA step further down already creates a
+      # repo-root `.venv` and pip-installs the project; the build
+      # itself needs the same venv populated earlier in the timeline.
+      # Without this step, `Build guest` fails with "No such file
+      # or directory" — the pre-existing breakage since the Makefile
+      # adopted memreq-codegen on 2026-05-11.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up memreq_codegen venv
+        run: |
+          # Mirror the local-dev convention: `.venv/` at repo root,
+          # editable install of the project. The OSACA step later
+          # uses `if [[ ! -x .venv/bin/osaca ]]` to detect this
+          # exact venv, so we satisfy both consumers in one shot.
+          python3 -m venv .venv
+          .venv/bin/pip install -e ".[dev]"
+          # Sanity check — fail loudly if the entry point didn't
+          # land, before the build step hits the same problem with
+          # a less obvious error message.
+          test -x .venv/bin/memreq-codegen
+
       - name: Build guest
         run: make -C arch/${{ matrix.arch }} PLATFORM=${{ matrix.platform }}
 
