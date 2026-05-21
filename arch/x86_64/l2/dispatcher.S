@@ -73,6 +73,28 @@ TX_TEST_PKT_LEN             equ 72
 ; RX_FRAME_BUDGET (16).
 RX_FRAME_BUDGET             equ 16
 
+; FSA-3: no x86 code changes needed for the phantom-frame race
+; fix that landed on aarch64 (LDARH for load-acquire on idx).
+; x86 TSO (Total Store Order) provides load-acquire semantics on
+; every ordinary load — loads are never reordered with other
+; loads, and loads are never reordered with prior stores on the
+; same CPU. So the consumer reading UsedRing.idx followed by
+; ring[slot] followed by the buffer is naturally ordered.
+;
+; The producer (Firecracker virtio-net VMM thread on x86_64) also
+; benefits from TSO — stores are never reordered with other
+; stores. A write to UsedRing.idx is guaranteed to be observed
+; after all prior buffer + ring writes by any single observer.
+;
+; The lfence/mfence sprinkled through the existing path are
+; therefore conservative and could be reduced (see Intel SDM
+; Vol. 3A §8.2.2 — "Loads are not reordered with other loads.").
+; They stay for now as defensive symmetry with aarch64, where the
+; barriers ARE load-bearing. A future cleanup could narrow them.
+;
+; The race only manifested on aarch64 per the FSA-3 task notes
+; (~15-25% on Pi 5; never observed on x86_64).
+
 ; Externally defined in arch/x86_64/platform/firecracker/boot.S.
 extern emit_bytes
 extern emit_hex32

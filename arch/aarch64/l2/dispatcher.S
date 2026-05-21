@@ -116,16 +116,30 @@ l2_dispatch:
     add     x26, x19, #VIRTQ_OFF_USED
     mov     w28, #0                      // H2: RX used_shadow = 0
 
+    // FSA-3: replace `dsb ishld + ldrh` with `ldarh` (load-acquire
+    // halfword). ARMv8 acquire semantics: any subsequent memory
+    // access in program order is observed by the local PE AFTER
+    // the LDARH completes its read. This is the canonical
+    // consumer side of a release-acquire pair — the producer
+    // (Firecracker virtio-net VMM thread) publishes via a
+    // release-ordered store (smp_wmb on the host side), and the
+    // consumer's LDARH ensures all subsequent loads (ring slot,
+    // virtio_net_hdr fields, buffer payload) see the published
+    // state. Replaces the `dsb ishld` pattern that fixed barrier
+    // *class* but did not provide acquire ordering against the
+    // producer; addresses the phantom-frame `num_bufs=0` race
+    // (~15-25% rate on Pi 5 under inbound traffic). The yield
+    // stays — separately load-bearing for KVM VCPU scheduling
+    // liveness, not for correctness; see comment block before
+    // emit_bytes in boot.S.
+    //
+    // LDARH addressing mode is `[Xn|SP]` only (no offset), so
+    // pre-compute &UsedRing.idx in x11 outside the loop.
+    add     x11, x26, #2                 // x11 = &RX UsedRing.idx
     ldr     w9, =POLL_BUDGET
 .Lrx_wait_loop:
-    yield                                // keep — see emit_bytes header
-    // H5: dsb ishld — inner-shareable load-only ordering is the
-    // minimum sufficient class for KVM-hosted virtio device
-    // observers. See P4 doc block in boot.S for the full audit
-    // trail (init paths stay on dsb sy).
-    dsb     ishld
-    ldrh    w10, [x26, #2]               // UsedRing.idx
-    dsb     ishld
+    yield                                // KVM liveness; see comment above
+    ldarh   w10, [x11]                   // load-acquire UsedRing.idx
     cmp     w10, w28
     b.ne    .Lrx_received
     subs    w9, w9, #1
@@ -160,12 +174,18 @@ l2_dispatch:
 .Lrx_consume_body:
     // P2: ring slot via H2 consumer-shadow. mask = N-1 valid per
     // Virtio 1.2 §4.1.4.3 (VIRTQ_MAX_SIZE is a power of 2).
+    //
+    // FSA-3: no barrier needed around the slot read or buffer
+    // read. The most recent UsedRing.idx observation (either
+    // the .Lrx_wait_loop or the .Lrx_consume_check LDARH below)
+    // already provided acquire semantics, so all loads here see
+    // the producer's released state. Removed two `dsb sy` pairs
+    // (slot reads, buffer reads) that were redundant under the
+    // LDARH-acquire model.
     and     w9, w28, w25                 // slot = used_shadow & mask
     add     x9, x26, x9, lsl #3          // entry_base = x26 + slot*8
-    dsb     sy
     ldr     w20, [x9, #4]                // ring[slot].id
     ldr     w21, [x9, #8]                // ring[slot].len
-    dsb     sy
 
     // Bounds check id < VIRTQ_MAX_SIZE.
     cmp     w20, #VIRTQ_MAX_SIZE
@@ -179,10 +199,8 @@ l2_dispatch:
     add     x9, x9, x10                           // buffer addr
 
     // Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
-    dsb     sy
     ldrh    w22, [x9, #2]                         // hdr_len
     ldrh    w23, [x9, #10]                        // num_buffers
-    dsb     sy
 
     // Validate num_buffers == 1 under MVP no-MRG_RXBUF policy.
     cmp     w23, #1
@@ -236,9 +254,13 @@ l2_dispatch:
 
     // Queue probe — is there another completion already available?
     // No yield/wait here; this is a non-blocking drain.
-    dsb     ishld
-    ldrh    w10, [x26, #2]                        // UsedRing.idx
-    dsb     ishld
+    // FSA-3: LDARH for acquire. x11 is AAPCS64 caller-saved and
+    // emit_bytes/emit_hex32 don't formally preserve it (their
+    // contracts list x0, x5, x6, x7, x8, x30 only), so re-derive
+    // &RX UsedRing.idx here rather than relying on incidental
+    // preservation by the emit helpers.
+    add     x11, x26, #2                 // x11 = &RX UsedRing.idx
+    ldarh   w10, [x11]
     cmp     w10, w28
     b.ne    .Lrx_consume_body
     // else: idx == shadow → queue drained, fall through
@@ -292,12 +314,13 @@ l2_dispatch:
     // H2: TX consumer-shadow restart (independent of RX queue).
     mov     w28, #0
 
+    // FSA-3: load-acquire on TX UsedRing.idx — same rationale as
+    // the RX wait loop above. Pre-compute &TX UsedRing.idx in x11.
+    add     x11, x27, #2                 // x11 = &TX UsedRing.idx
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
-    yield
-    dsb     ishld
-    ldrh    w10, [x27, #2]               // TX UsedRing.idx
-    dsb     ishld
+    yield                                // KVM liveness
+    ldarh   w10, [x11]                   // load-acquire TX UsedRing.idx
     cmp     w10, w28
     b.ne    .Ltx_reclaimed
     subs    w9, w9, #1
@@ -309,12 +332,12 @@ l2_dispatch:
     b       .Lok
 
 .Ltx_reclaimed:
+    // FSA-3: no barrier needed — the .Ltx_wait_loop LDARH above
+    // provided acquire semantics covering these slot reads.
     and     w9, w28, w25                 // slot = used_shadow & mask
     add     x9, x27, x9, lsl #3          // entry_base = x27 + slot*8
-    dsb     sy
     ldr     w20, [x9, #4]                // ring[slot].id
     ldr     w21, [x9, #8]                // ring[slot].len
-    dsb     sy
 
     cmp     w20, #VIRTQ_MAX_SIZE
     b.hs    .Ltx_bad_id_fail
