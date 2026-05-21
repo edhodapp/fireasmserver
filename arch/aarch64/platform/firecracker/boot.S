@@ -767,288 +767,21 @@ _entry:
     mov     w2, #(rx_populated_msg_end - rx_populated_msg)
     bl      emit_bytes
 
-    // --- VIO-R-003/004: poll RX Used Ring for first completion ---
-    // Mirrors x86_64 boot.S lines 657-732 in aarch64 idioms.
+    // --- FSA-1: hand off to L2 dispatcher ---
     //
-    // Block-local register allocation across this and the subsequent
-    // TX submit/reclaim sub-block. x20-x25 are AAPCS64 callee-saved,
-    // so they survive emit_bytes / emit_hex32 calls without stack
-    // spilling. Cleaner than x86_64's push/pop staging because
-    // aarch64 has more callee-saved GPRs to spend.
+    // Everything from this point through RX consume, TX submit, and
+    // TX reclaim lives in arch/aarch64/l2/dispatcher.S behind the
+    // single AAPCS64 entry point `l2_dispatch`. The function returns
+    //   w0 = 0  → clean halt (success path or completion timeout)
+    //   w0 = 1  → set VIRTIO_STATUS_FAILED then halt (validation fail)
     //
-    //   x19 = RX virtq base (memreq hot-tier pin, pre-existing)
-    //   x6  = VIRTIO_MMIO_BASE (pre-existing)
-    //   x0  = UART base (pre-existing)
-    //   x20 = id from used ring (consumed across RX:FRAME emit,
-    //         then reused across TX:RECLAIMED emit)
-    //   x21 = used_len from used ring (RX then TX)
-    //   x22 = hdr_len (RX only)
-    //   x23 = num_buffers (RX only)
-    //   x24 = next_avail shadow (analog of x86_64 r14); initialised
-    //         to N after the RX populate completes since AvailRing.idx
-    //         was just published as N. Advances on each return.
-    //   x25 = mask = N - 1; AvailRing slot = next_avail & mask.
-    //         Valid because VIRTQ_MAX_SIZE is a power of 2 per
-    //         Virtio 1.2 §4.1.4.3.
-    //   x26 = RX UsedRing base (x19 + VIRTQ_OFF_USED). Hoisted as a
-    //         callee-saved pin because VIRTQ_OFF_USED = 0x2000 puts
-    //         the USED-header fields (+2, +4, +8) past the scaled
-    //         LDRH/LDR imm12 windows from x19 directly.
-    //   x27 = TX UsedRing base (x19 + TX_QUEUE_OFF + VIRTQ_OFF_USED).
-    //         Same reason; computed before the TX poll loop.
-    // H2: w28 = used_shadow tracking the last-consumed UsedRing.idx.
-    // The prior cbnz-on-non-zero pattern was brittle against wrap-
-    // around; shadow-relative comparison is correct across wraps and
-    // future multi-frame consumption. For the MVP single-frame case
-    // shadow stays at 0 throughout the wait, so first-frame
-    // behavior is unchanged. x28 is AAPCS64 callee-saved and outside
-    // the memreq hot pool (x19-x25); emit_bytes / emit_hex32 preserve
-    // it by virtue of the AAPCS64 convention.
-    mov     w24, #VIRTQ_MAX_SIZE
-    mov     w25, #(VIRTQ_MAX_SIZE - 1)
-    add     x26, x19, #VIRTQ_OFF_USED
-    mov     w28, #0                      // H2: RX used_shadow = 0
-
-    ldr     w9, =POLL_BUDGET             // wait budget (matches x86_64)
-.Lrx_wait_loop:
-    yield                                // keep — see emit_bytes header
-    // H5: narrowed from dsb sy → dsb ishld. Inner-shareable
-    // domain (covers the host-side VMM device thread under KVM —
-    // the actual observer writing UsedRing.idx) is the minimum
-    // sufficient shareability; the prior `sy` extended to the
-    // outer-shareable / system domain at a per-iteration cost
-    // that dominated wall clock on Cortex-A76. `ld` direction
-    // narrows further to load-only ordering, which is correct
-    // because the loop body does only loads. Completion-wait
-    // semantics are preserved (still `dsb` not `dmb`) — required
-    // here because the prior post-notify path's completion
-    // depends on this barrier class even though the immediate
-    // hot-path ordering need is load-load.
-    dsb     ishld
-    ldrh    w10, [x26, #2]               // UsedRing.idx
-    dsb     ishld
-    cmp     w10, w28                     // H2: shadow-relative
-    b.ne    .Lrx_received
-    subs    w9, w9, #1
-    b.ne    .Lrx_wait_loop
-
-    adr     x1, rx_timeout_msg
-    mov     w2, #(rx_timeout_msg_end - rx_timeout_msg)
-    bl      emit_bytes
-    b       .Lflush
-
-.Lrx_received:
-    // P2: index the ring slot via the H2 consumer-shadow rather
-    // than hardcoded ring[0]. Each UsedRing entry is 8 bytes;
-    // entry_base = x26 + slot*8 puts id at +4 and len at +8
-    // (matching the prior hardcoded offsets for slot=0, so MVP
-    // single-frame byte-for-byte unchanged). Mask is w25 = N-1,
-    // valid because VIRTQ_MAX_SIZE is a power of 2 per Virtio
-    // 1.2 §4.1.4.3. x9 is caller-saved scratch with no live value
-    // at this point.
-    and     w9, w28, w25                 // slot = used_shadow & mask
-    add     x9, x26, x9, lsl #3          // entry_base = x26 + slot*8
-    dsb     sy
-    ldr     w20, [x9, #4]                // ring[slot].id
-    ldr     w21, [x9, #8]                // ring[slot].len
-    dsb     sy
-
-    // Bounds check id < VIRTQ_MAX_SIZE.
-    cmp     w20, #VIRTQ_MAX_SIZE
-    b.hs    .Lrx_bad_id_fail
-
-    // Buffer addr: __memreq_addr__rx_buffer + id * 2048 (cold-tier
-    // lookup). One load per frame on the completion hot path; could
-    // become a hot-tier pin later (would require extending the
-    // x86_64 budget too — see #30).
-    adrp    x9, __memreq_addr__rx_buffer
-    add     x9, x9, :lo12:__memreq_addr__rx_buffer
-    ldr     x9, [x9]                              // pool base
-    lsl     x10, x20, #11                         // id * 2048
-    add     x9, x9, x10                           // buffer addr
-
-    // Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
-    dsb     sy
-    ldrh    w22, [x9, #2]                         // hdr_len
-    ldrh    w23, [x9, #10]                        // num_buffers
-    dsb     sy
-
-    // Validate num_buffers == 1 under MVP no-MRG_RXBUF policy.
-    cmp     w23, #1
-    b.ne    .Lrx_num_bufs_fail
-
-    // Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
-    adr     x1, rx_frame_prefix_msg
-    mov     w2, #(rx_frame_prefix_msg_end - rx_frame_prefix_msg)
-    bl      emit_bytes
-    mov     w5, w20
-    bl      emit_hex32
-
-    adr     x1, rx_frame_hdr_len_msg
-    mov     w2, #(rx_frame_hdr_len_msg_end - rx_frame_hdr_len_msg)
-    bl      emit_bytes
-    mov     w5, w22
-    bl      emit_hex32
-
-    adr     x1, rx_frame_num_bufs_msg
-    mov     w2, #(rx_frame_num_bufs_msg_end - rx_frame_num_bufs_msg)
-    bl      emit_bytes
-    mov     w5, w23
-    bl      emit_hex32
-
-    adr     x1, rx_frame_used_len_msg
-    mov     w2, #(rx_frame_used_len_msg_end - rx_frame_used_len_msg)
-    bl      emit_bytes
-    mov     w5, w21
-    bl      emit_hex32
-
-    adr     x1, newline_msg
-    mov     w2, #(newline_msg_end - newline_msg)
-    bl      emit_bytes
-
-    // --- VIO-R-006/007: return consumed descriptor + notify ---
-    // Slot = next_avail mod N via mask. AvailRing.ring[slot] = id.
-    and     w10, w24, w25                         // slot = x24 & mask
-    add     x11, x19, #VIRTQ_OFF_AVAIL
-    add     x11, x11, #4                          // skip flags + idx
-    strh    w20, [x11, x10, lsl #1]               // ring[slot] = id
-
-    // Barrier before idx bump.
-    dsb     sy
-
-    // Advance shadow + publish AvailRing.idx.
-    add     w24, w24, #1
-    add     x11, x19, #VIRTQ_OFF_AVAIL
-    strh    w24, [x11, #2]
-
-    // Barrier before notify.
-    dsb     sy
-
-    // Kick RX (queue 0).
-    str     wzr, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
-    dsb     sy
-
-    // H2: advance used_shadow now that ring[0] has been consumed.
-    // For MVP single-frame this is the only consume; the increment
-    // is structural insurance against future multi-frame iteration.
-    add     w28, w28, #1
-
-    adr     x1, rx_returned_msg
-    mov     w2, #(rx_returned_msg_end - rx_returned_msg)
-    bl      emit_bytes
-
-    // --- VIO-T-002..005: submit one canary Ethernet frame on TX ---
-    // TX queue base = x19 + TX_QUEUE_OFF. Descriptor[0] points at
-    // tx_test_pkt with len = tx_test_pkt_end - tx_test_pkt, flags = 0
-    // (device-readable, no F_WRITE since TX buffers are driver→device).
-    //
-    // x11 holds the TX descriptor base across the descriptor write.
-    // Subsequent AvailRing accesses use a second temporary in x12
-    // since TX_QUEUE_OFF + VIRTQ_OFF_AVAIL = 0x4000 exceeds the
-    // ADD 12-bit-with-LSL-12 immediate range from x19 in one step.
-    adrp    x10, tx_test_pkt
-    add     x10, x10, :lo12:tx_test_pkt           // runtime addr (any aarch64 address)
-    add     x11, x19, #TX_QUEUE_OFF               // TX queue base (0x3000 = 3<<12)
-    // desc.addr is u64 at offset 0 (Virtio 1.2 §2.7.5.1) — write
-    // the full 64-bit address in one store. Robust regardless of
-    // where the linker places .rodata; diverges from x86_64 (which
-    // splits into two 32-bit stores because NASM's `mov dword [...]`
-    // is bounded by a 32-bit immediate). aarch64's xN store covers
-    // both halves atomically and removes the implicit < 4 GiB
-    // assumption.
-    str     x10, [x11, #0]                        // desc.addr (u64)
-    mov     w12, #(tx_test_pkt_end - tx_test_pkt)
-    str     w12, [x11, #8]                        // desc.len
-    strh    wzr, [x11, #12]                       // desc.flags = 0
-    strh    wzr, [x11, #14]                       // desc.next  = 0
-
-    // TX AvailRing base = TX_QUEUE_BASE + VIRTQ_OFF_AVAIL.
-    add     x12, x11, #VIRTQ_OFF_AVAIL            // 0x1000 = 1<<12
-
-    // AvailRing.ring[0] = 0 (single-desc head). Slot at +4 past
-    // flags + idx header.
-    strh    wzr, [x12, #4]
-
-    // Barrier before idx bump.
-    dsb     sy
-
-    // Publish TX AvailRing.idx = 1 at +2.
-    mov     w13, #1
-    strh    w13, [x12, #2]
-
-    // Barrier before notify.
-    dsb     sy
-
-    // Kick TX (queue 1).
-    str     w13, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
-    dsb     sy
-
-    adr     x1, tx_submitted_msg
-    mov     w2, #(tx_submitted_msg_end - tx_submitted_msg)
-    bl      emit_bytes
-
-    // --- VIO-T-006: poll TX Used Ring for completion ---
-    // x27 = TX UsedRing base; offsets +2/+4/+8 then fit LDR/LDRH
-    // scaled imm12. The composed constant TX_QUEUE_OFF +
-    // VIRTQ_OFF_USED = 0x5000 = 5<<12 fits the ADD imm12-with-
-    // LSL-12 encoding (imm12=5, shift=12) in one instruction.
-    add     x27, x19, #(TX_QUEUE_OFF + VIRTQ_OFF_USED)
-
-    // H2: TX consumer-shadow restart. The TX queue's used-idx
-    // counter is independent of the RX queue's, so reset w28 to 0
-    // before the TX wait. (For more concurrent queues we'd use
-    // separate registers; here re-using w28 is correct because
-    // RX consume is complete by this point.)
-    mov     w28, #0
-
-    ldr     w9, =POLL_BUDGET
-.Ltx_wait_loop:
-    yield                                // keep — see emit_bytes header
-    // H5: narrowed from dsb sy → dsb ishld — see .Lrx_wait_loop.
-    dsb     ishld
-    ldrh    w10, [x27, #2]               // TX UsedRing.idx
-    dsb     ishld
-    cmp     w10, w28                     // H2: shadow-relative
-    b.ne    .Ltx_reclaimed
-    subs    w9, w9, #1
-    b.ne    .Ltx_wait_loop
-
-    adr     x1, tx_timeout_msg
-    mov     w2, #(tx_timeout_msg_end - tx_timeout_msg)
-    bl      emit_bytes
-    b       .Lflush
-
-.Ltx_reclaimed:
-    // P2: same slot-indexed read as .Lrx_received. The TX wait
-    // loop reset w28 to 0 before the poll, so for MVP slot=0
-    // (= TX ring[0]) — identical bytes to the prior `[x27, #4]` /
-    // `[x27, #8]` hardcoded form. x9 is caller-saved scratch.
-    and     w9, w28, w25                 // slot = used_shadow & mask
-    add     x9, x27, x9, lsl #3          // entry_base = x27 + slot*8
-    dsb     sy
-    ldr     w20, [x9, #4]                // ring[slot].id
-    ldr     w21, [x9, #8]                // ring[slot].len
-    dsb     sy
-
-    cmp     w20, #VIRTQ_MAX_SIZE
-    b.hs    .Ltx_bad_id_fail
-
-    // Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX
-    adr     x1, tx_reclaimed_prefix_msg
-    mov     w2, #(tx_reclaimed_prefix_msg_end - tx_reclaimed_prefix_msg)
-    bl      emit_bytes
-    mov     w5, w20
-    bl      emit_hex32
-
-    adr     x1, tx_used_len_msg
-    mov     w2, #(tx_used_len_msg_end - tx_used_len_msg)
-    bl      emit_bytes
-    mov     w5, w21
-    bl      emit_hex32
-
-    adr     x1, newline_msg
-    mov     w2, #(newline_msg_end - newline_msg)
-    bl      emit_bytes
+    // Entry contract: x0 = UART, x6 = VIRTIO_MMIO base, x19 = RX
+    // virtq base. All preserved across the call by the conventional
+    // memreq pin discipline that emit_bytes / emit_hex32 already
+    // observe; AAPCS64 callee-saved set (x19-x28) preserved by
+    // l2_dispatch's prologue/epilogue.
+    bl      l2_dispatch
+    cbnz    w0, .Lset_failed
     b       .Lflush
 
 .Ldriver_ok_fail:
@@ -1173,47 +906,6 @@ _entry:
     bl      emit_bytes
     b       .Lflush
 
-.Lrx_bad_id_fail:
-    // RX UsedRing.ring[0].id is out of range (>= VIRTQ_MAX_SIZE).
-    // w20 holds the observed id.
-    adr     x1, rx_bad_id_msg
-    mov     w2, #(rx_bad_id_msg_end - rx_bad_id_msg)
-    bl      emit_bytes
-    mov     w5, w20
-    bl      emit_hex32
-    adr     x1, newline_msg
-    mov     w2, #(newline_msg_end - newline_msg)
-    bl      emit_bytes
-    b       .Lset_failed
-
-.Lrx_num_bufs_fail:
-    // virtio_net_hdr.num_buffers != 1 — MRG_RXBUF wasn't
-    // negotiated under the VIO-F-001 MVP subset, so a multi-
-    // buffer RX is a protocol-level violation. w23 holds the
-    // observed value.
-    adr     x1, rx_num_bufs_msg
-    mov     w2, #(rx_num_bufs_msg_end - rx_num_bufs_msg)
-    bl      emit_bytes
-    mov     w5, w23
-    bl      emit_hex32
-    adr     x1, newline_msg
-    mov     w2, #(newline_msg_end - newline_msg)
-    bl      emit_bytes
-    b       .Lset_failed
-
-.Ltx_bad_id_fail:
-    // TX UsedRing.ring[0].id is out of range. w20 holds the
-    // observed id. Symmetric with .Lrx_bad_id_fail.
-    adr     x1, tx_bad_id_msg
-    mov     w2, #(tx_bad_id_msg_end - tx_bad_id_msg)
-    bl      emit_bytes
-    mov     w5, w20
-    bl      emit_hex32
-    adr     x1, newline_msg
-    mov     w2, #(newline_msg_end - newline_msg)
-    bl      emit_bytes
-    b       .Lset_failed
-
 .Lflush:
     dsb     sy
     b       .Ldone
@@ -1277,6 +969,15 @@ _entry:
 //
 // Keep all three yields. The no-traffic wall-clock optimization
 // happens at the iteration-count level (POLL_BUDGET) instead.
+
+// Cross-file symbols consumed by arch/aarch64/l2/dispatcher.S:
+//   emit_bytes, emit_hex32 — UART write helpers
+//   newline_msg            — single-byte "\n" string
+//   tx_test_pkt            — canary TX frame (72 bytes)
+.global emit_bytes
+.global emit_hex32
+.global newline_msg
+.global tx_test_pkt
 
 // emit_bytes: write w2 bytes from [x1] via UART at x0.
 //   In:      x0 = UART base (preserved)
@@ -1433,50 +1134,6 @@ driver_ok_fail_msg_end:
 rx_populated_msg:
     .ascii  "RX:POPULATED\n"
 rx_populated_msg_end:
-rx_timeout_msg:
-    .ascii  "RX:TIMEOUT\n"
-rx_timeout_msg_end:
-
-rx_frame_prefix_msg:
-    .ascii  "RX:FRAME id="
-rx_frame_prefix_msg_end:
-rx_frame_hdr_len_msg:
-    .ascii  " hdr_len="
-rx_frame_hdr_len_msg_end:
-rx_frame_num_bufs_msg:
-    .ascii  " num_bufs="
-rx_frame_num_bufs_msg_end:
-rx_frame_used_len_msg:
-    .ascii  " used_len="
-rx_frame_used_len_msg_end:
-
-rx_bad_id_msg:
-    .ascii  "RX:FAIL bad_id="
-rx_bad_id_msg_end:
-rx_num_bufs_msg:
-    .ascii  "RX:FAIL num_bufs="
-rx_num_bufs_msg_end:
-
-rx_returned_msg:
-    .ascii  "RX:RETURNED\n"
-rx_returned_msg_end:
-
-tx_submitted_msg:
-    .ascii  "TX:SUBMITTED\n"
-tx_submitted_msg_end:
-tx_timeout_msg:
-    .ascii  "TX:TIMEOUT\n"
-tx_timeout_msg_end:
-tx_reclaimed_prefix_msg:
-    .ascii  "TX:RECLAIMED id="
-tx_reclaimed_prefix_msg_end:
-tx_used_len_msg:
-    .ascii  " used_len="
-tx_used_len_msg_end:
-tx_bad_id_msg:
-    .ascii  "TX:FAIL bad_id="
-tx_bad_id_msg_end:
-
 newline_msg:
     .ascii  "\n"
 newline_msg_end:

@@ -52,11 +52,25 @@ PLAT_OBJECTS := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(PLAT_SOURCES))
 # Arch-shared sources live one level up under arch/x86_64/<subdir>/.
 # `memory/` holds the init-time static memory layout machinery
 # (D059 + D060 — bump allocator, bytecode VM, .memreq macros).
-# Crypto stays out: those .S files are exercised by the host-side
-# test harness in tooling/crypto_tests/, not linked into the guest
-# kernel today.
-ARCH_SOURCES := $(sort $(wildcard memory/*.S))
-ARCH_OBJECTS := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(ARCH_SOURCES))
+# `l2/` holds the FSA dispatcher + transitions + buffer-pool sizing
+# (D012 + D043 — FSA runtime). Crypto stays out: those .S files
+# are exercised by the host-side test harness in
+# tooling/crypto_tests/, not linked into the guest kernel today.
+MEM_SOURCES  := $(sort $(wildcard memory/*.S))
+MEM_OBJECTS  := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(MEM_SOURCES))
+# L2 dispatcher pulls in virtio-MMIO + emit_bytes/emit_hex32 + the
+# canary TX frame; only the firecracker platform wires those today.
+# The qemu platform's boot.S is a minimal Multiboot1 stub without
+# virtio. Conditional inclusion avoids unresolved external refs at
+# link time on the qemu target.
+ifeq ($(PLATFORM),firecracker)
+L2_SOURCES   := $(sort $(wildcard l2/*.S))
+L2_OBJECTS   := $(patsubst l2/%.S,$(BUILD_DIR)/l2/%.o,$(L2_SOURCES))
+else
+L2_SOURCES   :=
+L2_OBJECTS   :=
+endif
+ARCH_OBJECTS := $(MEM_OBJECTS) $(L2_OBJECTS)
 OBJECTS      := $(PLAT_OBJECTS) $(ARCH_OBJECTS)
 LINKER_SCRIPT := $(SRC_DIR)/linker.ld
 BINARY := $(BUILD_DIR)/guest.elf
@@ -69,6 +83,9 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S $(MEMREQ_INCS) | $(BUILD_DIR)
 	$(AS) $(ASFLAGS) -o $@ $<
 
 $(BUILD_DIR)/memory/%.o: memory/%.S | $(BUILD_DIR)/memory
+	$(AS) $(ASFLAGS) -o $@ $<
+
+$(BUILD_DIR)/l2/%.o: l2/%.S | $(BUILD_DIR)/l2
 	$(AS) $(ASFLAGS) -o $@ $<
 
 # Both .inc files are produced in one tool invocation; the second
@@ -84,7 +101,7 @@ $(BUILD_DIR)/memreq_pin_hot.inc &: \
 $(BINARY): $(OBJECTS) $(LINKER_SCRIPT)
 	$(LD) $(LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS)
 
-$(BUILD_DIR) $(BUILD_DIR)/memory:
+$(BUILD_DIR) $(BUILD_DIR)/memory $(BUILD_DIR)/l2:
 	mkdir -p $@
 
 clean:

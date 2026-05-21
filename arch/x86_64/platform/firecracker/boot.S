@@ -115,6 +115,7 @@ VIRTIO_F_VERSION_1_HIBIT  equ 1
 
 extern mode_switch_to_long_mode
 extern init_memory_layout
+extern l2_dispatch    ; arch/x86_64/l2/dispatcher.S (FSA-1)
 
 ; ----- PVH ELF note -----
 
@@ -678,285 +679,25 @@ kernel_main_64:
     mov ecx, rx_populated_len
     call emit_bytes
 
-    ; --- VIO-R-003/004: poll Used Ring for first RX completion ---
-    ; H2: maintain a consumer-shadow (rbp) tracking the last-consumed
-    ; UsedRing.idx, and compare incoming idx against the shadow. The
-    ; prior "test ax, ax; jnz" pattern triggered on any non-zero idx,
-    ; which is brittle against wrap-around. For the MVP single-frame
-    ; case shadow == 0 throughout the wait, so the comparison reduces
-    ; to the same first-frame behavior; the structural change buys
-    ; correctness for any future multi-frame work.
+    ; --- FSA-1: hand off to L2 dispatcher ---
     ;
-    ; rbp was previously used as a scratch for `num_buffers` inside
-    ; .rx_received; that consumer moves to r11d so rbp can carry the
-    ; persistent shadow across the emit chain (rbp is callee-saved
-    ; per SysV ABI and emit_bytes/emit_hex32 preserve it).
-    xor ebp, ebp                                 ; RX used_shadow = 0
-    mov ecx, 100000000
-.rx_wait_loop:
-    lfence
-    mov ax, [r15 + VIRTQ_OFF_USED + 2]
-    lfence
-    cmp ax, bp                                   ; H2: shadow-relative
-    jne .rx_received
-    dec ecx
-    jnz .rx_wait_loop
-
-    lea rsi, [rel rx_timeout_msg]
-    mov ecx, rx_timeout_len
-    call emit_bytes
+    ; Everything from this point through RX consume, TX submit, and
+    ; TX reclaim lives in arch/x86_64/l2/dispatcher.S behind the
+    ; single SysV entry point `l2_dispatch`. The function returns
+    ;   eax = 0  → clean halt (success path or completion timeout)
+    ;   eax = 1  → set VIRTIO_STATUS_FAILED then halt (validation fail)
+    ;
+    ; Entry contract: r12 = VIRTIO_MMIO base, r13 = N, r14 =
+    ; next_avail, r15 = virtq base. SysV callee-saved set (rbx,
+    ; rbp, r12-r15) preserved by l2_dispatch's prologue/epilogue.
+    call l2_dispatch
+    test eax, eax
+    jnz .set_failed
     jmp .halt
-
-.rx_received:
-    ; P2: slot-indexed read using H2 consumer-shadow (ebp). Slot =
-    ; shadow & (N-1); ring entry base = r15 + VIRTQ_OFF_USED +
-    ; slot*8 lands id at +4 and used_len at +8. For MVP shadow=0
-    ; the address resolves to the prior `[r15 + VIRTQ_OFF_USED + 4]`
-    ; / `[r15 + VIRTQ_OFF_USED + 8]` byte-for-byte. eax / ecx /
-    ; r10 are caller-saved scratch with no live value at this point.
-    mov eax, ebp                                     ; eax = shadow
-    lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
-    and eax, ecx                                     ; eax = slot
-    lea r10, [r15 + rax*8 + VIRTQ_OFF_USED]          ; entry base
-    lfence
-    mov edi, [r10 + 4]                               ; ring[slot].id
-    mov ebx, [r10 + 8]                               ; ring[slot].len
-    lfence
-
-    ; Bounds check id < VIRTQ_MAX_SIZE.
-    cmp edi, VIRTQ_MAX_SIZE
-    jae .rx_bad_id_fail
-
-    ; Buffer addr: __memreq_addr__rx_buffer + id*2048 (cold-tier
-    ; lookup). One load per frame on the RX completion hot path;
-    ; could become a hot-tier pin later (task #30 would extend the
-    ; x86_64 budget to make room).
-    mov rax, [rel __memreq_addr__rx_buffer]
-    mov ecx, edi
-    shl ecx, 11
-    add rax, rcx
-
-    ; Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
-    ; H2: num_buffers reads into r11d (was rbp) so rbp can hold the
-    ; used_shadow across the emit chain.
-    lfence
-    movzx esi, word [rax + 2]                        ; hdr_len
-    movzx r11d, word [rax + 10]                      ; num_buffers
-    lfence
-
-    ; Validate num_buffers == 1 under MVP no-MRG_RXBUF policy.
-    cmp r11d, 1
-    jne .rx_num_bufs_fail
-
-    ; Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
-    ; Push order: used_len, num_bufs, hdr_len, id (last → first pop = id).
-    push rbx                                         ; used_len
-    push r11                                         ; num_buffers (H2)
-    push rsi                                         ; hdr_len
-    push rdi                                         ; id
-
-    lea rsi, [rel rx_frame_prefix_msg]
-    mov ecx, rx_frame_prefix_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-
-    lea rsi, [rel rx_frame_hdr_len_msg]
-    mov ecx, rx_frame_hdr_len_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-
-    lea rsi, [rel rx_frame_num_bufs_msg]
-    mov ecx, rx_frame_num_bufs_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-
-    lea rsi, [rel rx_frame_used_len_msg]
-    mov ecx, rx_frame_used_len_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-
-    lea rsi, [rel newline]
-    mov ecx, 1
-    call emit_bytes
-
-    ; --- VIO-R-006/007: return consumed descriptor + notify ---
-    ; H2: advance the consumer-shadow now that we've consumed ring[0].
-    ; rdi is clobbered by the emit_hex32 chain above; re-read id from
-    ; ring[(shadow_pre_inc) & mask] — for MVP that's still ring[0].
-    ; Tracking the shadow here keeps the structure correct against
-    ; multi-frame consumption that future iterations may add.
-    inc ebp                                          ; used_shadow_rx++
-    lfence
-    mov edi, [r15 + VIRTQ_OFF_USED + 4]
-    lfence
-
-    ; Use the driver-private next-avail shadow (r14, initialized to
-    ; N after RX populate). Computes slot = next_avail mod N where
-    ; mask = N - 1 (valid because Virtio §4.1.4.3 mandates queue
-    ; size be a power of 2). Replaces the prior pattern of re-
-    ; reading AvailRing.idx from shared memory.
-    mov eax, r14d                   ; eax = next_avail
-    lea ebx, [r13d - 1]              ; ebx = mask = N - 1
-    and eax, ebx                    ; eax = next_avail mod N
-
-    ; ring[slot] = id.
-    mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di
-
-    ; Barrier before idx bump.
-    mfence
-
-    ; Advance shadow + publish.
-    inc r14d
-    mov [r15 + VIRTQ_OFF_AVAIL + 2], r14w
-
-    ; Barrier before notify.
-    mfence
-
-    ; Kick RX (queue 0).
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 0
-    mfence
-
-    lea rsi, [rel rx_returned_msg]
-    mov ecx, rx_returned_len
-    call emit_bytes
-
-    ; --- VIO-T-002..005: submit one canary Ethernet frame ---
-    lea rbx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_DESC]
-    ; addr_lo = tx_test_pkt absolute address. NASM in [bits 64]
-    ; with `mov dword [...], imm32` writes a sign-extended-to-64
-    ; immediate; tx_test_pkt's address is < 4 GiB so the 32-bit
-    ; immediate is correct as a phys address. Stays valid only
-    ; while paging identity-maps low 4 GiB (D063); a future non-
-    ; identity layout would need a phys-frame translation here.
-    mov dword [rbx + 0],  tx_test_pkt
-    mov dword [rbx + 4],  0
-    mov dword [rbx + 8],  tx_test_pkt_len
-    mov word  [rbx + 12], 0
-    mov word  [rbx + 14], 0
-
-    ; AvailRing.ring[0] = 0 (head descriptor of single-desc TX).
-    mov word [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 4], 0
-
-    ; Barrier before idx bump.
-    mfence
-
-    ; Publish AvailRing.idx = 1.
-    mov word [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 2], 1
-
-    ; Barrier before notify.
-    mfence
-
-    ; Kick TX (queue 1).
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 1
-    mfence
-
-    lea rsi, [rel tx_submitted_msg]
-    mov ecx, tx_submitted_len
-    call emit_bytes
-
-    ; --- VIO-T-006: poll TX Used Ring for completion ---
-    ; H2: TX consumer-shadow restart for the TX wait. We just bumped
-    ; rbp to 1 after RX consume; the TX queue's shadow is a separate
-    ; logical counter starting at 0, so reset rbp before the wait.
-    xor ebp, ebp                                     ; TX used_shadow = 0
-    mov ecx, 100000000
-.tx_wait_loop:
-    lfence
-    mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]
-    lfence
-    cmp ax, bp                                       ; H2: shadow-relative
-    jne .tx_reclaimed
-    dec ecx
-    jnz .tx_wait_loop
-
-    lea rsi, [rel tx_timeout_msg]
-    mov ecx, tx_timeout_len
-    call emit_bytes
-    jmp .halt
-
-.tx_reclaimed:
-    ; P2: same slot-indexed pattern as .rx_received. The TX wait
-    ; loop reset ebp to 0 before polling so for MVP slot=0 and the
-    ; address is identical to the prior hardcoded form.
-    mov eax, ebp                                     ; eax = shadow
-    lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
-    and eax, ecx                                     ; eax = slot
-    lea r10, [r15 + rax*8 + TX_QUEUE_OFF + VIRTQ_OFF_USED]
-    lfence
-    mov edi, [r10 + 4]                               ; ring[slot].id
-    mov ebx, [r10 + 8]                               ; ring[slot].len
-    lfence
-
-    ; Bounds-check id symmetrically with RX.
-    cmp edi, VIRTQ_MAX_SIZE
-    jae .tx_bad_id_fail
-
-    ; Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX
-    push rbx                                         ; used_len
-    push rdi                                         ; id
-
-    lea rsi, [rel tx_reclaimed_prefix_msg]
-    mov ecx, tx_reclaimed_prefix_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-
-    lea rsi, [rel tx_used_len_msg]
-    mov ecx, tx_used_len_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-
-    lea rsi, [rel newline]
-    mov ecx, 1
-    call emit_bytes
-    jmp .halt
-
 .driver_ok_fail:
     push rax
     lea rsi, [rel driver_ok_fail_msg]
     mov ecx, driver_ok_fail_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-    lea rsi, [rel newline]
-    mov ecx, 1
-    call emit_bytes
-    jmp .set_failed
-
-.rx_bad_id_fail:
-    push rdi
-    lea rsi, [rel rx_bad_id_msg]
-    mov ecx, rx_bad_id_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-    lea rsi, [rel newline]
-    mov ecx, 1
-    call emit_bytes
-    jmp .set_failed
-
-.rx_num_bufs_fail:
-    ; H2: num_buffers now lives in r11d (was rbp).
-    push r11
-    lea rsi, [rel rx_num_bufs_msg]
-    mov ecx, rx_num_bufs_len
-    call emit_bytes
-    pop rax
-    call emit_hex32
-    lea rsi, [rel newline]
-    mov ecx, 1
-    call emit_bytes
-    jmp .set_failed
-
-.tx_bad_id_fail:
-    push rdi
-    lea rsi, [rel tx_bad_id_msg]
-    mov ecx, tx_bad_id_len
     call emit_bytes
     pop rax
     call emit_hex32
@@ -1096,6 +837,15 @@ kernel_main_64:
 ;   Clobbers: eax, ecx, esi/rsi, edi, flags.
 ;   Preserves: dx, rbx, rbp, rsp, r12 (and all other callee-saved).
 
+; Cross-file symbols consumed by arch/x86_64/l2/dispatcher.S:
+;   emit_bytes, emit_hex32 — UART write helpers
+;   newline                — single-byte 0x0A string
+;   tx_test_pkt            — canary TX frame (72 bytes)
+global emit_bytes
+global emit_hex32
+global newline
+global tx_test_pkt
+
 [bits 64]
 emit_bytes:
     test ecx, ecx
@@ -1226,36 +976,6 @@ driver_ok_len          equ $ - driver_ok_msg
 rx_populated_msg:      db 'RX:POPULATED', 10
 rx_populated_len       equ $ - rx_populated_msg
 
-rx_timeout_msg:        db 'RX:TIMEOUT', 10
-rx_timeout_len         equ $ - rx_timeout_msg
-
-rx_frame_prefix_msg:   db 'RX:FRAME id='
-rx_frame_prefix_len    equ $ - rx_frame_prefix_msg
-rx_frame_hdr_len_msg:  db ' hdr_len='
-rx_frame_hdr_len_len   equ $ - rx_frame_hdr_len_msg
-rx_frame_num_bufs_msg: db ' num_bufs='
-rx_frame_num_bufs_len  equ $ - rx_frame_num_bufs_msg
-rx_frame_used_len_msg: db ' used_len='
-rx_frame_used_len_len  equ $ - rx_frame_used_len_msg
-
-rx_bad_id_msg:         db 'RX:FAIL bad_id='
-rx_bad_id_len          equ $ - rx_bad_id_msg
-rx_num_bufs_msg:       db 'RX:FAIL num_bufs='
-rx_num_bufs_len        equ $ - rx_num_bufs_msg
-
-rx_returned_msg:       db 'RX:RETURNED', 10
-rx_returned_len        equ $ - rx_returned_msg
-
-tx_submitted_msg:      db 'TX:SUBMITTED', 10
-tx_submitted_len       equ $ - tx_submitted_msg
-tx_timeout_msg:        db 'TX:TIMEOUT', 10
-tx_timeout_len         equ $ - tx_timeout_msg
-tx_reclaimed_prefix_msg: db 'TX:RECLAIMED id='
-tx_reclaimed_prefix_len  equ $ - tx_reclaimed_prefix_msg
-tx_used_len_msg:       db ' used_len='
-tx_used_len_len        equ $ - tx_used_len_msg
-tx_bad_id_msg:         db 'TX:FAIL bad_id='
-tx_bad_id_len          equ $ - tx_bad_id_msg
 
 tx_test_pkt:
     times 12 db 0                                    ; virtio_net_hdr zero
