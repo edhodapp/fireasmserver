@@ -66,6 +66,13 @@ POLL_BUDGET                 equ 100000000
 ; in boot.S.
 TX_TEST_PKT_LEN             equ 72
 
+; FSA-2: per-dispatch RX frame budget. Caps how many RX completions
+; the multi-frame consume loop drains in a single l2_dispatch call.
+; Per D043 ("bounded transitions") the dispatcher must not
+; monopolize the CPU on a long burst. Mirrors aarch64's
+; RX_FRAME_BUDGET (16).
+RX_FRAME_BUDGET             equ 16
+
 ; Externally defined in arch/x86_64/platform/firecracker/boot.S.
 extern emit_bytes
 extern emit_hex32
@@ -108,6 +115,24 @@ l2_dispatch:
     jmp .l2_ok
 
 .l2_rx_received:
+    ; FSA-2: multi-frame consume loop. The wait loop above
+    ; established idx != shadow on entry, so the first iteration
+    ; proceeds unconditionally. Subsequent iterations re-enter via
+    ; .l2_rx_consume_check (post-consume budget + queue probe).
+    ;
+    ; Per-frame work: read ring slot, bounds-check id, read
+    ; virtio_net_hdr, validate num_buffers, emit RX:FRAME, then
+    ; write the descriptor id into AvailRing.ring[next_avail & mask].
+    ; The AvailRing.idx publish + RX QueueNotify are BATCHED to
+    ; .l2_rx_drained — one mfence + one idx store + one notify
+    ; covers all frames consumed this dispatch. Spec-compliant
+    ; per Virtio 1.2 §2.7.13.3.
+    ;
+    ; Frame budget: rbp doubles as the consumer shadow and the
+    ; per-dispatch frame counter (initialized to 0 at .l2_rx_wait_loop
+    ; setup). FSA-3+ will separate them when shadow becomes
+    ; persistent across dispatcher calls.
+.l2_rx_consume_body:
     ; P2: slot-indexed read using H2 consumer-shadow.
     mov eax, ebp                                     ; eax = shadow
     lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
@@ -171,28 +196,52 @@ l2_dispatch:
     mov ecx, 1
     call emit_bytes
 
-    ; --- VIO-R-006/007: return consumed descriptor + notify ---
-    inc ebp                                          ; used_shadow_rx++
+    ; --- VIO-R-006: per-frame AvailRing.ring[slot] = id ---
+    ; The emit chain clobbered rdi/rcx/rax (SysV caller-saved);
+    ; re-derive id from the current shadow's slot. FSA-1's
+    ; predecessor inline code hardcoded ring[0].id here, which
+    ; was correct for the single-shot case (shadow always 0)
+    ; but would break under multi-frame iteration.
+    mov eax, ebp                                     ; eax = shadow
+    lea ecx, [r13d - 1]                              ; ecx = mask
+    and eax, ecx                                     ; eax = slot
+    lea r10, [r15 + rax*8 + VIRTQ_OFF_USED]          ; entry base
     lfence
-    mov edi, [r15 + VIRTQ_OFF_USED + 4]
+    mov edi, [r10 + 4]                               ; re-read ring[slot].id
     lfence
 
     mov eax, r14d                                    ; eax = next_avail
-    lea ebx, [r13d - 1]                              ; ebx = mask = N - 1
-    and eax, ebx                                     ; eax = next_avail mod N
+    lea ecx, [r13d - 1]                              ; ecx = mask
+    and eax, ecx                                     ; eax = next_avail mod N
+    mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di      ; ring[avail_slot] = id
 
-    mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di      ; ring[slot] = id
-
-    mfence
-
+    ; Advance both shadows after the recycle write.
     inc r14d
-    mov [r15 + VIRTQ_OFF_AVAIL + 2], r14w
+    inc ebp
 
+.l2_rx_consume_check:
+    ; Budget check first — bounded-transition invariant.
+    cmp ebp, RX_FRAME_BUDGET
+    jae .l2_rx_drained
+
+    ; Queue probe — is there another completion already available?
+    ; No busy-wait here; this is a non-blocking drain.
+    lfence
+    mov ax, [r15 + VIRTQ_OFF_USED + 2]
+    lfence
+    cmp ax, bp
+    jne .l2_rx_consume_body
+    ; else: idx == shadow → queue drained, fall through
+
+.l2_rx_drained:
+    ; --- VIO-R-007: batched AvailRing.idx publish + RX kick ---
+    mfence
+    mov [r15 + VIRTQ_OFF_AVAIL + 2], r14w             ; AvailRing.idx = next_avail
+    mfence
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 0     ; kick RX
     mfence
 
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 0    ; kick RX
-    mfence
-
+    ; Emit RX:RETURNED once per dispatch (after all frames consumed).
     lea rsi, [rel rx_returned_msg]
     mov ecx, rx_returned_len
     call emit_bytes

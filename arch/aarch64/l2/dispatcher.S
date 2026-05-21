@@ -65,6 +65,17 @@
 .equ NEWLINE_MSG_LEN,           1
 .equ TX_TEST_PKT_LEN,           72
 
+// FSA-2: per-dispatch RX frame budget. Caps how many RX
+// completions the multi-frame consume loop drains in a single
+// l2_dispatch invocation. Per D043 ("bounded transitions") the
+// dispatcher must not monopolize the CPU on a long burst of
+// frames; 16 is small enough to keep transitions cooperative
+// and large enough to absorb a typical interactive burst (one
+// TCP window's worth of small frames). When the budget is hit
+// and more frames remain, they stay in the UsedRing for the
+// next dispatcher invocation. Tuneable as FSA-3+ data accrues.
+.equ RX_FRAME_BUDGET,           16
+
 .text
 .global l2_dispatch
 l2_dispatch:
@@ -126,6 +137,27 @@ l2_dispatch:
     b       .Lok
 
 .Lrx_received:
+    // FSA-2: multi-frame consume loop. The wait loop above
+    // established idx != shadow on entry, so the first iteration
+    // proceeds unconditionally. Subsequent iterations re-enter
+    // via .Lrx_consume_check (post-consume budget + queue probe).
+    //
+    // Per-frame work: read ring slot, bounds-check id, read
+    // virtio_net_hdr, validate num_buffers, emit RX:FRAME, then
+    // write the descriptor id into AvailRing.ring[next_avail & mask].
+    // The AvailRing.idx publish + RX QueueNotify are BATCHED to
+    // .Lrx_drained — one barrier + one idx update + one notify
+    // covers all frames consumed this dispatch. Spec-compliant
+    // (Virtio 1.2 §2.7.13.3: per-slot writes must precede the idx
+    // update with a write barrier; nothing requires per-frame
+    // notifies). Reduces dispatcher overhead under burst load.
+    //
+    // Frame budget: w28 doubles as the consumer shadow and the
+    // per-dispatch frame counter. For FSA-1/FSA-2 these coincide
+    // because the dispatcher initialises w28 to 0 at entry. FSA-3+
+    // will separate them when shadow becomes persistent across
+    // dispatcher calls.
+.Lrx_consume_body:
     // P2: ring slot via H2 consumer-shadow. mask = N-1 valid per
     // Virtio 1.2 §4.1.4.3 (VIRTQ_MAX_SIZE is a power of 2).
     and     w9, w28, w25                 // slot = used_shadow & mask
@@ -185,27 +217,43 @@ l2_dispatch:
     mov     w2, #NEWLINE_MSG_LEN
     bl      emit_bytes
 
-    // --- VIO-R-006/007: return consumed descriptor + notify ---
-    and     w10, w24, w25                         // slot = x24 & mask
+    // --- VIO-R-006: per-frame AvailRing.ring[slot] = id ---
+    // Idx publish + kick are batched at .Lrx_drained.
+    and     w10, w24, w25                         // slot = next_avail & mask
     add     x11, x19, #VIRTQ_OFF_AVAIL
     add     x11, x11, #4                          // skip flags + idx
     strh    w20, [x11, x10, lsl #1]               // ring[slot] = id
 
-    dsb     sy
-
+    // Advance next_avail (producer counter for AvailRing) and the
+    // RX consumer shadow (UsedRing read position).
     add     w24, w24, #1
-    add     x11, x19, #VIRTQ_OFF_AVAIL
-    strh    w24, [x11, #2]
+    add     w28, w28, #1
 
+.Lrx_consume_check:
+    // Budget check first — bounded-transition invariant.
+    cmp     w28, #RX_FRAME_BUDGET
+    b.hs    .Lrx_drained
+
+    // Queue probe — is there another completion already available?
+    // No yield/wait here; this is a non-blocking drain.
+    dsb     ishld
+    ldrh    w10, [x26, #2]                        // UsedRing.idx
+    dsb     ishld
+    cmp     w10, w28
+    b.ne    .Lrx_consume_body
+    // else: idx == shadow → queue drained, fall through
+
+.Lrx_drained:
+    // --- VIO-R-007: batched AvailRing.idx publish + RX kick ---
+    // Single barrier covers all per-slot writes from the loop.
     dsb     sy
-
-    // Kick RX (queue 0).
+    add     x11, x19, #VIRTQ_OFF_AVAIL
+    strh    w24, [x11, #2]                        // AvailRing.idx = next_avail
+    dsb     sy
     str     wzr, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
     dsb     sy
 
-    // H2: advance used_shadow now that ring[0] has been consumed.
-    add     w28, w28, #1
-
+    // Emit RX:RETURNED once per dispatch (after all frames consumed).
     adr     x1, rx_returned_msg
     mov     w2, #(rx_returned_msg_end - rx_returned_msg)
     bl      emit_bytes
