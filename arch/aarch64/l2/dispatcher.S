@@ -24,7 +24,11 @@
 // Caller contract (from boot.S):
 //   - On entry: x0 = UART base, x6 = VIRTIO_MMIO base, x19 = RX
 //     virtq base (memreq hot-tier pin). All other registers free.
-//   - On return: w0 = 0 → caller branches to .Lflush (clean halt);
+//   - On return: w0 = 0 → caller branches to .Lflush (clean halt
+//                — both success and wait-timeout paths land here;
+//                pre-FSA-1 behavior, no return-code differentiation
+//                between "consumed N frames" and "wait timed out"
+//                yet, address when a caller cares);
 //                w0 = 1 → caller branches to .Lset_failed
 //                (set VIRTIO_STATUS_FAILED then halt).
 //   - x19 is AAPCS64 callee-saved; preserved by ABI.
@@ -117,21 +121,28 @@ l2_dispatch:
     mov     w28, #0                      // H2: RX used_shadow = 0
 
     // FSA-3: replace `dsb ishld + ldrh` with `ldarh` (load-acquire
-    // halfword). ARMv8 acquire semantics: any subsequent memory
-    // access in program order is observed by the local PE AFTER
-    // the LDARH completes its read. This is the canonical
-    // consumer side of a release-acquire pair — the producer
-    // (Firecracker virtio-net VMM thread) publishes via a
-    // release-ordered store (smp_wmb on the host side), and the
-    // consumer's LDARH ensures all subsequent loads (ring slot,
-    // virtio_net_hdr fields, buffer payload) see the published
-    // state. Replaces the `dsb ishld` pattern that fixed barrier
-    // *class* but did not provide acquire ordering against the
-    // producer; addresses the phantom-frame `num_bufs=0` race
-    // (~15-25% rate on Pi 5 under inbound traffic). The yield
-    // stays — separately load-bearing for KVM VCPU scheduling
-    // liveness, not for correctness; see comment block before
-    // emit_bytes in boot.S.
+    // halfword). LDARH is the canonical ARMv8 consumer-side
+    // acquire idiom: any subsequent memory access in program
+    // order is observed by the local PE AFTER the LDARH completes
+    // its read.
+    //
+    // Diagnostic caveat: the prior `dsb ishld` pattern is also
+    // load-ordering on inner-shareable Normal memory and *should*
+    // have provided acquire-equivalent ordering against the
+    // producer (Firecracker virtio-net VMM thread). Whether the
+    // observed phantom-frame `num_bufs=0` race (~15-25% on Pi 5
+    // under inbound traffic) was actually caused by missing
+    // acquire ordering, by a different barrier-class defect, or
+    // by speculative loads past `dsb ishld` on Cortex-A76 has
+    // not been bottom-of-stack diagnosed. LDARH is the textbook
+    // ARMv8 fix and is correct independent of which mechanism
+    // was at fault; verification under sustained inbound traffic
+    // (not exercised by the tap0-no-traffic tracer-bullet) is
+    // still pending to confirm the race is closed.
+    //
+    // The yield stays — separately load-bearing for KVM VCPU
+    // scheduling liveness under busy-wait, not for correctness;
+    // see comment block before emit_bytes in boot.S.
     //
     // LDARH addressing mode is `[Xn|SP]` only (no offset), so
     // pre-compute &UsedRing.idx in x11 outside the loop.
@@ -168,18 +179,34 @@ l2_dispatch:
     //
     // Frame budget: w28 doubles as the consumer shadow and the
     // per-dispatch frame counter. For FSA-1/FSA-2 these coincide
-    // because the dispatcher initialises w28 to 0 at entry. FSA-3+
-    // will separate them when shadow becomes persistent across
-    // dispatcher calls.
+    // because the dispatcher initialises w28 to 0 at entry — the
+    // dispatcher is called exactly once from boot.S today.
+    //
+    // CAUTION: FSA-2's multi-frame loop AMPLIFIES the conflation
+    // hazard relative to FSA-1's single-shot path. If a future
+    // caller invokes l2_dispatch a second time without first
+    // making the shadow persistent, the wait loop will observe
+    // idx > 0 immediately and the consume loop will re-read up
+    // to RX_FRAME_BUDGET already-consumed UsedRing slots. The
+    // FSA-3+ separation (distinct shadow vs counter) must land
+    // before the dispatcher becomes re-entrant.
 .Lrx_consume_body:
+    // INVARIANT (FSA-3): every entry into .Lrx_consume_body —
+    // both the fall-through from .Lrx_received AND the back-edge
+    // from .Lrx_consume_check — is preceded by an LDARH load-
+    // acquire of UsedRing.idx. Subsequent ring-slot, header, and
+    // buffer reads here rely on that acquire for ordering against
+    // the producer's release-direction stores. If a future edit
+    // adds a third entry point into this block, it MUST establish
+    // the same acquire on idx first.
+    //
     // P2: ring slot via H2 consumer-shadow. mask = N-1 valid per
     // Virtio 1.2 §4.1.4.3 (VIRTQ_MAX_SIZE is a power of 2).
     //
     // FSA-3: no barrier needed around the slot read or buffer
-    // read. The most recent UsedRing.idx observation (either
-    // the .Lrx_wait_loop or the .Lrx_consume_check LDARH below)
-    // already provided acquire semantics, so all loads here see
-    // the producer's released state. Removed two `dsb sy` pairs
+    // read. The most recent UsedRing.idx observation already
+    // provided acquire semantics, so all loads here see the
+    // producer's released state. Removed two `dsb sy` pairs
     // (slot reads, buffer reads) that were redundant under the
     // LDARH-acquire model.
     and     w9, w28, w25                 // slot = used_shadow & mask
@@ -258,7 +285,11 @@ l2_dispatch:
     // emit_bytes/emit_hex32 don't formally preserve it (their
     // contracts list x0, x5, x6, x7, x8, x30 only), so re-derive
     // &RX UsedRing.idx here rather than relying on incidental
-    // preservation by the emit helpers.
+    // preservation by the emit helpers. The 1-cycle `add` per
+    // iteration is bounded by RX_FRAME_BUDGET = 16; hoisting into
+    // a callee-saved register would require extending the
+    // prologue save list and isn't worth the per-frame cycle
+    // savings.
     add     x11, x26, #2                 // x11 = &RX UsedRing.idx
     ldarh   w10, [x11]
     cmp     w10, w28
@@ -267,7 +298,19 @@ l2_dispatch:
 
 .Lrx_drained:
     // --- VIO-R-007: batched AvailRing.idx publish + RX kick ---
+    //
     // Single barrier covers all per-slot writes from the loop.
+    // dsb sy (full system) is intentionally retained here rather
+    // than narrowed to dsb ishst (inner-shareable, store-only).
+    // The first barrier orders normal-memory ring writes against
+    // the upcoming idx write (ishst would suffice for that
+    // alone), but the SECOND barrier orders the normal-memory
+    // idx store against the Device-memory QueueNotify MMIO write,
+    // and per ARM ARM B2.3.7 the inner-shareable Normal-memory
+    // domain doesn't disqualifiably cover Device accesses. Full
+    // system dsb is the safe class across the Normal/Device
+    // boundary. A future cleanup could split the barriers (ishst
+    // before idx, sy before notify) at modest complexity cost.
     dsb     sy
     add     x11, x19, #VIRTQ_OFF_AVAIL
     strh    w24, [x11, #2]                        // AvailRing.idx = next_avail

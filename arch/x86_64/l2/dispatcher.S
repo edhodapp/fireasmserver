@@ -1,8 +1,7 @@
 ; SPDX-License-Identifier: AGPL-3.0-or-later
 ;
-; L2 dispatcher — FSA-1 skeleton (single-shot wrapper around the
-; existing RX/TX path). x86_64 counterpart to
-; arch/aarch64/l2/dispatcher.S.
+; L2 dispatcher — x86_64 (FSA-1/2/3 + post-review SysV cleanup).
+; Counterpart to arch/aarch64/l2/dispatcher.S.
 ;
 ; FSA framing (D012 / D043, Astier paper):
 ;   - The dispatcher is the engine. It picks events (today: a
@@ -13,12 +12,23 @@
 ;   - Buffer pools are sized statically (see pools.S) and never
 ;     allocated dynamically post-init.
 ;
-; FSA-1 scope (intentionally narrow):
-;   - Same external behavior as the prior inline code. One RX
-;     completion consumed, one TX canary submitted + reclaimed,
-;     same marker emissions.
-;   - The dispatcher is still single-iteration. Multi-frame loop
-;     semantics land with FSA-2 (task #16).
+; FSA-1 scope (extraction): single-shot wrapper around the prior
+; inline RX/TX path.
+; FSA-2 scope (multi-frame RX): bounded RX_FRAME_BUDGET=16 drain
+; loop with batched AvailRing.idx publish + RX QueueNotify.
+; FSA-3 scope (race fix): no x86 code change — TSO provides
+; acquire-on-load naturally; see comment block lower.
+;
+; SysV AMD64 ABI compliance (Ed, 2026-05-21): we are bare metal,
+; not running under a kernel that imposes SysV — but we *adopt*
+; SysV strictly across the project. Rationale: we expect to call
+; into SSE/AVX/AES-NI helpers (crypto/) from these paths in
+; future work; SysV §3.2.2 mandates rsp ≡ 0 (mod 16) at the CALL
+; instruction so a callee can use 16-aligned vector loads
+; (movdqa, movapd, vmovapd) safely. Pre-FSA-3 code violated this
+; in two ways: (a) the prologue's two pushes left rsp ≡ 8 (mod 16)
+; at the function body, and (b) the emit-chain push/pop pattern
+; alternated alignment. Both are corrected below.
 ;
 ; Caller contract (from kernel_main_64 in boot.S):
 ;   - On entry: r12 = VIRTIO_MMIO base, r13 = N (queue size),
@@ -27,14 +37,18 @@
 ;     function; the prologue/epilogue save+restore them.
 ;   - r12, r13, r15 are also callee-saved AND read-only inside
 ;     this function; preserved trivially.
-;   - r14 is callee-saved per ABI but MODIFIED here — the RX-
-;     consume path bumps next_avail by 1 (`inc r14d`). The caller
-;     (kernel_main_64) does not read r14 post-call on either
-;     return arm: success → `jmp .halt`, failure → `jmp .set_failed`
-;     which only references r12. If a future caller cares about
-;     r14 surviving the call, either save/restore r14 here or
-;     surface the advanced value as a return.
-;   - On return: eax = 0 → caller jmps to .halt (clean halt);
+;   - r14 is callee-saved per ABI but MODIFIED here. The RX-
+;     consume path advances next_avail by N where N is the number
+;     of frames consumed this dispatch, 0..RX_FRAME_BUDGET. The
+;     caller (kernel_main_64) does not read r14 post-call on
+;     either return arm: success → `jmp .halt`, failure → `jmp
+;     .set_failed` which only references r12. If a future caller
+;     cares about r14 surviving the call, either save/restore
+;     r14 here or surface the advanced value as a return.
+;   - On return: eax = 0 → caller jmps to .halt (clean halt
+;                — both success and timeout paths land here;
+;                pre-FSA-1 behavior, no return-code differentiation
+;                between "consumed N frames" and "wait timed out");
 ;                eax = 1 → caller jmps to .set_failed (sets
 ;                VIRTIO_STATUS_FAILED then halts).
 
@@ -56,9 +70,7 @@ VIRTQ_MAX_SIZE              equ 0x100
 ; dispatcher's POLL_BUDGET = 10000000 (1e7) by 10x — x86_64 has no
 ; `yield` in its busy-wait body so each iteration is cheaper, and
 ; the larger budget gives more wall-clock slack for the host VMM
-; to schedule the device thread. (aarch64 budget was tightened by
-; task #15 once `yield` was identified as load-bearing for
-; producer-consumer timing under KVM.)
+; to schedule the device thread.
 POLL_BUDGET                 equ 100000000
 
 ; tx_test_pkt layout = 12 (virtio_net_hdr) + 14 (Ethernet) + 46
@@ -73,27 +85,29 @@ TX_TEST_PKT_LEN             equ 72
 ; RX_FRAME_BUDGET (16).
 RX_FRAME_BUDGET             equ 16
 
-; FSA-3: no x86 code changes needed for the phantom-frame race
-; fix that landed on aarch64 (LDARH for load-acquire on idx).
-; x86 TSO (Total Store Order) provides load-acquire semantics on
-; every ordinary load — loads are never reordered with other
-; loads, and loads are never reordered with prior stores on the
-; same CPU. So the consumer reading UsedRing.idx followed by
-; ring[slot] followed by the buffer is naturally ordered.
-;
-; The producer (Firecracker virtio-net VMM thread on x86_64) also
-; benefits from TSO — stores are never reordered with other
-; stores. A write to UsedRing.idx is guaranteed to be observed
-; after all prior buffer + ring writes by any single observer.
+; FSA-3: no x86 code changes were needed for the phantom-frame
+; race fix that landed on aarch64 (LDARH for load-acquire on idx).
+; x86 TSO (Intel SDM Vol. 3A §8.2.2) provides:
+;   - Loads are not reordered with other loads.
+;   - Stores are not reordered with other stores.
+;   - Loads may be reordered with prior stores to a different
+;     location (StoreLoad reordering is the ONLY allowed
+;     reordering on x86 outside of NT stores / WC memory).
+; So a consumer reading UsedRing.idx followed by ring[slot]
+; followed by the buffer is naturally ordered. The producer
+; (Firecracker virtio-net VMM thread, also x86) writes buffer
+; then ring then idx; under TSO those stores cannot be reordered.
+; Together: any observer that sees the new idx also sees the
+; preceding ring + buffer writes. No memory-fence reasoning
+; required for the consumer path.
 ;
 ; The lfence/mfence sprinkled through the existing path are
-; therefore conservative and could be reduced (see Intel SDM
-; Vol. 3A §8.2.2 — "Loads are not reordered with other loads.").
-; They stay for now as defensive symmetry with aarch64, where the
-; barriers ARE load-bearing. A future cleanup could narrow them.
-;
-; The race only manifested on aarch64 per the FSA-3 task notes
-; (~15-25% on Pi 5; never observed on x86_64).
+; therefore conservative and could be narrowed. They stay as a
+; matter of defensive symmetry with aarch64 (where the barriers
+; ARE load-bearing) and project policy: tolerate the wasted
+; cycles to keep the cross-arch reading symmetric. A future
+; cleanup could measure timeout-path CPU usage and decide to
+; remove some lfences.
 
 ; Externally defined in arch/x86_64/platform/firecracker/boot.S.
 extern emit_bytes
@@ -108,18 +122,40 @@ global l2_dispatch
 section .text
 
 l2_dispatch:
-    ; SysV AMD64 prologue. rbx and rbp are callee-saved and the
-    ; dispatcher modifies both. r12-r15 are also callee-saved but
-    ; the dispatcher *preserves* their pre-existing values (they
-    ; were set up by kernel_main_64 and must survive the call) —
-    ; no save needed since the body never overwrites them.
+    ; SysV AMD64 prologue.
+    ;
+    ; Function entry: rsp ≡ 8 (mod 16) per the SysV calling
+    ; convention — the caller's CALL pushed an 8-byte return
+    ; address onto a 16-aligned stack. We save rbx and rbp
+    ; (callee-saved per ABI; both modified by this function);
+    ; r12-r15 are also callee-saved but read-only here so no
+    ; save needed.
+    ;
+    ; After `push rbp` rsp ≡ 0 (mod 16); after `push rbx`
+    ; rsp ≡ 8 (mod 16). The `sub rsp, 8` below restores
+    ; 16-alignment so that every CALL inside this function lands
+    ; on a SysV-compliant stack — critical for any callee that
+    ; might use aligned vector loads (movdqa / vmovapd / XSAVE).
+    ; emit_bytes/emit_hex32 are currently SSE-free, but the
+    ; project policy is to maintain strict SysV alignment so the
+    ; door stays open for SSE/AVX/AES-NI helpers (see top header
+    ; block for rationale).
     push rbp
     mov rbp, rsp
     push rbx
+    sub rsp, 8
 
     ; --- VIO-R-003/004: poll RX Used Ring for first completion ---
     ;
-    ; H2: maintain a consumer-shadow in rbp (RX used_shadow).
+    ; H2: maintain a consumer-shadow in rbp (RX used_shadow). rbp
+    ; doubles as the per-dispatch RX frame counter for the
+    ; RX_FRAME_BUDGET bound; the two roles coincide because the
+    ; dispatcher resets rbp to 0 at entry. FSA-2 amplifies the
+    ; existing hazard from FSA-1 (more stale reads on a second
+    ; invocation than before), but currently the dispatcher is
+    ; called exactly once from kernel_main_64 so the issue is
+    ; latent. FSA-3+ will separate shadow from counter when
+    ; shadow becomes persistent across dispatcher calls.
     xor ebp, ebp
     mov ecx, POLL_BUDGET
 .l2_rx_wait_loop:
@@ -142,6 +178,18 @@ l2_dispatch:
     ; proceeds unconditionally. Subsequent iterations re-enter via
     ; .l2_rx_consume_check (post-consume budget + queue probe).
     ;
+    ; INVARIANT (FSA-3): every entry into .l2_rx_consume_body —
+    ; both the fall-through from .l2_rx_received AND the back-edge
+    ; from .l2_rx_consume_check — is preceded by a load of
+    ; UsedRing.idx with at least acquire-equivalent ordering. On
+    ; x86_64 that is naturally provided by TSO (the `mov ax, [...]`
+    ; in the wait loop / queue probe; the surrounding lfence is
+    ; conservative). Subsequent reads of UsedRing.ring[slot],
+    ; virtio_net_hdr, and the buffer payload rely on this ordering
+    ; to see the producer's released state. If a future edit adds
+    ; a third entry point into .l2_rx_consume_body, it MUST
+    ; establish the same acquire on idx first.
+    ;
     ; Per-frame work: read ring slot, bounds-check id, read
     ; virtio_net_hdr, validate num_buffers, emit RX:FRAME, then
     ; write the descriptor id into AvailRing.ring[next_avail & mask].
@@ -149,11 +197,6 @@ l2_dispatch:
     ; .l2_rx_drained — one mfence + one idx store + one notify
     ; covers all frames consumed this dispatch. Spec-compliant
     ; per Virtio 1.2 §2.7.13.3.
-    ;
-    ; Frame budget: rbp doubles as the consumer shadow and the
-    ; per-dispatch frame counter (initialized to 0 at .l2_rx_wait_loop
-    ; setup). FSA-3+ will separate them when shadow becomes
-    ; persistent across dispatcher calls.
 .l2_rx_consume_body:
     ; P2: slot-indexed read using H2 consumer-shadow.
     mov eax, ebp                                     ; eax = shadow
@@ -183,8 +226,18 @@ l2_dispatch:
     cmp r11d, 1
     jne .l2_rx_num_bufs_fail
 
-    ; Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
-    ; Push order: used_len, num_bufs, hdr_len, id (last → first pop = id).
+    ; --- Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=... ---
+    ;
+    ; Strict SysV: push 4 args (32 bytes, preserves 16-alignment
+    ; since rsp ≡ 0 (mod 16) entering this block) and read them
+    ; via [rsp + offset] across the emit chain instead of popping
+    ; one at a time. The pop-after-call pattern alternates rsp
+    ; alignment (each 8-byte pop toggles bit 3); array access
+    ; keeps every CALL at rsp ≡ 0 (mod 16). Stack slot map:
+    ;     [rsp +  0] = id          (pushed last)
+    ;     [rsp +  8] = hdr_len
+    ;     [rsp + 16] = num_buffers
+    ;     [rsp + 24] = used_len    (pushed first)
     push rbx                                         ; used_len
     push r11                                         ; num_buffers
     push rsi                                         ; hdr_len
@@ -193,30 +246,32 @@ l2_dispatch:
     lea rsi, [rel rx_frame_prefix_msg]
     mov ecx, rx_frame_prefix_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 0]                               ; id
     call emit_hex32
 
     lea rsi, [rel rx_frame_hdr_len_msg]
     mov ecx, rx_frame_hdr_len_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 8]                               ; hdr_len
     call emit_hex32
 
     lea rsi, [rel rx_frame_num_bufs_msg]
     mov ecx, rx_frame_num_bufs_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 16]                              ; num_buffers
     call emit_hex32
 
     lea rsi, [rel rx_frame_used_len_msg]
     mov ecx, rx_frame_used_len_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 24]                              ; used_len
     call emit_hex32
 
     lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
+
+    add rsp, 32                                      ; release the 4 saved args
 
     ; --- VIO-R-006: per-frame AvailRing.ring[slot] = id ---
     ; The emit chain clobbered rdi/rcx/rax (SysV caller-saved);
@@ -313,6 +368,9 @@ l2_dispatch:
     jmp .l2_ok
 
 .l2_tx_reclaimed:
+    ; INVARIANT (FSA-3): the .l2_tx_wait_loop above established
+    ; acquire-equivalent ordering on TX UsedRing.idx (via TSO);
+    ; subsequent ring-slot reads inherit the ordering.
     mov eax, ebp                                     ; eax = shadow
     lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
     and eax, ecx                                     ; eax = slot
@@ -325,61 +383,76 @@ l2_dispatch:
     cmp edi, VIRTQ_MAX_SIZE
     jae .l2_tx_bad_id_fail
 
-    ; Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX
+    ; --- Emit: TX:RECLAIMED id=XXXXXXXX used_len=XXXXXXXX ---
+    ; Strict SysV: 2 pushes = 16 bytes, preserves 16-alignment.
+    ;     [rsp + 0] = id        (pushed last)
+    ;     [rsp + 8] = used_len  (pushed first)
     push rbx                                         ; used_len
     push rdi                                         ; id
 
     lea rsi, [rel tx_reclaimed_prefix_msg]
     mov ecx, tx_reclaimed_prefix_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 0]                               ; id
     call emit_hex32
 
     lea rsi, [rel tx_used_len_msg]
     mov ecx, tx_used_len_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 8]                               ; used_len
     call emit_hex32
 
     lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
+
+    add rsp, 16
     jmp .l2_ok
 
 .l2_rx_bad_id_fail:
-    push rdi
+    ; Strict SysV: 1-arg fail path. A single push would leave
+    ; rsp ≡ 8 (mod 16) for the subsequent CALL — instead, reserve
+    ; a 16-byte aligned scratch frame and stash the saved value
+    ; via mov [rsp + N], reg.
+    sub rsp, 16
+    mov [rsp + 0], rdi                               ; save id
     lea rsi, [rel rx_bad_id_msg]
     mov ecx, rx_bad_id_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 0]
     call emit_hex32
     lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
+    add rsp, 16
     jmp .l2_fail
 
 .l2_rx_num_bufs_fail:
-    push r11
+    sub rsp, 16
+    mov [rsp + 0], r11                               ; save num_buffers
     lea rsi, [rel rx_num_bufs_msg]
     mov ecx, rx_num_bufs_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 0]
     call emit_hex32
     lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
+    add rsp, 16
     jmp .l2_fail
 
 .l2_tx_bad_id_fail:
-    push rdi
+    sub rsp, 16
+    mov [rsp + 0], rdi                               ; save id
     lea rsi, [rel tx_bad_id_msg]
     mov ecx, tx_bad_id_len
     call emit_bytes
-    pop rax
+    mov rax, [rsp + 0]
     call emit_hex32
     lea rsi, [rel newline]
     mov ecx, 1
     call emit_bytes
+    add rsp, 16
     jmp .l2_fail
 
 .l2_ok:
@@ -391,6 +464,7 @@ l2_dispatch:
     ; fall through
 
 .l2_epilogue:
+    add rsp, 8                                       ; undo prologue alignment padding
     pop rbx
     pop rbp
     ret
