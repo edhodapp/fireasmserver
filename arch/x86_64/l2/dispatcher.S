@@ -22,9 +22,18 @@
 ;
 ; Caller contract (from kernel_main_64 in boot.S):
 ;   - On entry: r12 = VIRTIO_MMIO base, r13 = N (queue size),
-;     r14 = next_avail shadow, r15 = virtq base. SysV callee-
-;     saved registers (rbx, rbp, r12-r15) preserved across the
-;     call by the prologue/epilogue here.
+;     r14 = next_avail shadow, r15 = virtq base.
+;   - rbx and rbp are SysV callee-saved and modified by this
+;     function; the prologue/epilogue save+restore them.
+;   - r12, r13, r15 are also callee-saved AND read-only inside
+;     this function; preserved trivially.
+;   - r14 is callee-saved per ABI but MODIFIED here — the RX-
+;     consume path bumps next_avail by 1 (`inc r14d`). The caller
+;     (kernel_main_64) does not read r14 post-call on either
+;     return arm: success → `jmp .halt`, failure → `jmp .set_failed`
+;     which only references r12. If a future caller cares about
+;     r14 surviving the call, either save/restore r14 here or
+;     surface the advanced value as a return.
 ;   - On return: eax = 0 → caller jmps to .halt (clean halt);
 ;                eax = 1 → caller jmps to .set_failed (sets
 ;                VIRTIO_STATUS_FAILED then halts).
@@ -42,6 +51,15 @@ VIRTQ_OFF_AVAIL             equ 0x1000
 VIRTQ_OFF_USED              equ 0x2000
 TX_QUEUE_OFF                equ 1 * VIRTQ_STRIDE
 VIRTQ_MAX_SIZE              equ 0x100
+
+; Poll budget for the RX/TX wait loops. Diverges from the aarch64
+; dispatcher's POLL_BUDGET = 10000000 (1e7) by 10x — x86_64 has no
+; `yield` in its busy-wait body so each iteration is cheaper, and
+; the larger budget gives more wall-clock slack for the host VMM
+; to schedule the device thread. (aarch64 budget was tightened by
+; task #15 once `yield` was identified as load-bearing for
+; producer-consumer timing under KVM.)
+POLL_BUDGET                 equ 100000000
 
 ; tx_test_pkt layout = 12 (virtio_net_hdr) + 14 (Ethernet) + 46
 ; (canary payload) = 72 bytes. Keep in sync with the byte sequence
@@ -74,7 +92,7 @@ l2_dispatch:
     ;
     ; H2: maintain a consumer-shadow in rbp (RX used_shadow).
     xor ebp, ebp
-    mov ecx, 100000000
+    mov ecx, POLL_BUDGET
 .l2_rx_wait_loop:
     lfence
     mov ax, [r15 + VIRTQ_OFF_USED + 2]
@@ -208,7 +226,7 @@ l2_dispatch:
     ; --- VIO-T-006: poll TX Used Ring for completion ---
     ; H2: TX consumer-shadow restart (independent of RX queue).
     xor ebp, ebp
-    mov ecx, 100000000
+    mov ecx, POLL_BUDGET
 .l2_tx_wait_loop:
     lfence
     mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]

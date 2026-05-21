@@ -1151,7 +1151,6 @@ tx_test_pkt:
     .byte   0x02, 0x00, 0x00, 0x00, 0x00, 0x01          // src MAC local-admin
     .byte   0x88, 0xB5                                  // EtherType 0x88B5
     .fill   46, 1, 0xAB                                 // 46-byte canary
-tx_test_pkt_end:
 
 // _image_end is defined in the linker script (placed after both .text
 // and .rodata) so the Image header's image_size covers the entire file.

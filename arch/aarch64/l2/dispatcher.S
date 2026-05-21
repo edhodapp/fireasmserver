@@ -27,8 +27,15 @@
 //   - On return: w0 = 0 → caller branches to .Lflush (clean halt);
 //                w0 = 1 → caller branches to .Lset_failed
 //                (set VIRTIO_STATUS_FAILED then halt).
-//   - x0/x6/x19 preserved by the conventional "memreq pin"
-//     discipline that emit_bytes/emit_hex32 already observe.
+//   - x19 is AAPCS64 callee-saved; preserved by ABI.
+//   - x0 and x6 are caller-saved per AAPCS64 (x9-x15 are caller-
+//     saved scratch, x0-x7 are arg/result registers). They survive
+//     this function because (a) the body never writes x0 or x6
+//     directly — x6 is only read for VIRTIO_MMIO_QUEUE_NOTIFY
+//     stores, x0 is only read by emit_bytes/emit_hex32 — and
+//     (b) both helpers explicitly preserve x0, x5, x6, x7, x8,
+//     x30 per their documented contracts (see emit_bytes header
+//     in boot.S). The dispatcher inherits that discipline.
 //   - x20-x28, x29, x30 saved+restored by AAPCS64 callee
 //     prologue/epilogue (this function is non-leaf — it calls
 //     emit_bytes/emit_hex32).

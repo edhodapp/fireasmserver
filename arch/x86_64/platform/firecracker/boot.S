@@ -983,7 +983,6 @@ tx_test_pkt:
     db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; src MAC local-admin
     db 0x88, 0xB5                                    ; EtherType 0x88B5
     times 46 db 0xAB                                 ; 46-byte canary payload
-tx_test_pkt_len        equ $ - tx_test_pkt
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
