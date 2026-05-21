@@ -24,32 +24,25 @@ set -euo pipefail
 PI_HOST="${PI_HOST:-10.0.2.2}"
 PI_USER="${PI_USER:-ed}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/fireasm_pi5_ed}"
-TIMEOUT="${TIMEOUT:-60}"     # Boot-to-TX:RECLAIMED on the success
-                             # path is ~100-200 ms on Pi 5. The
-                             # no-traffic path (poll budget exhausts
-                             # before RX:TIMEOUT fires) is the
-                             # dominator and stays in the 35-50s
-                             # band with high variance.
+TIMEOUT="${TIMEOUT:-15}"     # Boot-to-TX:RECLAIMED is ~50-500 ms on
+                             # the success path. No-traffic budget
+                             # exhausts (RX:TIMEOUT) in ~3-5 s after
+                             # task #15 dropped POLL_BUDGET on
+                             # aarch64 from 100M → 10M iterations
+                             # (the previous 35-50s band was
+                             # dominated by `yield` + KVM VMEXIT
+                             # cost per iter; the iteration count
+                             # was over-sized for wall-clock parity
+                             # with x86_64 where each iter is ~100x
+                             # cheaper).
                              #
-                             # P1 (post-H5) measurement: 8-run
-                             # samples at TIMEOUT=45/50/55 showed
-                             # 2/3 SIGTERM-mid-poll failures
-                             # respectively; TIMEOUT=60 held 5/5 in
-                             # H5 verification. The dsb sy → dsb
-                             # ishld narrowing in H5 was correct on
-                             # its own terms, but the wall-clock
-                             # impact under KVM is dominated by
-                             # `yield` + VMEXIT round-trips and
-                             # cross-cluster memory-system traffic,
-                             # not the dsb instruction class. So:
-                             # 60s stays as the conservative ceiling.
-                             #
-                             # The follow-up that would actually
-                             # move the needle is reducing
-                             # POLL_BUDGET (boot.S, per-arch) or
-                             # removing `yield` from the poll loop —
-                             # tracked separately, not folded into
-                             # tracer-bullet TIMEOUT.
+                             # 15s gives ~3-5x margin over the
+                             # observed budget tail. Empirical:
+                             # 12-run sample at TIMEOUT=10 held
+                             # 10/12 PASS with the 2 FAILs being the
+                             # pre-existing phantom-frame race
+                             # (orthogonal to TIMEOUT). 15s is the
+                             # conservative ceiling.
 READY_MARKER="${READY_MARKER:-READY}"
 
 if [[ $EUID -eq 0 ]]; then

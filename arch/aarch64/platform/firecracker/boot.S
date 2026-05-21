@@ -92,14 +92,26 @@
 // any power-of-2 ≤ QueueNumMax).
 .equ VIRTQ_MAX_SIZE,    0x100
 
-// Wait budget for RX / TX Used Ring polls. 100M iterations matches
-// the x86_64 boot.S literal. Wall-clock cost on Cortex-A76 is
-// dominated by two `dsb sy` per iteration (~15-25 s for the full
-// budget); the tracer-bullet TIMEOUT is sized accordingly. H5
-// (fence audit) will narrow the per-iteration cost and let this
-// drop, but the iteration count itself stays a parity invariant
-// with x86_64 until then.
-.equ POLL_BUDGET,       100000000
+// Wait budget for RX / TX Used Ring polls.
+//
+// Task #15 (2026-05-20): empirically dropped from 100M → 10M after
+// investigation found the no-traffic wall clock on Pi 5 was
+// 35-50s under KVM, dominated by `yield` + VMEXIT cost per
+// iteration (the `yield` ahead of the dsb-ishld/ldrh pair is
+// load-bearing: it provides timing slack that lets the host-side
+// virtio device thread finish writing the buffer header before
+// the guest reads it, preventing a producer-consumer race that
+// surfaces as `RX:FAIL num_bufs=00000000`).
+//
+// 10M iterations × ~350 ns/iter under KVM = ~3.5 s wall clock —
+// well below any reasonable frame-arrival latency, well above
+// the per-byte UART emit cost. Parity with x86_64's 100M literal
+// is dropped: aarch64-under-KVM has ~100× the per-iter cost, so
+// equal iteration counts give vastly unequal wall clocks. Real
+// parity is "wait long enough for any reasonable frame to
+// arrive on each platform" — and that's wall-clock, not
+// iteration-count, terms.
+.equ POLL_BUDGET,       10000000
 
 // Virtqueue descriptor flag bits (Virtio 1.2 §2.7.5.1).
 .equ VIRTQ_DESC_F_NEXT,     1    // buffer continues via next field
@@ -799,7 +811,7 @@ _entry:
 
     ldr     w9, =POLL_BUDGET             // wait budget (matches x86_64)
 .Lrx_wait_loop:
-    yield
+    yield                                // keep — see emit_bytes header
     // H5: narrowed from dsb sy → dsb ishld. Inner-shareable
     // domain (covers the host-side VMM device thread under KVM —
     // the actual observer writing UsedRing.idx) is the minimum
@@ -991,7 +1003,7 @@ _entry:
 
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
-    yield
+    yield                                // keep — see emit_bytes header
     // H5: narrowed from dsb sy → dsb ishld — see .Lrx_wait_loop.
     dsb     ishld
     ldrh    w10, [x27, #2]               // TX UsedRing.idx
@@ -1241,6 +1253,31 @@ _entry:
 // Helpers — UART writers
 // ================================================================
 
+// `yield` policy in busy-wait loops (RX wait, TX wait, emit_bytes).
+//
+// `yield` is the AArch64 SMT-hint instruction. On Cortex-A76 (no
+// SMT) it's architecturally a NOP — but under KVM it can trigger
+// guest-vCPU descheduling by the host scheduler, giving the host
+// time to make progress on other work.
+//
+// Task #15 (2026-05-20) found that on Pi 5 / Firecracker / KVM,
+// the yield in the RX wait loop is LOAD-BEARING beyond mere
+// politeness: it provides timing slack that lets the host-side
+// virtio device thread finish writing the buffer header BEFORE
+// the guest's next ldrh observes UsedRing.idx and starts reading
+// the buffer. Removing yield surfaces a producer-consumer race
+// where the guest catches the device mid-write and reads garbage
+// (`RX:FAIL num_bufs=00000000`).
+//
+// The dsb-ishld barriers narrowed in H5 order LOAD operations
+// against subsequent loads on this PE; they don't make the host's
+// remote stores propagate any faster. The yield's KVM-side
+// descheduling effect IS what gives the producer-consumer
+// pipeline time to drain.
+//
+// Keep all three yields. The no-traffic wall-clock optimization
+// happens at the iteration-count level (POLL_BUDGET) instead.
+
 // emit_bytes: write w2 bytes from [x1] via UART at x0.
 //   In:      x0 = UART base (preserved)
 //            x1 = source pointer (advances by w2)
@@ -1250,7 +1287,7 @@ _entry:
 emit_bytes:
     cbz     w2, .Lemit_done
 .Lemit_loop:
-    yield
+    yield                                // see header comment block
     ldrb    w3, [x0, #0x05]             // LSR — THRE status
     dsb     nsh                          // H5: narrowed from dsb sy →
                                          // dsb nsh. UART MMIO is Device
