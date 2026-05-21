@@ -44,8 +44,18 @@ PLAT_OBJECTS  := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(PLAT_SOURCES))
 # tooling/crypto_tests/, not linked into the guest kernel today.
 MEM_SOURCES   := $(sort $(wildcard memory/*.S))
 MEM_OBJECTS   := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(MEM_SOURCES))
+# L2 dispatcher pulls in virtio-MMIO + emit_hex32 + the canary TX
+# frame; only the firecracker platform wires those today. The qemu
+# platform's boot.S is a minimal PL011-on-virt stub without virtio.
+# Conditional inclusion avoids unresolved external refs at link
+# time on the qemu target. Mirrors arch/x86_64/Makefile's gate.
+ifeq ($(PLATFORM),firecracker)
 L2_SOURCES    := $(sort $(wildcard l2/*.S))
 L2_OBJECTS    := $(patsubst l2/%.S,$(BUILD_DIR)/l2/%.o,$(L2_SOURCES))
+else
+L2_SOURCES    :=
+L2_OBJECTS    :=
+endif
 ARCH_OBJECTS  := $(MEM_OBJECTS) $(L2_OBJECTS)
 OBJECTS       := $(PLAT_OBJECTS) $(ARCH_OBJECTS)
 LINKER_SCRIPT := $(SRC_DIR)/linker.ld
