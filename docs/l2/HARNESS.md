@@ -151,6 +151,43 @@ existing CD pre-push pipeline already requires passwordless sudo
 for tap0 ephemeral creation, so this isn't new ground. Revisit
 if developer ergonomics suffer.
 
+**Status (2026-05-22+):** adopted the `setcap` path. One-time
+setup on the developer's venv:
+
+    sudo setcap cap_net_raw+eip $(readlink -f .venv/bin/python3)
+
+Known limitation: setcap'd Python runs in `AT_SECURE=1`, which
+strips `PYTHONPATH`/`PYTHONHOME` etc. CI runners that rely on
+these for plugin discovery will need a different approach.
+Tracked as task #25.
+
+### 3.3a Other one-time operator prereqs
+
+In addition to the privilege grant, the harness needs:
+
+1. **`tap0` configured at `192.168.42.1/24`.**
+   ```
+   sudo ip tuntap add dev tap0 mode tap user $USER
+   sudo ip link set tap0 up
+   sudo ip addr add 192.168.42.1/24 dev tap0
+   ```
+
+2. **`tap0` MTU bumped to ≥ 1700.** The kernel's AF_PACKET raw
+   send refuses frames larger than the device MTU (errno
+   EMSGSIZE). The default tap0 MTU is 1500, which caps wire
+   frames at 1514 bytes — below the ETH-003 oversize threshold
+   of 1518. Tests that need to send oversize stimuli (e.g.,
+   `test_oversize_frame_dropped`) skip cleanly if MTU is too
+   low; bump once with:
+   ```
+   sudo ip link set tap0 mtu 2000
+   ```
+
+   The increased MTU is purely a host-side TX permission ceiling
+   — it does NOT change Firecracker's virtio-net negotiated MTU
+   nor the guest's view of the frame size. The L2 wire-size
+   bounds in the dispatcher (60..1518 wire) are unaffected.
+
 ### 3.4 Frame send/capture mechanism
 
 scapy. Rationale:

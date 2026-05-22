@@ -112,6 +112,21 @@ def flush_arp_cache(guest_ip: str, iface: str = "tap0") -> None:
     )
 
 
+def host_mtu_of(iface: str) -> int | None:
+    """Return the MTU of `iface`, or None if it can't be read.
+
+    Reads from /sys/class/net/<iface>/mtu. No netlink, no sudo.
+    """
+    try:
+        raw = (SYSFS_NET_DIR / iface / "mtu").read_text().strip()
+    except (FileNotFoundError, PermissionError):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 def require_tap0(expected_host_ip: str = "192.168.42.1") -> None:
     """Raise if tap0 is missing or not at the expected IP.
 

@@ -269,6 +269,20 @@ l2_dispatch:
     cmp edi, VIRTQ_MAX_SIZE
     jae .l2_rx_bad_id_fail
 
+    ; --- ETH-003 / ETH-013: frame-size bounds (RX:DROP path) ---
+    ;
+    ; used_len (ebx) includes the 12-byte virtio_net_hdr, so the
+    ; Ethernet wire range [60, 1518] becomes [72, 1530] in virtio
+    ; terms. Runt and oversize frames are dropped at L2 per
+    ; docs/l2/REQUIREMENTS.md — the dispatcher emits RX:DROP,
+    ; recycles the descriptor (the device must get the buffer
+    ; back regardless of whether we used it), and re-enters the
+    ; consume loop. ARP recognition + RX:FRAME emit are skipped.
+    cmp ebx, 72
+    jb  .l2_rx_drop
+    cmp ebx, 1530
+    ja  .l2_rx_drop
+
     ; Buffer addr: load rx_buffer pool base, then add id*2048.
     ;
     ; memreq indirection (codegen convention): __memreq_addr__X
@@ -694,6 +708,42 @@ l2_dispatch:
     mov word [rax + L2_STATE_TX_USED_SHADOW], bp
     jmp .l2_ok
 
+.l2_rx_drop:
+    ; --- ETH-003 / ETH-013: drop a malformed-size RX frame ---
+    ;
+    ; Branched here from .l2_rx_consume_body when used_len (ebx)
+    ; is outside the [72, 1530] virtio range. ebx is SysV
+    ; callee-saved and survives the emit chain; edi (id) is NOT
+    ; preserved by emit_hex32 — stash it through the local frame
+    ; slot at [rsp + 12] (the ARP recognition's id-save slot —
+    ; the two code paths are mutually exclusive within an
+    ; iteration, so the reuse is safe).
+    mov [rsp + 12], edi                              ; save id
+
+    lea rsi, [rel rx_drop_msg]
+    mov ecx, rx_drop_len
+    call emit_bytes
+    mov eax, ebx                                     ; used_len
+    call emit_hex32
+    lea rsi, [rel newline]
+    mov ecx, 1
+    call emit_bytes
+
+    mov edi, [rsp + 12]                              ; restore id
+
+    ; Recycle: write id to AvailRing.ring[next_avail & mask].
+    mov eax, r14d
+    lea ecx, [r13d - 1]
+    and eax, ecx
+    mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di
+
+    ; Advance next_avail, consumer shadow, per-dispatch counter.
+    inc r14d
+    inc ebp
+    inc dword [rsp + 0]
+
+    jmp .l2_rx_consume_check
+
 .l2_rx_bad_id_fail:
     ; FSA-4 writeback intentionally skipped on validation-fail
     ; paths: l2_dispatch returns eax = 1 → caller sets
@@ -780,6 +830,9 @@ rx_bad_id_msg:           db 'RX:FAIL bad_id='
 rx_bad_id_len            equ $ - rx_bad_id_msg
 rx_num_bufs_msg:         db 'RX:FAIL num_bufs='
 rx_num_bufs_len          equ $ - rx_num_bufs_msg
+
+rx_drop_msg:             db 'RX:DROP used_len='
+rx_drop_len              equ $ - rx_drop_msg
 
 rx_returned_msg:         db 'RX:RETURNED', 10
 rx_returned_len          equ $ - rx_returned_msg

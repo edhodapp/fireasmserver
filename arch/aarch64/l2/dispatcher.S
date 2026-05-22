@@ -286,6 +286,24 @@ l2_dispatch:
     cmp     w20, #VIRTQ_MAX_SIZE
     b.hs    .Lrx_bad_id_fail
 
+    // --- ETH-003 / ETH-013: frame-size bounds (RX:DROP path) ---
+    //
+    // used_len (w21) includes the 12-byte virtio_net_hdr, so
+    // the Ethernet wire range [60, 1518] becomes [72, 1530] in
+    // virtio terms. Runt and oversize frames are dropped at L2
+    // per docs/l2/REQUIREMENTS.md — the dispatcher emits an
+    // RX:DROP marker, recycles the descriptor (the device must
+    // get the buffer back regardless of whether we used it),
+    // and re-enters the consume loop. ARP recognition + RX:FRAME
+    // emit are skipped.
+    //
+    // Both bounds fit in 12-bit immediate cmp (max 4095), so no
+    // movz scratch is needed.
+    cmp     w21, #72
+    b.lo    .Lrx_drop
+    cmp     w21, #1530
+    b.hi    .Lrx_drop
+
     // Buffer addr: load the rx_buffer pool base, then add id*2048.
     //
     // memreq indirection (codegen convention, easy to misread):
@@ -688,6 +706,46 @@ l2_dispatch:
     strh    w28, [x10, #L2_STATE_TX_USED_SHADOW]
     b       .Lok
 
+.Lrx_drop:
+    // --- ETH-003 / ETH-013: drop a malformed-size RX frame ---
+    //
+    // Branched here from .Lrx_consume_body when used_len (w21) is
+    // outside the [72, 1530] virtio range (60..1518 wire bytes
+    // per IEEE 802.3 / Virtio 1.2 §5.1.6.1). The descriptor is
+    // returned to the device via the normal AvailRing path so we
+    // don't leak buffers; only the per-frame consumer-side
+    // processing (ARP recognition, RX:FRAME emit, num_bufs check)
+    // is skipped.
+    //
+    // w20 (id) and w21 (used_len) are AAPCS64 callee-saved and
+    // survive emit_bytes / emit_hex32 calls.
+    adr     x1, rx_drop_msg
+    mov     w2, #(rx_drop_msg_end - rx_drop_msg)
+    bl      emit_bytes
+    mov     w5, w21                              // used_len
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #NEWLINE_MSG_LEN
+    bl      emit_bytes
+
+    // Recycle: write id to AvailRing.ring[next_avail & mask].
+    and     w10, w24, w25
+    add     x11, x19, #VIRTQ_OFF_AVAIL
+    add     x11, x11, #4
+    strh    w20, [x11, x10, lsl #1]
+
+    // Advance next_avail, consumer shadow, and per-dispatch
+    // counter — same triple as the RX consume body's tail.
+    // The drop counts toward RX_FRAME_BUDGET because it
+    // consumed work the dispatcher must do (read + recycle).
+    add     w24, w24, #1
+    add     w28, w28, #1
+    ldr     w9, [sp, #88]
+    add     w9, w9, #1
+    str     w9, [sp, #88]
+
+    b       .Lrx_consume_check
+
 .Lrx_bad_id_fail:
     // RX UsedRing.ring[slot].id is out of range. w20 = observed id.
     //
@@ -777,6 +835,10 @@ rx_bad_id_msg_end:
 rx_num_bufs_msg:
     .ascii  "RX:FAIL num_bufs="
 rx_num_bufs_msg_end:
+
+rx_drop_msg:
+    .ascii  "RX:DROP used_len="
+rx_drop_msg_end:
 
 rx_returned_msg:
     .ascii  "RX:RETURNED\n"
