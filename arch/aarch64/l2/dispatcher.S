@@ -305,6 +305,14 @@ l2_dispatch:
 
 .Lrx_consume_check:
     // Budget check first — bounded-transition invariant.
+    //
+    // FSA-4 reminder: this compare reads w28 unmasked, so once
+    // shadow becomes persistent across dispatcher calls and grows
+    // past RX_FRAME_BUDGET, `b.hs` will always be taken and the
+    // consume loop terminates after a single frame. Separate
+    // shadow from per-dispatch counter at the same time the
+    // u16-wrap fix above starts mattering — see the comment block
+    // at .Lrx_wait_loop.
     cmp     w28, #RX_FRAME_BUDGET
     b.hs    .Lrx_drained
 
