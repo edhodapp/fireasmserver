@@ -161,15 +161,27 @@ l2_dispatch:
     ;   - r14:      RX next_avail, loaded from l2_state below
     ;   - r12, r13, r15: read-only — no save needed
     ;
-    ; Three 8-byte pushes (rbp, rbx, r14) + a 16-byte local frame
-    ; bring rsp ≡ 0 (mod 16) and reserve two stack slots:
-    ;   [rsp + 0] : per-dispatch frame counter (separate from
-    ;               shadow, used by both RX consume and TX reclaim
-    ;               loop budget checks)
-    ;   [rsp + 8] : TX next_avail stash (snapshot of the advanced
-    ;               r9 value, kept across the TX emit chain so it
-    ;               can be written back to l2_state at exit even
-    ;               if r9 is clobbered by emit_bytes/emit_hex32)
+    ; Three 8-byte pushes (rbp, rbx, r14) + a 32-byte local frame
+    ; bring rsp ≡ 0 (mod 16) and reserve six dword-sized slots
+    ; (with padding for 8-byte alignment of each pair):
+    ;   [rsp +  0..3] : per-dispatch frame counter (FSA-4; bounds
+    ;                   the RX consume and TX reclaim loops)
+    ;   [rsp +  4..7] : hdr_len save (FSA-4(A); preserved across
+    ;                   the optional ARP:REQUEST marker emit since
+    ;                   emit_bytes consumes esi via lodsb)
+    ;   [rsp +  8..11]: TX next_avail stash (FSA-4; snapshot of
+    ;                   advanced r9, kept across the TX emit chain
+    ;                   for writeback at .l2_tx_writeback)
+    ;   [rsp + 12..15]: id save (FSA-4(A); preserved across the
+    ;                   optional ARP:REQUEST marker emit since
+    ;                   emit_bytes clobbers edi as its LSR-poll
+    ;                   counter = UART_POLL_TIMEOUT)
+    ;   [rsp + 16..19]: arp_match flag (FSA-4(A); zeroed at entry,
+    ;                   set in the ARP recognition path)
+    ;   [rsp + 20..23]: sender_ip stash (FSA-4(A); ARP reply
+    ;                   patches THA/TPA from here)
+    ;   [rsp + 24..29]: sender_mac stash (6 bytes for ARP reply)
+    ;   [rsp + 30..31]: padding for 16-alignment
     push rbp
     mov rbp, rsp
     push rbx
@@ -292,13 +304,22 @@ l2_dispatch:
     ; arp_match flag, emit ARP:REQUEST marker. The post-RX-drain
     ; code reads the flag + stash to build the reply.
     ;
-    ; rsi holds hdr_len at this point (movzx above); emit_bytes
-    ; consumes rsi via lodsb. Stash rsi to [rsp + 4] before any
-    ; potential marker emit and restore it before the push chain
-    ; below. The stash is unconditional — costs 2 movs per frame
-    ; whether or not ARP matches, which is cheaper than wrapping
-    ; the save in the match path.
+    ; Register-save discipline across the (potential) ARP:REQUEST
+    ; emit. emit_bytes clobbers rsi (consumed via lodsb) AND rdi
+    ; (used as the LSR-poll inner counter — `mov edi,
+    ; UART_POLL_TIMEOUT` in boot.S, which is 0x00100000). Both
+    ; values are needed AFTER the recognition block (rsi for the
+    ; RX:FRAME hdr_len emit, rdi for the RX:FRAME id emit and the
+    ; AvailRing recycle). Save unconditionally — one mov each is
+    ; cheaper than gating on whether ARP matched.
+    ;
+    ; The rdi save was added 2026-05-22 in response to the
+    ; clean-Claude pre-push review on the harness commit. The
+    ; first L2 integration run noticed `id=00100000` in the
+    ; iter-2 RX:FRAME marker — UART_POLL_TIMEOUT's residue from
+    ; emit_bytes leaking through the push chain.
     mov [rsp + 4], esi                               ; save hdr_len
+    mov [rsp + 12], edi                              ; save id
 
     cmp word [rax + 24], 0x0608                      ; EtherType (0x0806 BE)
     jne .l2_no_arp
@@ -317,13 +338,19 @@ l2_dispatch:
     ; emit_bytes wedged in its LSR-poll loop reading a bogus
     ; port, producing the bus_error spam Firecracker logs.
     ;
-    ; r10d is caller-saved per SysV and not live at this point
-    ; (we last used r10 for the slot entry base above, computed
-    ; from rbp+r13, no further use). emit_bytes clobbers it
-    ; freely, but we only use it BEFORE the marker emit, so the
-    ; clobber doesn't matter to us. Same fix applies to any
-    ; future dispatcher addition that needs a scratch register
-    ; across an emit_bytes call: use r10/r11/eax — anything but dx.
+    ; r10d is caller-saved per SysV and dead at this point (last
+    ; used as the slot entry-base; no further read). emit_bytes
+    ; clobbers it freely, but we only use it BEFORE the marker
+    ; emit, so the clobber doesn't matter to us.
+    ;
+    ; Future dispatcher additions that need a scratch register
+    ; across an emit_bytes call: pick r10/eax (caller-saved, no
+    ; emit_bytes invariant). DON'T pick rdx (carries COM1_PORT;
+    ; corrupting it produces the 0xa8c5 bus_error symptom this
+    ; fix was originally for) and DON'T pick rdi/r11 around the
+    ; RX:FRAME emit chain — rdi carries the descriptor id and
+    ; r11 carries num_buffers, both pushed for the emit chain
+    ; below.
     mov r10d, [rax + 34]                             ; SHA bytes 0-3
     mov [rsp + 24], r10d
     movzx r10d, word [rax + 38]                      ; SHA bytes 4-5
@@ -337,6 +364,7 @@ l2_dispatch:
     call emit_bytes
 .l2_no_arp:
     mov esi, [rsp + 4]                               ; restore hdr_len
+    mov edi, [rsp + 12]                              ; restore id
 
     ; --- Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=... ---
     ;

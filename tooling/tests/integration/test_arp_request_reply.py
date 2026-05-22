@@ -73,7 +73,23 @@ def test_arp_request_for_guest_ip_gets_reply(
             f"Serial log:\n{serial_log.text()}\n"
             f"Captured: {len(cap.packets)} frames (see {captured_pcap})"
         )
+    # Exactly one reply expected. A second reply would indicate the
+    # dispatcher loop double-processed the same request — a real
+    # regression we want to catch.
+    assert len(replies) == 1, (
+        f"expected exactly 1 ARP reply, got {len(replies)}; "
+        f"see {captured_pcap}"
+    )
     reply = replies[0]
+    # Ethernet-layer destination should be the requester's MAC.
+    # parse_arp_reply returns only the ARP layer; pull the
+    # Ethernet header out of the raw bytes for completeness.
+    raw = bytes(cap.packets[0])
+    eth_dst = ":".join(f"{b:02x}" for b in raw[0:6])
+    assert eth_dst == frames.HOST_DEFAULT_MAC.lower(), (
+        f"Ethernet dst={eth_dst!r}, expected "
+        f"{frames.HOST_DEFAULT_MAC.lower()!r}"
+    )
     assert reply.psrc == frames.GUEST_DEFAULT_IP, (
         f"reply psrc={reply.psrc!r}, expected "
         f"{frames.GUEST_DEFAULT_IP!r}"
@@ -121,6 +137,17 @@ def test_arp_request_for_wrong_ip_gets_no_reply(
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(request)
+        # Marker-absence check INSIDE the capture context, with
+        # a window matching the sniff timeout. This synchronizes
+        # the absence assertion with the live capture so a
+        # delayed reply (e.g., from a future race) lands inside
+        # the same window we're verifying didn't fire markers.
+        # Per the clean-Claude 2026-05-22 review: doing this
+        # AFTER the with block would only check the log instant
+        # the call runs and could miss a delayed emit.
+        serial_log.assert_marker_absent(
+            "ARP:REQUEST", window=CAPTURE_WINDOW_SECONDS,
+        )
 
     parsed = [parse_arp_reply(bytes(p)) for p in cap.packets]
     replies = [r for r in parsed if r is not None]
@@ -132,8 +159,7 @@ def test_arp_request_for_wrong_ip_gets_no_reply(
             f"Serial log:\n{serial_log.text()}\n"
             f"See {captured_pcap}"
         )
-    # The guest should NOT have logged ARP:REQUEST for a wrong-IP
-    # frame (the recognition gate filters on TPA before setting
-    # the flag) — so the marker should be absent too.
-    serial_log.assert_marker_absent("ARP:REQUEST", window=0.0)
+    # Snapshot check on ARP:REPLY for completeness; the absence
+    # check above already covered the same window via the
+    # window= parameter.
     serial_log.assert_marker_absent("ARP:REPLY", window=0.0)

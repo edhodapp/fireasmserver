@@ -89,13 +89,13 @@ def _check_guest_built() -> None:
 
 
 @pytest.fixture()
-def artifact_dir(tmp_path: pytest.TempPathFactory) -> Path:
+def artifact_dir(tmp_path: Path) -> Path:
     """Per-test artifact directory.
 
     pytest's `tmp_path` is per-test by default. We rename the
     fixture for clarity at the test call site.
     """
-    return Path(tmp_path)  # type: ignore[arg-type]
+    return tmp_path
 
 
 # pylint: disable=redefined-outer-name

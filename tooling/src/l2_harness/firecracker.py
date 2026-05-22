@@ -20,7 +20,7 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import IO, Iterator
 
 from pydantic import BaseModel
 
@@ -64,6 +64,14 @@ class FirecrackerGuest:
         self._serial_path = cfg.artifact_dir / "serial.log"
         self._stderr_path = cfg.artifact_dir / "firecracker-stderr.log"
         self._config_path = cfg.artifact_dir / "firecracker-config.json"
+        # We track the redirected stdout/stderr file handles
+        # explicitly because Popen does NOT expose them via
+        # proc.stdout / proc.stderr when we pass an already-open
+        # file object (those attributes stay None unless
+        # PIPE/stdout was used). Without explicit tracking, the
+        # handles leak — caught by clean-Claude on 2026-05-22.
+        self._stdout_f: IO[bytes] | None = None
+        self._stderr_f: IO[bytes] | None = None
 
     @property
     def serial_log_path(self) -> Path:
@@ -89,8 +97,13 @@ class FirecrackerGuest:
             raise RuntimeError("Firecracker already started")
         self._write_config()
         self._serial_path.touch()
-        # pylint: disable=consider-using-with — owned across scope
-        # by this class; closed in stop().
+        # pylint: disable=consider-using-with — file handles are
+        # owned across scope by this class and closed in stop().
+        # Stored on self so _close_redirected_streams can find them
+        # (Popen doesn't expose them via proc.stdout/.stderr when
+        # we pass an already-open file).
+        self._stdout_f = open(self._serial_path, "wb")
+        self._stderr_f = open(self._stderr_path, "wb")
         self._proc = subprocess.Popen(
             [
                 "firecracker",
@@ -98,8 +111,8 @@ class FirecrackerGuest:
                 "--config-file", str(self._config_path),
                 "--id", self._cfg.instance_id,
             ],
-            stdout=open(self._serial_path, "wb"),
-            stderr=open(self._stderr_path, "wb"),
+            stdout=self._stdout_f,
+            stderr=self._stderr_f,
             cwd=self._cfg.artifact_dir,
         )
         self._wait_for_marker(ready_marker, ready_timeout)
@@ -126,13 +139,12 @@ class FirecrackerGuest:
 
     def _close_redirected_streams(self) -> None:
         """Close stdout/stderr file handles we opened."""
-        proc = self._proc
-        if proc is None:
-            return
-        if proc.stdout is not None:
-            proc.stdout.close()
-        if proc.stderr is not None:
-            proc.stderr.close()
+        if self._stdout_f is not None:
+            self._stdout_f.close()
+            self._stdout_f = None
+        if self._stderr_f is not None:
+            self._stderr_f.close()
+            self._stderr_f = None
 
     def _write_config(self) -> None:
         """Emit the Firecracker config JSON to the artifact dir."""

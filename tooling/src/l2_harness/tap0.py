@@ -79,12 +79,36 @@ def flush_arp_cache(guest_ip: str, iface: str = "tap0") -> None:
     and the guest must actually respond to ARP for the host's
     next request to succeed. Tolerates "no such entry" (the
     expected state on first call) without raising.
+
+    `ip neigh del` needs CAP_NET_ADMIN. The harness's venv Python
+    only has CAP_NET_RAW (per docs/l2/HARNESS.md §3.3), so the
+    delete fails with `Operation not permitted`. That failure is
+    currently benign — the integration tests use AF_PACKET sniff,
+    which doesn't consult the kernel's ARP cache — but the
+    "no silent suppressions" rule (CLAUDE.md feedback) says we
+    must NOT hide it. Surface it as a debug-visible warning so
+    a future test that DOES depend on a clean kernel ARP cache
+    fails loudly rather than mysteriously.
     """
-    subprocess.run(
+    result = subprocess.run(
         ["ip", "neigh", "del", guest_ip, "dev", iface],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
+        text=True,
+    )
+    if result.returncode == 0:
+        return
+    stderr = result.stderr.strip()
+    # "RTNETLINK answers: No such file or directory" is the
+    # expected first-call state. Anything else (permission
+    # denied, no route, etc.) gets surfaced.
+    if "No such file or directory" in stderr:
+        return
+    print(
+        f"WARNING: `ip neigh del {guest_ip} dev {iface}` "
+        f"returned {result.returncode}: {stderr!r}",
+        flush=True,
     )
 
 
