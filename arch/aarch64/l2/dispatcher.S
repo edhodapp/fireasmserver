@@ -373,8 +373,12 @@ l2_dispatch:
     add     x12, x19, #TX_QUEUE_OFF
     add     x12, x12, #VIRTQ_OFF_AVAIL            // x12 = TX AvailRing base
     and     w17, w15, w25                         // avail_slot = tx_next_avail & mask
-    add     x18, x12, #4                          // x18 = &ring[0]
-    strh    w16, [x18, x17, lsl #1]               // ring[avail_slot] = desc_idx
+    // Post-Gemini-review (MEDIUM): use x14 (AAPCS64 caller-saved
+    // scratch) rather than x18 here. x18 is the "platform
+    // register" reserved for platform-specific use under AAPCS64
+    // §6.2; using it as general scratch is non-portable.
+    add     x14, x12, #4                          // x14 = &ring[0]
+    strh    w16, [x14, x17, lsl #1]               // ring[avail_slot] = desc_idx
 
     dsb     sy
 
