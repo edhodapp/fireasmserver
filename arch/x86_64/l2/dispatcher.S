@@ -30,6 +30,16 @@
 ; at the function body, and (b) the emit-chain push/pop pattern
 ; alternated alignment. Both are corrected below.
 ;
+; Acknowledged deviation (Gemini #3): emit_bytes and emit_hex32
+; (defined in arch/x86_64/platform/firecracker/boot.S) use a
+; custom register convention — rsi/ecx for emit_bytes (source
+; ptr + length) and rax for emit_hex32 (value) — rather than
+; SysV's rdi/rsi/rdx. The helpers are bare-metal-internal
+; (never called from C), so the deviation is local to this
+; build. Changing the convention would cascade into boot.S and
+; every other caller of those helpers; tracked as a future
+; standardization pass.
+;
 ; Caller contract (from kernel_main_64 in boot.S):
 ;   - On entry: r12 = VIRTIO_MMIO base, r13 = N (queue size),
 ;     r14 = next_avail shadow, r15 = virtq base.
@@ -37,14 +47,17 @@
 ;     function; the prologue/epilogue save+restore them.
 ;   - r12, r13, r15 are also callee-saved AND read-only inside
 ;     this function; preserved trivially.
-;   - r14 is callee-saved per ABI but MODIFIED here. The RX-
-;     consume path advances next_avail by N where N is the number
-;     of frames consumed this dispatch, 0..RX_FRAME_BUDGET. The
-;     caller (kernel_main_64) does not read r14 post-call on
-;     either return arm: success → `jmp .halt`, failure → `jmp
-;     .set_failed` which only references r12. If a future caller
-;     cares about r14 surviving the call, either save/restore
-;     r14 here or surface the advanced value as a return.
+;   - r14 is SysV callee-saved AND modified inside this function
+;     (the RX-consume path advances next_avail by 0..RX_FRAME_BUDGET).
+;     Post-Gemini-review (HIGH finding): the prologue now
+;     `push r14` and the epilogue `pop r14`, so caller's r14 value
+;     is preserved as the SysV ABI requires. The dispatcher uses
+;     r14 internally as a working register, advances it through
+;     the consume loop, and restores the caller's value before
+;     return. The internal advance is therefore LOST — if a
+;     future reentrant caller needs the new next_avail to persist
+;     across invocations, the value must move to persistent
+;     storage (memreq region) or be returned via a new contract.
 ;   - On return: eax = 0 → caller jmps to .halt (clean halt
 ;                — both success and timeout paths land here;
 ;                pre-FSA-1 behavior, no return-code differentiation
@@ -126,24 +139,19 @@ l2_dispatch:
     ;
     ; Function entry: rsp ≡ 8 (mod 16) per the SysV calling
     ; convention — the caller's CALL pushed an 8-byte return
-    ; address onto a 16-aligned stack. We save rbx and rbp
-    ; (callee-saved per ABI; both modified by this function);
-    ; r12-r15 are also callee-saved but read-only here so no
-    ; save needed.
+    ; address onto a 16-aligned stack. Callee-saved set used here:
+    ;   - rbx, rbp: modified by the function body
+    ;   - r14:      modified by the RX-recycle loop (next_avail++)
+    ;   - r12, r13, r15: read-only — no save needed
     ;
-    ; After `push rbp` rsp ≡ 0 (mod 16); after `push rbx`
-    ; rsp ≡ 8 (mod 16). The `sub rsp, 8` below restores
-    ; 16-alignment so that every CALL inside this function lands
-    ; on a SysV-compliant stack — critical for any callee that
-    ; might use aligned vector loads (movdqa / vmovapd / XSAVE).
-    ; emit_bytes/emit_hex32 are currently SSE-free, but the
-    ; project policy is to maintain strict SysV alignment so the
-    ; door stays open for SSE/AVX/AES-NI helpers (see top header
-    ; block for rationale).
+    ; Three 8-byte pushes (rbp, rbx, r14) bring rsp ≡ 0 (mod 16),
+    ; which is what SysV §3.2.2 requires at every CALL. No extra
+    ; padding needed — saving r14 here doubles as the alignment
+    ; fix the pre-Gemini code used `sub rsp, 8` for.
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 8
+    push r14
 
     ; --- VIO-R-003/004: poll RX Used Ring for first completion ---
     ;
@@ -159,9 +167,16 @@ l2_dispatch:
     xor ebp, ebp
     mov ecx, POLL_BUDGET
 .l2_rx_wait_loop:
-    lfence
+    ; Gemini (8): `pause` is the x86 architecturally-recommended
+    ; spin-wait hint — improves power efficiency on SMT cores and
+    ; reduces pipeline stalls on memory-order-violation snoops.
+    ; The aarch64 equivalent is `yield`, used in the same role on
+    ; the matching wait loop. lfence here is dropped: x86 TSO
+    ; guarantees `mov ax, [...]` is not reordered with subsequent
+    ; loads, so the load-load ordering the lfence provided is
+    ; already free.
+    pause
     mov ax, [r15 + VIRTQ_OFF_USED + 2]
-    lfence
     cmp ax, bp
     jne .l2_rx_received
     dec ecx
@@ -302,21 +317,23 @@ l2_dispatch:
     jae .l2_rx_drained
 
     ; Queue probe — is there another completion already available?
-    ; No busy-wait here; this is a non-blocking drain.
-    lfence
+    ; No busy-wait here; this is a non-blocking drain. No pause
+    ; (we're not spinning) and no lfence (x86 TSO orders the load
+    ; against subsequent loads naturally).
     mov ax, [r15 + VIRTQ_OFF_USED + 2]
-    lfence
     cmp ax, bp
     jne .l2_rx_consume_body
     ; else: idx == shadow → queue drained, fall through
 
 .l2_rx_drained:
     ; --- VIO-R-007: batched AvailRing.idx publish + RX kick ---
+    ; Two mfences (was three): first orders per-slot ring writes
+    ; against idx publish, second orders idx against notify.
+    ; Gemini (9): the third (post-notify) mfence was unnecessary.
     mfence
     mov [r15 + VIRTQ_OFF_AVAIL + 2], r14w             ; AvailRing.idx = next_avail
     mfence
     mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 0     ; kick RX
-    mfence
 
     ; Emit RX:RETURNED once per dispatch (after all frames consumed).
     lea rsi, [rel rx_returned_msg]
@@ -324,7 +341,33 @@ l2_dispatch:
     call emit_bytes
 
     ; --- VIO-T-002..005: submit one canary Ethernet frame ---
+    ;
+    ; Post-Gemini-review (#2): the prior code hardcoded
+    ; `ring[0] = 0` and `idx = 1`, baking in the single-shot
+    ; assumption. Now parameterized by two shadow counters so the
+    ; shape is reentrant-ready (persistent storage of the shadows
+    ; is FSA-4 work):
+    ;
+    ;   r9  = tx_next_avail (producer counter for TX AvailRing).
+    ;         Today: initialised to 0 here. FSA-4: load from a
+    ;         memreq tx_state region so the value persists across
+    ;         dispatcher invocations.
+    ;   r10 = desc_idx (which TX descriptor slot to write).
+    ;         Today: fixed at 0 because TX_BUF_COUNT = 1.
+    ;         FSA-4: from a free-list when TX gains slots.
+    ;
+    ; For r9 = 0, r10 = 0 the byte effect is identical to the
+    ; prior hardcoded form: desc[0] = canary, ring[0] = 0,
+    ; AvailRing.idx = 1. Mirrors the aarch64 dispatcher's
+    ; w15/w16 shadow pair.
+    xor r9d, r9d                                     ; tx_next_avail (FSA-4: load from persistent)
+    xor r10d, r10d                                   ; desc_idx (FSA-4: from free-list)
+
+    ; rbx = desc[desc_idx] base. Each desc is 16 bytes.
     lea rbx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_DESC]
+    shl r10, 4                                       ; r10 *= 16
+    add rbx, r10                                     ; rbx = desc[desc_idx]
+    shr r10, 4                                       ; restore r10 = desc_idx for ring write
     ; addr is 32-bit immediate; tx_test_pkt is < 4 GiB so the
     ; sign-extended-to-64 immediate is correct as a phys address.
     ; Valid while paging identity-maps low 4 GiB (D063).
@@ -334,16 +377,25 @@ l2_dispatch:
     mov word  [rbx + 12], 0
     mov word  [rbx + 14], 0
 
-    mov word [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 4], 0   ; ring[0] = 0
+    ; avail_slot = tx_next_avail mod N. ring[avail_slot] = desc_idx.
+    mov eax, r9d
+    lea ecx, [r13d - 1]                              ; mask = N - 1
+    and eax, ecx                                     ; eax = avail_slot
+    mov [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 4 + rax*2], r10w
 
     mfence
 
-    mov word [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 2], 1   ; idx = 1
+    ; tx_next_avail++; publish AvailRing.idx = tx_next_avail.
+    inc r9d
+    mov [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 2], r9w
 
     mfence
 
-    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 1            ; kick TX
-    mfence
+    ; Gemini (9): drop the trailing mfence after the notify store
+    ; — no subsequent code depends on the notify having
+    ; completed, and the upcoming .l2_tx_wait_loop has its own
+    ; ordering.
+    mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 1    ; kick TX
 
     lea rsi, [rel tx_submitted_msg]
     mov ecx, tx_submitted_len
@@ -354,9 +406,8 @@ l2_dispatch:
     xor ebp, ebp
     mov ecx, POLL_BUDGET
 .l2_tx_wait_loop:
-    lfence
+    pause                                            ; Gemini (8): see RX wait loop
     mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]
-    lfence
     cmp ax, bp
     jne .l2_tx_reclaimed
     dec ecx
@@ -464,7 +515,7 @@ l2_dispatch:
     ; fall through
 
 .l2_epilogue:
-    add rsp, 8                                       ; undo prologue alignment padding
+    pop r14                                          ; restore caller's r14 (SysV)
     pop rbx
     pop rbp
     ret

@@ -115,6 +115,14 @@ l2_dispatch:
     //         LDRH/LDR imm12 windows from x19 directly.
     //   x27 = TX UsedRing base (x19 + TX_QUEUE_OFF + VIRTQ_OFF_USED).
     //   x28 = H2 RX/TX consumer shadow.
+    // Post-review (Gemini): w24 is hardcoded to VIRTQ_MAX_SIZE here
+    // because boot.S populates exactly that many RX buffers before
+    // calling the dispatcher (RX:POPULATED step publishes
+    // AvailRing.idx = VIRTQ_MAX_SIZE). For reentrance, the
+    // dispatcher must source RX next_avail from a persistent
+    // location (matching the TX shadow plan below). Same FSA-4
+    // work item; tracked together. Today's single-shot dispatch
+    // path is unaffected.
     mov     w24, #VIRTQ_MAX_SIZE
     mov     w25, #(VIRTQ_MAX_SIZE - 1)
     add     x26, x19, #VIRTQ_OFF_USED
@@ -299,24 +307,28 @@ l2_dispatch:
 .Lrx_drained:
     // --- VIO-R-007: batched AvailRing.idx publish + RX kick ---
     //
-    // Single barrier covers all per-slot writes from the loop.
-    // dsb sy (full system) is intentionally retained here rather
-    // than narrowed to dsb ishst (inner-shareable, store-only).
-    // The first barrier orders normal-memory ring writes against
-    // the upcoming idx write (ishst would suffice for that
-    // alone), but the SECOND barrier orders the normal-memory
-    // idx store against the Device-memory QueueNotify MMIO write,
-    // and per ARM ARM B2.3.7 the inner-shareable Normal-memory
-    // domain doesn't disqualifiably cover Device accesses. Full
-    // system dsb is the safe class across the Normal/Device
-    // boundary. A future cleanup could split the barriers (ishst
-    // before idx, sy before notify) at modest complexity cost.
+    // Two barriers (was three pre-Gemini-review):
+    //   #1 (before idx store) orders all per-slot AvailRing.ring
+    //      writes from the consume loop against the idx publish.
+    //      dsb sy retained rather than narrowed to dsb ishst —
+    //      the second barrier needs full-system class anyway, so
+    //      using ishst here would only shave one barrier's worth.
+    //   #2 (between idx and notify) orders the normal-memory idx
+    //      store against the Device-memory QueueNotify MMIO
+    //      write. Per ARM ARM B2.3.7 the inner-shareable Normal-
+    //      memory domain doesn't cover Device accesses, so full
+    //      system dsb is the safe class across the Normal/Device
+    //      boundary.
+    //
+    // Gemini (9) caught the third (post-notify) dsb sy as
+    // unnecessary — no subsequent code depends on the notify
+    // having completed, and the next op (emit_bytes) is on the
+    // independent UART device with its own ordering.
     dsb     sy
     add     x11, x19, #VIRTQ_OFF_AVAIL
     strh    w24, [x11, #2]                        // AvailRing.idx = next_avail
     dsb     sy
     str     wzr, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
-    dsb     sy
 
     // Emit RX:RETURNED once per dispatch (after all frames consumed).
     adr     x1, rx_returned_msg
@@ -324,28 +336,60 @@ l2_dispatch:
     bl      emit_bytes
 
     // --- VIO-T-002..005: submit one canary Ethernet frame on TX ---
+    //
+    // Post-review (Gemini): the prior code hardcoded `ring[0] = 0`
+    // and `AvailRing.idx = 1`, baking in the single-shot
+    // assumption. Restructured to compute both via parametric
+    // shadows so the code shape is reentrant-ready even though
+    // the persistent storage of those shadows is not yet wired:
+    //
+    //   w15 = tx_next_avail (producer counter for TX AvailRing).
+    //         Currently initialised to 0 here. FSA-4 will source
+    //         this from persistent storage (a memreq tx_state
+    //         region or equivalent) so the value survives across
+    //         dispatcher invocations — required for the
+    //         dispatcher to become legitimately reentrant for TX.
+    //   w16 = desc_idx (which TX descriptor slot to write).
+    //         Currently fixed at 0 because TX_BUF_COUNT = 1 in
+    //         pools.S — only one TX buffer exists. FSA-4 expands
+    //         this with a free-list when TX gains multiple slots.
+    //
+    // For w15 = 0, w16 = 0 the byte effect is identical to the
+    // prior hardcoded form: desc[0] gets the canary, ring[0] = 0,
+    // AvailRing.idx = 1.
+    mov     w15, #0                               // tx_next_avail (FSA-4: load from persistent)
+    mov     w16, #0                               // desc_idx (FSA-4: from free-list)
+
     adrp    x10, tx_test_pkt
     add     x10, x10, :lo12:tx_test_pkt           // runtime addr
-    add     x11, x19, #TX_QUEUE_OFF               // TX queue base
+    add     x11, x19, #TX_QUEUE_OFF               // x11 = TX desc[0] base
+    add     x11, x11, x16, lsl #4                 // x11 = TX desc[desc_idx] base (16 B/desc)
     str     x10, [x11, #0]                        // desc.addr (u64)
     mov     w12, #TX_TEST_PKT_LEN
     str     w12, [x11, #8]                        // desc.len
     strh    wzr, [x11, #12]                       // desc.flags = 0
     strh    wzr, [x11, #14]                       // desc.next  = 0
 
-    add     x12, x11, #VIRTQ_OFF_AVAIL            // TX AvailRing base
-    strh    wzr, [x12, #4]                        // ring[0] = 0
+    add     x12, x19, #TX_QUEUE_OFF
+    add     x12, x12, #VIRTQ_OFF_AVAIL            // x12 = TX AvailRing base
+    and     w17, w15, w25                         // avail_slot = tx_next_avail & mask
+    add     x18, x12, #4                          // x18 = &ring[0]
+    strh    w16, [x18, x17, lsl #1]               // ring[avail_slot] = desc_idx
 
     dsb     sy
 
+    add     w15, w15, #1                          // tx_next_avail++
+    strh    w15, [x12, #2]                        // AvailRing.idx = tx_next_avail
+
+    dsb     sy
+
+    // Kick TX (queue 1). Gemini (9): drop the trailing dsb sy
+    // here — the upcoming .Ltx_wait_loop LDARH provides its own
+    // acquire ordering on TX UsedRing.idx, and no other code
+    // between this kick and the loop depends on the notify
+    // having completed.
     mov     w13, #1
-    strh    w13, [x12, #2]                        // AvailRing.idx = 1
-
-    dsb     sy
-
-    // Kick TX (queue 1).
     str     w13, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
-    dsb     sy
 
     adr     x1, tx_submitted_msg
     mov     w2, #(tx_submitted_msg_end - tx_submitted_msg)
