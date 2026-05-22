@@ -129,42 +129,70 @@ extern newline
 extern tx_test_pkt
 extern __memreq_addr__rx_buffer
 
+; FSA-4: persistent shadow storage (4 × u16, see regions.yaml l2_state).
+extern __memreq_addr__l2_state
+
+; FSA-4: per-dispatch TX reclaim budget. Same role as
+; RX_FRAME_BUDGET for the multi-frame TX reclaim loop — caps the
+; number of TX completions drained per dispatcher invocation so
+; the bounded-transition invariant holds on a heavy TX-completion
+; backlog. Mirrors aarch64.
+TX_RECLAIM_BUDGET           equ 16
+
+; FSA-4: l2_state field offsets (mirror regions.yaml doc).
+L2_STATE_RX_NEXT_AVAIL      equ 0
+L2_STATE_RX_USED_SHADOW     equ 2
+L2_STATE_TX_NEXT_AVAIL      equ 4
+L2_STATE_TX_USED_SHADOW     equ 6
+
 global l2_dispatch
 
 [bits 64]
 section .text
 
 l2_dispatch:
-    ; SysV AMD64 prologue.
+    ; SysV AMD64 prologue + FSA-4 reentrance scaffolding.
     ;
     ; Function entry: rsp ≡ 8 (mod 16) per the SysV calling
-    ; convention — the caller's CALL pushed an 8-byte return
-    ; address onto a 16-aligned stack. Callee-saved set used here:
+    ; convention. Callee-saved set used here:
     ;   - rbx, rbp: modified by the function body
-    ;   - r14:      modified by the RX-recycle loop (next_avail++)
+    ;   - r14:      RX next_avail, loaded from l2_state below
     ;   - r12, r13, r15: read-only — no save needed
     ;
-    ; Three 8-byte pushes (rbp, rbx, r14) bring rsp ≡ 0 (mod 16),
-    ; which is what SysV §3.2.2 requires at every CALL. No extra
-    ; padding needed — saving r14 here doubles as the alignment
-    ; fix the pre-Gemini code used `sub rsp, 8` for.
+    ; Three 8-byte pushes (rbp, rbx, r14) + a 16-byte local frame
+    ; bring rsp ≡ 0 (mod 16) and reserve two stack slots:
+    ;   [rsp + 0] : per-dispatch frame counter (separate from
+    ;               shadow, used by both RX consume and TX reclaim
+    ;               loop budget checks)
+    ;   [rsp + 8] : TX next_avail stash (snapshot of the advanced
+    ;               r9 value, kept across the TX emit chain so it
+    ;               can be written back to l2_state at exit even
+    ;               if r9 is clobbered by emit_bytes/emit_hex32)
     push rbp
     mov rbp, rsp
     push rbx
     push r14
+    sub rsp, 16
+
+    ; --- FSA-4: load persistent shadows from l2_state ---
+    ;
+    ; l2_state holds four u16 counters (regions.yaml docs the
+    ; layout): rx_next_avail @ +0, rx_used_shadow @ +2,
+    ; tx_next_avail @ +4, tx_used_shadow @ +6. boot.S initialises
+    ; rx_next_avail = VIRTQ_MAX_SIZE after RX:POPULATED; the other
+    ; three are zero-init via the allocator pass.
+    ;
+    ; movzx loads zero-extended u16, so r14d/ebp range is [0,65535]
+    ; on entry — matching Virtio u16 idx wrap semantics. The
+    ; subsequent `cmp ax, bp` in the wait loops is naturally
+    ; wrap-safe (16-bit subregister compare).
+    mov rax, [rel __memreq_addr__l2_state]
+    movzx r14d, word [rax + L2_STATE_RX_NEXT_AVAIL]
+    movzx ebp,  word [rax + L2_STATE_RX_USED_SHADOW]
+    mov dword [rsp + 0], 0                           ; per-dispatch RX frame counter
+    mov dword [rsp + 8], 0                           ; tx_next_avail stash (TX phase will fill)
 
     ; --- VIO-R-003/004: poll RX Used Ring for first completion ---
-    ;
-    ; H2: maintain a consumer-shadow in rbp (RX used_shadow). rbp
-    ; doubles as the per-dispatch RX frame counter for the
-    ; RX_FRAME_BUDGET bound; the two roles coincide because the
-    ; dispatcher resets rbp to 0 at entry. FSA-2 amplifies the
-    ; existing hazard from FSA-1 (more stale reads on a second
-    ; invocation than before), but currently the dispatcher is
-    ; called exactly once from kernel_main_64 so the issue is
-    ; latent. FSA-3+ will separate shadow from counter when
-    ; shadow becomes persistent across dispatcher calls.
-    xor ebp, ebp
     mov ecx, POLL_BUDGET
 .l2_rx_wait_loop:
     ; Gemini (8): `pause` is the x86 architecturally-recommended
@@ -316,19 +344,28 @@ l2_dispatch:
     and eax, ecx                                     ; eax = next_avail mod N
     mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di      ; ring[avail_slot] = id
 
-    ; Advance both shadows after the recycle write.
+    ; Advance both shadows + the per-dispatch counter after the
+    ; recycle write. ebp tracks the consumer shadow (persistent,
+    ; loaded from l2_state); the dword at [rsp + 0] tracks how
+    ; many frames THIS dispatch has consumed (bounded by
+    ; RX_FRAME_BUDGET).
     inc r14d
     inc ebp
+    inc dword [rsp + 0]
 
 .l2_rx_consume_check:
-    ; Budget check first — bounded-transition invariant.
-    cmp ebp, RX_FRAME_BUDGET
+    ; Budget check first — FSA-4 separated counter from shadow.
+    ; Pre-FSA-4 this read ebp directly; under reentrance ebp can
+    ; start non-zero from persistent state, so the budget needs
+    ; its own dispatch-local counter.
+    cmp dword [rsp + 0], RX_FRAME_BUDGET
     jae .l2_rx_drained
 
     ; Queue probe — is there another completion already available?
     ; No busy-wait here; this is a non-blocking drain. No pause
     ; (we're not spinning) and no lfence (x86 TSO orders the load
-    ; against subsequent loads naturally).
+    ; against subsequent loads naturally). `cmp ax, bp` is a 16-bit
+    ; subregister compare that wraps correctly with the u16 idx.
     mov ax, [r15 + VIRTQ_OFF_USED + 2]
     cmp ax, bp
     jne .l2_rx_consume_body
@@ -338,7 +375,6 @@ l2_dispatch:
     ; --- VIO-R-007: batched AvailRing.idx publish + RX kick ---
     ; Two mfences (was three): first orders per-slot ring writes
     ; against idx publish, second orders idx against notify.
-    ; Gemini (9): the third (post-notify) mfence was unnecessary.
     mfence
     mov [r15 + VIRTQ_OFF_AVAIL + 2], r14w             ; AvailRing.idx = next_avail
     mfence
@@ -349,28 +385,23 @@ l2_dispatch:
     mov ecx, rx_returned_len
     call emit_bytes
 
+    ; --- FSA-4: write back RX shadows to l2_state ---
+    ;
+    ; mov word truncates the 32-bit r14d/ebp to u16 on store, so
+    ; even when the in-register values have overflowed 16 bits
+    ; mid-dispatch (e.g., r14d = 256+N after N frames consumed
+    ; this call), the persisted u16 wraps modulo 65536 correctly.
+    mov rax, [rel __memreq_addr__l2_state]
+    mov word [rax + L2_STATE_RX_NEXT_AVAIL],  r14w
+    mov word [rax + L2_STATE_RX_USED_SHADOW], bp
+
     ; --- VIO-T-002..005: submit one canary Ethernet frame ---
     ;
-    ; Post-Gemini-review (#2): the prior code hardcoded
-    ; `ring[0] = 0` and `idx = 1`, baking in the single-shot
-    ; assumption. Now parameterized by two shadow counters so the
-    ; shape is reentrant-ready (persistent storage of the shadows
-    ; is FSA-4 work):
-    ;
-    ;   r9  = tx_next_avail (producer counter for TX AvailRing).
-    ;         Today: initialised to 0 here. FSA-4: load from a
-    ;         memreq tx_state region so the value persists across
-    ;         dispatcher invocations.
-    ;   r10 = desc_idx (which TX descriptor slot to write).
-    ;         Today: fixed at 0 because TX_BUF_COUNT = 1.
-    ;         FSA-4: from a free-list when TX gains slots.
-    ;
-    ; For r9 = 0, r10 = 0 the byte effect is identical to the
-    ; prior hardcoded form: desc[0] = canary, ring[0] = 0,
-    ; AvailRing.idx = 1. Mirrors the aarch64 dispatcher's
-    ; w15/w16 shadow pair.
-    xor r9d, r9d                                     ; tx_next_avail (FSA-4: load from persistent)
-    xor r10d, r10d                                   ; desc_idx (FSA-4: from free-list)
+    ; FSA-4: tx_next_avail loaded from l2_state. desc_idx still
+    ; fixed at 0 because TX_BUF_COUNT = 1; FSA-5 will introduce
+    ; a free-list when TX gains multiple buffer slots.
+    movzx r9d, word [rax + L2_STATE_TX_NEXT_AVAIL]
+    xor r10d, r10d                                   ; desc_idx (FSA-5: from free-list)
 
     ; rbx = desc[desc_idx] base. Each desc is 16 bytes.
     lea rbx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_DESC]
@@ -395,50 +426,58 @@ l2_dispatch:
     mfence
 
     ; tx_next_avail++; publish AvailRing.idx = tx_next_avail.
+    ; Stash the advanced value in the local frame slot for
+    ; writeback at .l2_tx_writeback below — r9 is SysV caller-
+    ; saved and emit_bytes can clobber it across the TX:SUBMITTED
+    ; / TX:RECLAIMED emit chains.
     inc r9d
+    mov [rsp + 8], r9d
     mov [r15 + TX_QUEUE_OFF + VIRTQ_OFF_AVAIL + 2], r9w
 
     mfence
 
-    ; Gemini (9): drop the trailing mfence after the notify store
-    ; — no subsequent code depends on the notify having
-    ; completed, and the upcoming .l2_tx_wait_loop has its own
-    ; ordering.
     mov dword [r12 + VIRTIO_MMIO_QUEUE_NOTIFY], 1    ; kick TX
 
     lea rsi, [rel tx_submitted_msg]
     mov ecx, tx_submitted_len
     call emit_bytes
 
-    ; --- VIO-T-006: poll TX Used Ring for completion ---
-    ; H2: TX consumer-shadow restart (independent of RX queue).
-    xor ebp, ebp
+    ; --- VIO-T-006: poll TX Used Ring + multi-frame reclaim ---
+    ;
+    ; FSA-4: tx_used_shadow now loaded from l2_state (was reset
+    ; to 0 each call pre-FSA-4). The wait loop polls for the
+    ; FIRST completion past the persistent shadow; once seen,
+    ; .l2_tx_reclaim_body drains additional completions (analogous
+    ; to the RX multi-frame consume loop) up to TX_RECLAIM_BUDGET.
+    mov rax, [rel __memreq_addr__l2_state]
+    movzx ebp, word [rax + L2_STATE_TX_USED_SHADOW]
+    mov dword [rsp + 0], 0                           ; reinit per-dispatch counter for TX
     mov ecx, POLL_BUDGET
 .l2_tx_wait_loop:
     pause                                            ; Gemini (8): see RX wait loop
     mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]
     cmp ax, bp
-    jne .l2_tx_reclaimed
+    jne .l2_tx_reclaim_body
     dec ecx
     jnz .l2_tx_wait_loop
 
     lea rsi, [rel tx_timeout_msg]
     mov ecx, tx_timeout_len
     call emit_bytes
-    jmp .l2_ok
+    jmp .l2_tx_writeback                             ; writeback then clean halt
 
-.l2_tx_reclaimed:
-    ; INVARIANT (FSA-3): the .l2_tx_wait_loop above established
-    ; acquire-equivalent ordering on TX UsedRing.idx (via TSO);
-    ; subsequent ring-slot reads inherit the ordering.
+.l2_tx_reclaim_body:
+    ; FSA-4: multi-frame TX reclaim. The wait loop above
+    ; established idx != shadow on entry; this body drains
+    ; additional completions up to TX_RECLAIM_BUDGET (analogous
+    ; to .l2_rx_consume_body for the RX side). x86 TSO provides
+    ; acquire-on-load for the slot reads.
     mov eax, ebp                                     ; eax = shadow
     lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
     and eax, ecx                                     ; eax = slot
     lea r10, [r15 + rax*8 + TX_QUEUE_OFF + VIRTQ_OFF_USED]
-    lfence
     mov edi, [r10 + 4]                               ; ring[slot].id
     mov ebx, [r10 + 8]                               ; ring[slot].len
-    lfence
 
     cmp edi, VIRTQ_MAX_SIZE
     jae .l2_tx_bad_id_fail
@@ -467,6 +506,31 @@ l2_dispatch:
     call emit_bytes
 
     add rsp, 16
+
+    ; Advance shadow + per-dispatch counter.
+    inc ebp                                          ; tx_used_shadow++
+    inc dword [rsp + 0]                              ; per-dispatch counter++
+
+.l2_tx_reclaim_check:
+    ; Budget check first.
+    cmp dword [rsp + 0], TX_RECLAIM_BUDGET
+    jae .l2_tx_writeback
+
+    ; Queue probe — non-blocking; drain anything else already there.
+    mov ax, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2]
+    cmp ax, bp
+    jne .l2_tx_reclaim_body
+    ; else: queue drained, fall through
+
+.l2_tx_writeback:
+    ; --- FSA-4: write back TX shadows to l2_state ---
+    ; tx_next_avail comes from the stash slot at [rsp + 8] because
+    ; the value in r9 may have been clobbered by emit chains since
+    ; the submit. tx_used_shadow rides in rbp through the TX phase.
+    mov rax, [rel __memreq_addr__l2_state]
+    mov ecx, [rsp + 8]
+    mov word [rax + L2_STATE_TX_NEXT_AVAIL],  cx
+    mov word [rax + L2_STATE_TX_USED_SHADOW], bp
     jmp .l2_ok
 
 .l2_rx_bad_id_fail:
@@ -524,6 +588,7 @@ l2_dispatch:
     ; fall through
 
 .l2_epilogue:
+    add rsp, 16                                      ; release local frame (FSA-4)
     pop r14                                          ; restore caller's r14 (SysV)
     pop rbx
     pop rbp

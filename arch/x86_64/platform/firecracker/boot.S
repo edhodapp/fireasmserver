@@ -679,6 +679,15 @@ kernel_main_64:
     mov ecx, rx_populated_len
     call emit_bytes
 
+    ; --- FSA-4: initialise l2_state.rx_next_avail ---
+    ;
+    ; Match the AvailRing.idx just published (= VIRTQ_MAX_SIZE).
+    ; The other three shadows zero-init via the allocator pass.
+    ; Layout in arch/x86_64/.../regions.yaml's l2_state entry.
+    mov rax, [rel __memreq_addr__l2_state]
+    mov word [rax + 0], VIRTQ_MAX_SIZE                ; rx_next_avail = N
+    mfence
+
     ; --- FSA-1: hand off to L2 dispatcher ---
     ;
     ; Everything from this point through RX consume, TX submit, and

@@ -80,14 +80,36 @@
 // next dispatcher invocation. Tuneable as FSA-3+ data accrues.
 .equ RX_FRAME_BUDGET,           16
 
+// FSA-4: per-dispatch TX reclaim budget. Mirrors x86_64's
+// TX_RECLAIM_BUDGET. Caps how many TX completions the new
+// multi-frame TX reclaim loop drains in one dispatcher call.
+.equ TX_RECLAIM_BUDGET,         16
+
+// FSA-4: l2_state field offsets (mirror regions.yaml doc).
+.equ L2_STATE_RX_NEXT_AVAIL,    0
+.equ L2_STATE_RX_USED_SHADOW,   2
+.equ L2_STATE_TX_NEXT_AVAIL,    4
+.equ L2_STATE_TX_USED_SHADOW,   6
+
 .text
 .global l2_dispatch
 l2_dispatch:
-    // AAPCS64 prologue: save fp, lr, and the callee-saved
-    // registers we modify (x20-x28). 96-byte frame = 12 * 8;
-    // 11 regs + 1 padding slot keeps SP 16-byte aligned per
-    // AAPCS64 §6.2.2.
-    sub     sp, sp, #96
+    // AAPCS64 prologue + FSA-4 local frame.
+    //
+    // 112-byte frame layout (16-aligned per AAPCS64 §6.2.2):
+    //   [sp +   0..7] : x29 (fp)
+    //   [sp +   8..15]: x30 (lr)
+    //   [sp +  16..79]: x20-x27 callee-saved pairs
+    //   [sp +  80..87]: x28
+    //   [sp +  88..95]: per-dispatch frame counter (FSA-4)
+    //   [sp +  96..103]: tx_next_avail stash (FSA-4)
+    //   [sp + 104..111]: padding for 16-alignment
+    //
+    // The per-dispatch counter and the tx_next_avail stash both
+    // live on the stack rather than in registers because all the
+    // callee-saved registers (x19-x28) are already spoken for and
+    // we don't want to grow the prologue save list further.
+    sub     sp, sp, #112
     stp     x29, x30, [sp]
     stp     x20, x21, [sp, #16]
     stp     x22, x23, [sp, #32]
@@ -95,6 +117,23 @@ l2_dispatch:
     stp     x26, x27, [sp, #64]
     str     x28, [sp, #80]
     mov     x29, sp
+
+    // --- FSA-4: load persistent shadows from l2_state ---
+    //
+    // l2_state holds four u16 counters (regions.yaml docs the
+    // layout). boot.S initialises rx_next_avail = VIRTQ_MAX_SIZE
+    // after RX:POPULATED; the other three are zero-init by the
+    // allocator. ldrh zero-extends, so w24/w28 range is
+    // [0,65535] on entry — matching Virtio u16 idx wrap. The
+    // strh-based writebacks at exit truncate to u16 again, so
+    // persistent storage stays wrap-safe.
+    adrp    x10, __memreq_addr__l2_state
+    add     x10, x10, :lo12:__memreq_addr__l2_state
+    ldr     x10, [x10]                       // x10 = l2_state base
+    ldrh    w24, [x10, #L2_STATE_RX_NEXT_AVAIL]
+    ldrh    w28, [x10, #L2_STATE_RX_USED_SHADOW]
+    str     wzr, [sp, #88]                   // per-dispatch counter = 0
+    str     wzr, [sp, #96]                   // tx_next_avail stash = 0 (TX phase fills)
 
     // --- VIO-R-003/004: poll RX Used Ring for first completion ---
     //
@@ -106,27 +145,21 @@ l2_dispatch:
     //   x21 = used_len from used ring (RX then TX)
     //   x22 = hdr_len (RX only)
     //   x23 = num_buffers (RX only)
-    //   x24 = next_avail shadow; initialised to N after RX
-    //         populate published AvailRing.idx as N.
+    //   x24 = rx_next_avail (FSA-4: loaded from l2_state above;
+    //         written back at .Lrx_drained).
     //   x25 = mask = N - 1; AvailRing slot = next_avail & mask.
     //   x26 = RX UsedRing base (x19 + VIRTQ_OFF_USED). Hoisted as
     //         a callee-saved pin because VIRTQ_OFF_USED = 0x2000
     //         puts the USED-header fields past the scaled
     //         LDRH/LDR imm12 windows from x19 directly.
     //   x27 = TX UsedRing base (x19 + TX_QUEUE_OFF + VIRTQ_OFF_USED).
-    //   x28 = H2 RX/TX consumer shadow.
-    // Post-review (Gemini): w24 is hardcoded to VIRTQ_MAX_SIZE here
-    // because boot.S populates exactly that many RX buffers before
-    // calling the dispatcher (RX:POPULATED step publishes
-    // AvailRing.idx = VIRTQ_MAX_SIZE). For reentrance, the
-    // dispatcher must source RX next_avail from a persistent
-    // location (matching the TX shadow plan below). Same FSA-4
-    // work item; tracked together. Today's single-shot dispatch
-    // path is unaffected.
-    mov     w24, #VIRTQ_MAX_SIZE
+    //   x28 = rx_used_shadow / tx_used_shadow (FSA-4: loaded from
+    //         l2_state per phase; written back at phase exit).
+    //
+    // w24 and w28 already loaded from l2_state by the prologue;
+    // only the constants (mask, UsedRing base) need init here.
     mov     w25, #(VIRTQ_MAX_SIZE - 1)
     add     x26, x19, #VIRTQ_OFF_USED
-    mov     w28, #0                      // H2: RX used_shadow = 0
 
     // FSA-3: replace `dsb ishld + ldrh` with `ldarh` (load-acquire
     // halfword). LDARH is the canonical ARMv8 consumer-side
@@ -298,22 +331,24 @@ l2_dispatch:
     add     x11, x11, #4                          // skip flags + idx
     strh    w20, [x11, x10, lsl #1]               // ring[slot] = id
 
-    // Advance next_avail (producer counter for AvailRing) and the
-    // RX consumer shadow (UsedRing read position).
+    // Advance next_avail, consumer shadow, and the per-dispatch
+    // frame counter. FSA-4 separated the counter from the shadow:
+    // the shadow rides in w28 (persistent across calls, loaded
+    // from l2_state), so it can be non-zero at function entry and
+    // grow uncapped through the dispatch. The per-dispatch
+    // counter at [sp + 88] starts at 0 every call and bounds the
+    // consume loop via RX_FRAME_BUDGET.
     add     w24, w24, #1
     add     w28, w28, #1
+    ldr     w9, [sp, #88]
+    add     w9, w9, #1
+    str     w9, [sp, #88]
 
 .Lrx_consume_check:
-    // Budget check first — bounded-transition invariant.
-    //
-    // FSA-4 reminder: this compare reads w28 unmasked, so once
-    // shadow becomes persistent across dispatcher calls and grows
-    // past RX_FRAME_BUDGET, `b.hs` will always be taken and the
-    // consume loop terminates after a single frame. Separate
-    // shadow from per-dispatch counter at the same time the
-    // u16-wrap fix above starts mattering — see the comment block
-    // at .Lrx_wait_loop.
-    cmp     w28, #RX_FRAME_BUDGET
+    // Budget check first — uses the per-dispatch counter, not
+    // the shadow (FSA-4 separation).
+    ldr     w9, [sp, #88]
+    cmp     w9, #RX_FRAME_BUDGET
     b.hs    .Lrx_drained
 
     // Queue probe — is there another completion already available?
@@ -364,30 +399,27 @@ l2_dispatch:
     mov     w2, #(rx_returned_msg_end - rx_returned_msg)
     bl      emit_bytes
 
+    // --- FSA-4: write back RX shadows to l2_state ---
+    //
+    // strh truncates the 32-bit w24/w28 to u16 on store, so even
+    // if the in-register values have overflowed 16 bits during
+    // this dispatch (e.g., w24 = 256+N after N frames consumed),
+    // the persisted u16 wraps modulo 65536 correctly.
+    adrp    x10, __memreq_addr__l2_state
+    add     x10, x10, :lo12:__memreq_addr__l2_state
+    ldr     x10, [x10]                            // x10 = l2_state base
+    strh    w24, [x10, #L2_STATE_RX_NEXT_AVAIL]
+    strh    w28, [x10, #L2_STATE_RX_USED_SHADOW]
+
     // --- VIO-T-002..005: submit one canary Ethernet frame on TX ---
     //
-    // Post-review (Gemini): the prior code hardcoded `ring[0] = 0`
-    // and `AvailRing.idx = 1`, baking in the single-shot
-    // assumption. Restructured to compute both via parametric
-    // shadows so the code shape is reentrant-ready even though
-    // the persistent storage of those shadows is not yet wired:
-    //
-    //   w15 = tx_next_avail (producer counter for TX AvailRing).
-    //         Currently initialised to 0 here. FSA-4 will source
-    //         this from persistent storage (a memreq tx_state
-    //         region or equivalent) so the value survives across
-    //         dispatcher invocations — required for the
-    //         dispatcher to become legitimately reentrant for TX.
-    //   w16 = desc_idx (which TX descriptor slot to write).
-    //         Currently fixed at 0 because TX_BUF_COUNT = 1 in
-    //         pools.S — only one TX buffer exists. FSA-4 expands
-    //         this with a free-list when TX gains multiple slots.
-    //
-    // For w15 = 0, w16 = 0 the byte effect is identical to the
-    // prior hardcoded form: desc[0] gets the canary, ring[0] = 0,
-    // AvailRing.idx = 1.
-    mov     w15, #0                               // tx_next_avail (FSA-4: load from persistent)
-    mov     w16, #0                               // desc_idx (FSA-4: from free-list)
+    // FSA-4: tx_next_avail loaded from l2_state. desc_idx still
+    // fixed at 0 because TX_BUF_COUNT = 1; FSA-5 will introduce
+    // a free-list when TX gains multiple buffer slots. For
+    // tx_next_avail = 0 (first call) and desc_idx = 0 the byte
+    // effect is identical to the FSA-3 hardcoded form.
+    ldrh    w15, [x10, #L2_STATE_TX_NEXT_AVAIL]   // tx_next_avail (FSA-4: persistent)
+    mov     w16, #0                               // desc_idx (FSA-5: from free-list)
 
     adrp    x10, tx_test_pkt
     add     x10, x10, :lo12:tx_test_pkt           // runtime addr
@@ -402,25 +434,18 @@ l2_dispatch:
     add     x12, x19, #TX_QUEUE_OFF
     add     x12, x12, #VIRTQ_OFF_AVAIL            // x12 = TX AvailRing base
     and     w17, w15, w25                         // avail_slot = tx_next_avail & mask
-    // Post-Gemini-review (MEDIUM): use x14 (AAPCS64 caller-saved
-    // scratch) rather than x18 here. x18 is the "platform
-    // register" reserved for platform-specific use under AAPCS64
-    // §6.2; using it as general scratch is non-portable.
     add     x14, x12, #4                          // x14 = &ring[0]
     strh    w16, [x14, x17, lsl #1]               // ring[avail_slot] = desc_idx
 
     dsb     sy
 
     add     w15, w15, #1                          // tx_next_avail++
+    str     w15, [sp, #96]                        // stash for writeback (FSA-4)
     strh    w15, [x12, #2]                        // AvailRing.idx = tx_next_avail
 
     dsb     sy
 
-    // Kick TX (queue 1). Gemini (9): drop the trailing dsb sy
-    // here — the upcoming .Ltx_wait_loop LDARH provides its own
-    // acquire ordering on TX UsedRing.idx, and no other code
-    // between this kick and the loop depends on the notify
-    // having completed.
+    // Kick TX (queue 1).
     mov     w13, #1
     str     w13, [x6, #VIRTIO_MMIO_QUEUE_NOTIFY]
 
@@ -428,36 +453,46 @@ l2_dispatch:
     mov     w2, #(tx_submitted_msg_end - tx_submitted_msg)
     bl      emit_bytes
 
-    // --- VIO-T-006: poll TX Used Ring for completion ---
+    // --- VIO-T-006: poll TX Used Ring + multi-frame reclaim ---
+    //
+    // FSA-4: tx_used_shadow loaded from l2_state (was reset to 0
+    // each call pre-FSA-4). The wait loop polls for the FIRST
+    // completion past the persistent shadow; once seen,
+    // .Ltx_reclaim_body drains additional completions (analogous
+    // to the RX multi-frame consume loop) up to TX_RECLAIM_BUDGET.
     add     x27, x19, #(TX_QUEUE_OFF + VIRTQ_OFF_USED)
+    adrp    x10, __memreq_addr__l2_state
+    add     x10, x10, :lo12:__memreq_addr__l2_state
+    ldr     x10, [x10]
+    ldrh    w28, [x10, #L2_STATE_TX_USED_SHADOW]
+    str     wzr, [sp, #88]                       // reinit per-dispatch counter for TX
 
-    // H2: TX consumer-shadow restart (independent of RX queue).
-    mov     w28, #0
-
-    // FSA-3: load-acquire on TX UsedRing.idx — same rationale as
-    // the RX wait loop above. Pre-compute &TX UsedRing.idx in x11.
-    add     x11, x27, #2                 // x11 = &TX UsedRing.idx
+    add     x11, x27, #2                         // x11 = &TX UsedRing.idx
     ldr     w9, =POLL_BUDGET
 .Ltx_wait_loop:
-    yield                                // KVM liveness
-    ldarh   w10, [x11]                   // load-acquire TX UsedRing.idx
-    cmp     w10, w28, uxth               // u16 wrap-safe compare (see RX wait loop)
-    b.ne    .Ltx_reclaimed
+    yield                                        // KVM liveness
+    ldarh   w10, [x11]                           // load-acquire TX UsedRing.idx
+    cmp     w10, w28, uxth                       // u16 wrap-safe (see RX wait loop)
+    b.ne    .Ltx_reclaim_body
     subs    w9, w9, #1
     b.ne    .Ltx_wait_loop
 
     adr     x1, tx_timeout_msg
     mov     w2, #(tx_timeout_msg_end - tx_timeout_msg)
     bl      emit_bytes
-    b       .Lok
+    b       .Ltx_writeback                        // writeback then clean halt
 
-.Ltx_reclaimed:
-    // FSA-3: no barrier needed — the .Ltx_wait_loop LDARH above
-    // provided acquire semantics covering these slot reads.
-    and     w9, w28, w25                 // slot = used_shadow & mask
-    add     x9, x27, x9, lsl #3          // entry_base = x27 + slot*8
-    ldr     w20, [x9, #4]                // ring[slot].id
-    ldr     w21, [x9, #8]                // ring[slot].len
+.Ltx_reclaim_body:
+    // INVARIANT (FSA-3): every entry into .Ltx_reclaim_body —
+    // both the fall-through from .Ltx_wait_loop and the back-edge
+    // from .Ltx_reclaim_check — is preceded by an LDARH load-
+    // acquire of TX UsedRing.idx. Subsequent ring-slot reads here
+    // rely on that acquire for ordering against the producer
+    // (Firecracker virtio-net VMM thread).
+    and     w9, w28, w25                         // slot = tx_used_shadow & mask
+    add     x9, x27, x9, lsl #3                  // entry_base = x27 + slot*8
+    ldr     w20, [x9, #4]                        // ring[slot].id
+    ldr     w21, [x9, #8]                        // ring[slot].len
 
     cmp     w20, #VIRTQ_MAX_SIZE
     b.hs    .Ltx_bad_id_fail
@@ -478,6 +513,34 @@ l2_dispatch:
     adr     x1, newline_msg
     mov     w2, #NEWLINE_MSG_LEN
     bl      emit_bytes
+
+    // Advance shadow + per-dispatch counter.
+    add     w28, w28, #1                         // tx_used_shadow++
+    ldr     w9, [sp, #88]
+    add     w9, w9, #1
+    str     w9, [sp, #88]
+
+.Ltx_reclaim_check:
+    // Budget check (per-dispatch counter; FSA-4 separated from shadow).
+    ldr     w9, [sp, #88]
+    cmp     w9, #TX_RECLAIM_BUDGET
+    b.hs    .Ltx_writeback
+
+    // Queue probe — non-blocking; drain more completions if any.
+    add     x11, x27, #2
+    ldarh   w10, [x11]
+    cmp     w10, w28, uxth
+    b.ne    .Ltx_reclaim_body
+    // else: queue drained, fall through
+
+.Ltx_writeback:
+    // --- FSA-4: write back TX shadows to l2_state ---
+    adrp    x10, __memreq_addr__l2_state
+    add     x10, x10, :lo12:__memreq_addr__l2_state
+    ldr     x10, [x10]
+    ldr     w9, [sp, #96]                        // tx_next_avail (stashed)
+    strh    w9, [x10, #L2_STATE_TX_NEXT_AVAIL]
+    strh    w28, [x10, #L2_STATE_TX_USED_SHADOW]
     b       .Lok
 
 .Lrx_bad_id_fail:
@@ -531,7 +594,7 @@ l2_dispatch:
     ldp     x22, x23, [sp, #32]
     ldp     x20, x21, [sp, #16]
     ldp     x29, x30, [sp]
-    add     sp, sp, #96
+    add     sp, sp, #112                          // FSA-4: 112-byte frame
     ret
 
 // --- Strings used by l2_dispatch (file-local .rodata) ---

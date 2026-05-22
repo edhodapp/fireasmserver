@@ -767,6 +767,21 @@ _entry:
     mov     w2, #(rx_populated_msg_end - rx_populated_msg)
     bl      emit_bytes
 
+    // --- FSA-4: initialise l2_state.rx_next_avail ---
+    //
+    // Match the AvailRing.idx just published (= VIRTQ_MAX_SIZE,
+    // since we filled all 256 descriptors and advertised them).
+    // The other three shadows (rx_used_shadow, tx_next_avail,
+    // tx_used_shadow) are zero-init via the allocator pass and
+    // advance from there. See arch/aarch64/.../regions.yaml's
+    // l2_state entry for the layout.
+    mov     w9, #VIRTQ_MAX_SIZE
+    adrp    x10, __memreq_addr__l2_state
+    add     x10, x10, :lo12:__memreq_addr__l2_state
+    ldr     x10, [x10]                       // l2_state base address
+    strh    w9, [x10, #0]                    // rx_next_avail = N
+    dsb     sy
+
     // --- FSA-1: hand off to L2 dispatcher ---
     //
     // Everything from this point through RX consume, TX submit, and

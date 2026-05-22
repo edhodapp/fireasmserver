@@ -78,3 +78,32 @@ regions:
       returns and before any further `bl`. The bootstrap stack is
       only needed for init_memory_layout itself per MR-003; the
       kernel-proper stack lives here.
+
+  - name: l2_state
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 16          # 4 × u16 shadows + 8 B padding for FSA-5+ growth
+    align: 8          # natural u64 alignment for the storage word
+    doc: >
+      Persistent shadow storage for l2_dispatch (FSA-4). Four u16
+      counters at fixed offsets:
+        +0 : rx_next_avail   — producer counter for RX AvailRing
+        +2 : rx_used_shadow  — consumer counter for RX UsedRing
+        +4 : tx_next_avail   — producer counter for TX AvailRing
+        +6 : tx_used_shadow  — consumer counter for TX UsedRing
+        +8 : reserved (zero-init via allocator)
+
+      All four wrap modulo 65536 to match Virtio u16 idx fields.
+      boot.S initialises rx_next_avail = VIRTQ_MAX_SIZE (256)
+      after RX:POPULATED publishes that count of buffers; the
+      other three are zero on first call (zero-init by the
+      allocator) and advance from there.
+
+      The dispatcher reads all four shadows at entry, uses them
+      across the RX/TX phases, and writes them back at exit so
+      subsequent invocations see the advanced state. Cold-tier
+      because the load+store is two MMIO-free memory ops per
+      dispatch — well below the threshold where a pinned hot-tier
+      register would pay off.
