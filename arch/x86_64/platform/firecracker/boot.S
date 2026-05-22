@@ -711,9 +711,19 @@ kernel_main_64:
     ; Entry contract: r12 = VIRTIO_MMIO base, r13 = N, r14 =
     ; next_avail, r15 = virtq base. SysV callee-saved set (rbx,
     ; rbp, r12-r15) preserved by l2_dispatch's prologue/epilogue.
+    ; FSA-4(A): loop l2_dispatch so reentrance from FSA-4(B) is
+    ; actually exercised. 100 iterations gives the host enough
+    ; time to send an ARP request (or other inbound traffic) and
+    ; observe the reply land via tap0. rbx holds the counter
+    ; across `call l2_dispatch` (SysV callee-saved; dispatcher
+    ; saves/restores rbx in its prologue/epilogue).
+    mov ebx, 100
+.dispatch_loop:
     call l2_dispatch
     test eax, eax
     jnz .set_failed
+    dec ebx
+    jnz .dispatch_loop
     jmp .halt
 .driver_ok_fail:
     push rax

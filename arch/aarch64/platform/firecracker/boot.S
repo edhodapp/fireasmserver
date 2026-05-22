@@ -807,8 +807,23 @@ _entry:
     // memreq pin discipline that emit_bytes / emit_hex32 already
     // observe; AAPCS64 callee-saved set (x19-x28) preserved by
     // l2_dispatch's prologue/epilogue.
+    // FSA-4(A): loop l2_dispatch so reentrance from FSA-4(B) is
+    // actually exercised. 100 iterations gives the host enough
+    // time to send an ARP request (or anything else) and observe
+    // the reply land via tap0. Iteration count is a soft cap; if
+    // we ever need open-ended dispatch the obvious tweak is to
+    // turn this into a wfi/wfe-paced loop and gate exit on an
+    // explicit shutdown signal.
+    //
+    // x20 holds the counter across `bl l2_dispatch` because
+    // AAPCS64 callee-saved set covers it and the dispatcher
+    // saves/restores x20 in its prologue/epilogue.
+    mov     x20, #100
+.Ldispatch_loop:
     bl      l2_dispatch
     cbnz    w0, .Lset_failed
+    subs    x20, x20, #1
+    b.ne    .Ldispatch_loop
     b       .Lflush
 
 .Ldriver_ok_fail:

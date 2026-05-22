@@ -131,6 +131,9 @@ extern __memreq_addr__rx_buffer
 ; FSA-4: persistent shadow storage (4 × u16, see regions.yaml l2_state).
 extern __memreq_addr__l2_state
 
+; FSA-4(A): writable TX buffer for ARP replies (see regions.yaml tx_arp_buf).
+extern __memreq_addr__tx_arp_buf
+
 ; FSA-4: per-dispatch TX reclaim budget. Same role as
 ; RX_FRAME_BUDGET for the multi-frame TX reclaim loop — caps the
 ; number of TX completions drained per dispatcher invocation so
@@ -171,7 +174,7 @@ l2_dispatch:
     mov rbp, rsp
     push rbx
     push r14
-    sub rsp, 16
+    sub rsp, 32                                      ; FSA-4(A): grew from 16 → 32 for ARP stash
 
     ; --- FSA-4: load persistent shadows from l2_state ---
     ;
@@ -190,6 +193,7 @@ l2_dispatch:
     movzx ebp,  word [rax + L2_STATE_RX_USED_SHADOW]
     mov dword [rsp + 0], 0                           ; per-dispatch RX frame counter
     mov dword [rsp + 8], 0                           ; tx_next_avail stash (TX phase will fill)
+    mov dword [rsp + 16], 0                          ; FSA-4(A): arp_match flag
 
     ; --- VIO-R-003/004: poll RX Used Ring for first completion ---
     mov ecx, POLL_BUDGET
@@ -276,6 +280,47 @@ l2_dispatch:
 
     cmp r11d, 1
     jne .l2_rx_num_bufs_fail
+
+    ; --- FSA-4(A): ARP request recognition ---
+    ;
+    ; Three short-circuit ne-checks on the inbound frame:
+    ;   EtherType @ +24 = 0x0806 BE (= 0x0608 LE16)
+    ;   ARP OPER  @ +32 = 0x0001 BE (= 0x0100 LE16) — request
+    ;   TPA       @ +50 = 192.168.42.2 BE → 0x022AA8C0 LE32
+    ;
+    ; On match: stash SHA (6 B @ +34) + SPA (4 B @ +40), set
+    ; arp_match flag, emit ARP:REQUEST marker. The post-RX-drain
+    ; code reads the flag + stash to build the reply.
+    ;
+    ; rsi holds hdr_len at this point (movzx above); emit_bytes
+    ; consumes rsi via lodsb. Stash rsi to [rsp + 4] before any
+    ; potential marker emit and restore it before the push chain
+    ; below. The stash is unconditional — costs 2 movs per frame
+    ; whether or not ARP matches, which is cheaper than wrapping
+    ; the save in the match path.
+    mov [rsp + 4], esi                               ; save hdr_len
+
+    cmp word [rax + 24], 0x0608                      ; EtherType (0x0806 BE)
+    jne .l2_no_arp
+    cmp word [rax + 32], 0x0100                      ; OPER (0x0001 BE)
+    jne .l2_no_arp
+    cmp dword [rax + 50], 0x022AA8C0                 ; TPA = 192.168.42.2
+    jne .l2_no_arp
+
+    ; ARP match. Stash sender MAC + IP.
+    mov edx, [rax + 34]                              ; SHA bytes 0-3
+    mov [rsp + 24], edx
+    movzx edx, word [rax + 38]                       ; SHA bytes 4-5
+    mov [rsp + 28], dx
+    mov edx, [rax + 40]                              ; SPA
+    mov [rsp + 20], edx
+    mov dword [rsp + 16], 1                          ; arp_match = 1
+
+    lea rsi, [rel arp_request_msg]
+    mov ecx, arp_request_len
+    call emit_bytes
+.l2_no_arp:
+    mov esi, [rsp + 4]                               ; restore hdr_len
 
     ; --- Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=... ---
     ;
@@ -402,16 +447,80 @@ l2_dispatch:
     movzx r9d, word [rax + L2_STATE_TX_NEXT_AVAIL]
     xor r10d, r10d                                   ; desc_idx (FSA-5: from free-list)
 
+    ; --- FSA-4(A): build ARP reply if matched, else use canary ---
+    ;
+    ; If an ARP request matched during RX consume (arp_match @
+    ; [rsp + 16]), build a reply frame in tx_arp_buf by copying
+    ; the rodata arp_reply_template and patching dst MAC + THA +
+    ; TPA from the stashed sender info. r8 = chosen TX buffer addr
+    ; (tx_arp_buf when arp_match, tx_test_pkt when not).
+    cmp dword [rsp + 16], 0
+    je .l2_use_canary
+
+    ; Copy the 72-byte template into tx_arp_buf via 4× 16-byte
+    ; movdqu pairs of GPR loads. Actually use 64-bit movs for
+    ; simplicity (no SSE register needed here): 9× mov rcx + mov
+    ; [r8 + N], rcx covers 72 bytes.
+    mov r8, [rel __memreq_addr__tx_arp_buf]
+    lea rdi, [rel arp_reply_template]
+    mov rcx, [rdi + 0]
+    mov [r8 + 0], rcx
+    mov rcx, [rdi + 8]
+    mov [r8 + 8], rcx
+    mov rcx, [rdi + 16]
+    mov [r8 + 16], rcx
+    mov rcx, [rdi + 24]
+    mov [r8 + 24], rcx
+    mov rcx, [rdi + 32]
+    mov [r8 + 32], rcx
+    mov rcx, [rdi + 40]
+    mov [r8 + 40], rcx
+    mov rcx, [rdi + 48]
+    mov [r8 + 48], rcx
+    mov rcx, [rdi + 56]
+    mov [r8 + 56], rcx
+    mov rcx, [rdi + 64]
+    mov [r8 + 64], rcx
+
+    ; Patch dst MAC @ +12 from sender_mac stash (6 bytes).
+    mov ecx, [rsp + 24]                              ; SHA bytes 0-3
+    mov [r8 + 12], ecx
+    movzx ecx, word [rsp + 28]                       ; SHA bytes 4-5
+    mov [r8 + 16], cx
+
+    ; Patch THA @ +44 from sender_mac stash.
+    mov ecx, [rsp + 24]
+    mov [r8 + 44], ecx
+    movzx ecx, word [rsp + 28]
+    mov [r8 + 48], cx
+
+    ; Patch TPA @ +50 from sender_ip stash.
+    mov ecx, [rsp + 20]
+    mov [r8 + 50], ecx
+
+    lea rsi, [rel arp_reply_msg]
+    mov ecx, arp_reply_len
+    call emit_bytes
+    ; emit_bytes clobbers rax/rcx/rsi/rdi; r8 (caller-saved) is
+    ; not touched by the helper's implementation but the contract
+    ; doesn't promise it. Re-derive tx_arp_buf for the desc write.
+    mov r8, [rel __memreq_addr__tx_arp_buf]
+    jmp .l2_have_tx_addr
+
+.l2_use_canary:
+    lea r8, [rel tx_test_pkt]
+
+.l2_have_tx_addr:
     ; rbx = desc[desc_idx] base. Each desc is 16 bytes.
     lea rbx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_DESC]
     shl r10, 4                                       ; r10 *= 16
     add rbx, r10                                     ; rbx = desc[desc_idx]
     shr r10, 4                                       ; restore r10 = desc_idx for ring write
-    ; addr is 32-bit immediate; tx_test_pkt is < 4 GiB so the
-    ; sign-extended-to-64 immediate is correct as a phys address.
-    ; Valid while paging identity-maps low 4 GiB (D063).
-    mov dword [rbx + 0],  tx_test_pkt
-    mov dword [rbx + 4],  0
+    ; Write desc.addr (u64) — r8 < 4 GiB so the upper 32 bits of
+    ; the 64-bit phys address are zero. Splitting into two 32-bit
+    ; stores both because TX_TEST_PKT_LEN @ +8 wants a 32-bit
+    ; store and because the upper half is unconditionally zero.
+    mov [rbx + 0],  r8
     mov dword [rbx + 8],  TX_TEST_PKT_LEN
     mov word  [rbx + 12], 0
     mov word  [rbx + 14], 0
@@ -603,7 +712,7 @@ l2_dispatch:
     ; fall through
 
 .l2_epilogue:
-    add rsp, 16                                      ; release local frame (FSA-4)
+    add rsp, 32                                      ; release local frame (FSA-4 + FSA-4(A))
     pop r14                                          ; restore caller's r14 (SysV)
     pop rbx
     pop rbp
@@ -641,6 +750,42 @@ tx_used_len_msg:         db ' used_len='
 tx_used_len_len          equ $ - tx_used_len_msg
 tx_bad_id_msg:           db 'TX:FAIL bad_id='
 tx_bad_id_len            equ $ - tx_bad_id_msg
+
+; FSA-4(A) ARP responder markers.
+arp_request_msg:         db 'ARP:REQUEST', 10
+arp_request_len          equ $ - arp_request_msg
+arp_reply_msg:           db 'ARP:REPLY', 10
+arp_reply_len            equ $ - arp_reply_msg
+
+; FSA-4(A) ARP reply template — 72 bytes, copied verbatim into
+; tx_arp_buf then patched with dst MAC / THA / TPA from the
+; stashed request info. Pre-baked fields: src MAC (GUEST_MAC),
+; EtherType (ARP), HTYPE / PTYPE / HLEN / PLEN, OPER (reply),
+; SHA (GUEST_MAC), SPA (GUEST_IP = 192.168.42.2).
+;
+; GUEST_MAC = 02:00:00:00:00:01 matches the tx_test_pkt canary's
+; src MAC for ARP-table consistency.
+align 16
+arp_reply_template:
+    ; virtio_net_hdr (12 zero bytes)
+    times 12 db 0
+    ; Ethernet header
+    times 6  db 0                                    ; dst MAC (patched)
+    db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; src MAC = GUEST_MAC
+    db 0x08, 0x06                                    ; EtherType = ARP (BE)
+    ; ARP payload (28 bytes)
+    db 0x00, 0x01                                    ; HTYPE = Ethernet (BE)
+    db 0x08, 0x00                                    ; PTYPE = IPv4 (BE)
+    db 0x06                                          ; HLEN
+    db 0x04                                          ; PLEN
+    db 0x00, 0x02                                    ; OPER = reply (BE)
+    db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; SHA = GUEST_MAC
+    db 0xC0, 0xA8, 0x2A, 0x02                        ; SPA = GUEST_IP
+    times 6  db 0                                    ; THA (patched)
+    times 4  db 0                                    ; TPA (patched)
+    ; Ethernet padding to 60-byte minimum frame.
+    times 18 db 0
+arp_reply_template_end:
 
 ; Mark the stack as non-executable. Without this section the linker
 ; assumes RWX stack and warns; the other NASM-emitted units in this

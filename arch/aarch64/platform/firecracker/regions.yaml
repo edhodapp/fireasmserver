@@ -79,6 +79,28 @@ regions:
       only needed for init_memory_layout itself per MR-003; the
       kernel-proper stack lives here.
 
+  - name: tx_arp_buf
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 128        # 12 B virtio_net_hdr + 60 B Ethernet min (14 hdr + 28 ARP + 18 pad) + slack
+    align: 16
+    doc: >
+      Writable TX scratch buffer for FSA-4(A) — the ARP responder
+      writes its reply Ethernet frame here when an inbound ARP
+      request for our IP arrives. boot.S submits TX descriptor 0
+      pointing at this region (when arp_match is set during a
+      dispatch); otherwise descriptor 0 points at the rodata
+      canary frame (tx_test_pkt) as before.
+
+      The region is intentionally generous (128 B vs the strict 72
+      bytes a single-frame ARP reply needs) so future TX-side
+      additions — ICMP, gratuitous ARP, link-layer probes — have
+      room to share the buffer without a second region. FSA-5 will
+      introduce a free-list and multiple writable TX buffers when
+      reentrant multi-frame TX becomes load-bearing.
+
   - name: l2_state
     tier: cold
     lifetime: steady_state

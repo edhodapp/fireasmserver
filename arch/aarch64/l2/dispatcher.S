@@ -96,7 +96,7 @@
 l2_dispatch:
     // AAPCS64 prologue + FSA-4 local frame.
     //
-    // 112-byte frame layout (16-aligned per AAPCS64 §6.2.2):
+    // 128-byte frame layout (16-aligned per AAPCS64 §6.2.2):
     //   [sp +   0..7] : x29 (fp)
     //   [sp +   8..15]: x30 (lr)
     //   [sp +  16..79]: x20-x27 callee-saved pairs
@@ -104,12 +104,17 @@ l2_dispatch:
     //   [sp +  88..91]: per-dispatch frame counter (u32; FSA-4)
     //   [sp +  92..95]: padding
     //   [sp +  96..99]: tx_next_avail stash (u32; FSA-4)
-    //   [sp + 100..111]: padding for 16-alignment
+    //   [sp + 100..103]: padding
+    //   [sp + 104..107]: arp_match flag (u32; FSA-4(A))
+    //   [sp + 108..111]: sender_ip stash (u32; FSA-4(A))
+    //   [sp + 112..117]: sender_mac stash (6 bytes; FSA-4(A))
+    //   [sp + 118..127]: padding for 16-alignment
     //
-    // The per-dispatch counter and the tx_next_avail stash both
-    // live on the stack rather than in registers because all the
-    // callee-saved registers (x19-x28) are already spoken for and
-    // we don't want to grow the prologue save list further.
+    // The per-dispatch counter, tx_next_avail stash, and ARP
+    // recognition stash all live on the stack rather than in
+    // registers because all the callee-saved registers (x19-x28)
+    // are already spoken for and we don't want to grow the
+    // prologue save list further.
     //
     // l2_state addressing note: this function re-derives
     // &l2_state via the `adrp + add + ldr` triple at four
@@ -120,7 +125,7 @@ l2_dispatch:
     // and 3 instructions × 4 sites = ~12 cycles of overhead per
     // dispatch is well under the cost of any single emit_bytes
     // call already on the path.
-    sub     sp, sp, #112
+    sub     sp, sp, #128
     stp     x29, x30, [sp]
     stp     x20, x21, [sp, #16]
     stp     x22, x23, [sp, #32]
@@ -145,6 +150,7 @@ l2_dispatch:
     ldrh    w28, [x10, #L2_STATE_RX_USED_SHADOW]
     str     wzr, [sp, #88]                   // per-dispatch counter = 0
     str     wzr, [sp, #96]                   // tx_next_avail stash = 0 (TX phase fills)
+    str     wzr, [sp, #104]                  // arp_match flag = 0 (set by ARP recognition)
 
     // --- VIO-R-003/004: poll RX Used Ring for first completion ---
     //
@@ -306,6 +312,58 @@ l2_dispatch:
     cmp     w23, #1
     b.ne    .Lrx_num_bufs_fail
 
+    // --- FSA-4(A): ARP request recognition ---
+    //
+    // x9 still holds the buffer base. We inspect three fields
+    // gated by short-circuit ne-checks:
+    //   EtherType @ +24 = 0x0806 BE (= 0x0608 LE16)
+    //   ARP OPER @ +32 = 0x0001 BE (= 0x0100 LE16) — request
+    //   TPA      @ +50 = 192.168.42.2 BE → bytes C0 A8 2A 02
+    //
+    // All buffer offsets are 2-aligned but not 4-aligned at
+    // +50/+52, so the TPA compare uses two ldrh halves rather
+    // than a single ldr (MMU is disabled per boot.S, which means
+    // strict Device-memory alignment applies to normal-memory
+    // loads too; ldrh requires only 2-byte alignment).
+    //
+    // On match: stash sender MAC (SHA @ +34) and sender IP
+    // (SPA @ +40) in the local frame, set arp_match = 1, emit
+    // an ARP:REQUEST marker. The post-RX-drain code reads the
+    // flag + stash to build the ARP reply frame in tx_arp_buf
+    // and submit it on TX (replacing the canary).
+    ldrh    w14, [x9, #24]                        // EtherType
+    cmp     w14, #0x0608
+    b.ne    .Lno_arp
+    ldrh    w14, [x9, #32]                        // ARP OPER
+    cmp     w14, #0x0100
+    b.ne    .Lno_arp
+    ldrh    w14, [x9, #50]                        // TPA bytes 0-1 (C0 A8 LE → 0xA8C0)
+    mov     w15, #0xA8C0
+    cmp     w14, w15
+    b.ne    .Lno_arp
+    ldrh    w14, [x9, #52]                        // TPA bytes 2-3 (2A 02 LE → 0x022A)
+    mov     w15, #0x022A
+    cmp     w14, w15
+    b.ne    .Lno_arp
+
+    // ARP match — stash SHA (6 bytes, 3× ldrh) and SPA (4 bytes).
+    ldrh    w14, [x9, #34]                        // SHA bytes 0-1
+    strh    w14, [sp, #112]
+    ldrh    w14, [x9, #36]                        // SHA bytes 2-3
+    strh    w14, [sp, #114]
+    ldrh    w14, [x9, #38]                        // SHA bytes 4-5
+    strh    w14, [sp, #116]
+    ldr     w14, [x9, #40]                        // SPA (offset 40 is 8-aligned)
+    str     w14, [sp, #108]
+    mov     w14, #1
+    str     w14, [sp, #104]                       // arp_match = 1
+
+    adr     x1, arp_request_msg
+    mov     w2, #(arp_request_msg_end - arp_request_msg)
+    bl      emit_bytes
+
+.Lno_arp:
+
     // Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
     adr     x1, rx_frame_prefix_msg
     mov     w2, #(rx_frame_prefix_msg_end - rx_frame_prefix_msg)
@@ -432,12 +490,88 @@ l2_dispatch:
     ldrh    w15, [x10, #L2_STATE_TX_NEXT_AVAIL]   // tx_next_avail (FSA-4: persistent)
     mov     w16, #0                               // desc_idx (FSA-5: from free-list)
 
+    // --- FSA-4(A): pick TX buffer based on arp_match ---
+    //
+    // If an ARP request matched during RX consume, build a reply
+    // frame in tx_arp_buf and submit that. Otherwise submit the
+    // rodata canary (tx_test_pkt). Both are 72 bytes so desc.len
+    // is the same either way.
+    ldr     w13, [sp, #104]                       // arp_match
+    cbz     w13, .Larp_use_canary
+
+    // Build ARP reply in tx_arp_buf:
+    //   1. Copy the 72-byte arp_reply_template (rodata) over.
+    //      4× ldp/stp (64 B) + 1× ldr/str (8 B) = 72 B exactly.
+    //      Template has GUEST_MAC as src + SHA and GUEST_IP as
+    //      SPA pre-baked; dst MAC, THA, TPA are placeholder 0s.
+    //   2. Patch dst MAC @ +12 from stashed sender MAC.
+    //   3. Patch THA @ +44 from stashed sender MAC.
+    //   4. Patch TPA @ +50 from stashed sender IP.
+    adrp    x10, __memreq_addr__tx_arp_buf
+    add     x10, x10, :lo12:__memreq_addr__tx_arp_buf
+    ldr     x10, [x10]                            // x10 = tx_arp_buf base
+    adrp    x11, arp_reply_template
+    add     x11, x11, :lo12:arp_reply_template
+
+    // Template copy: 9× 8-byte words via 4 ldp/stp + 1 ldr/str.
+    ldp     x12, x13, [x11, #0]
+    stp     x12, x13, [x10, #0]
+    ldp     x12, x13, [x11, #16]
+    stp     x12, x13, [x10, #16]
+    ldp     x12, x13, [x11, #32]
+    stp     x12, x13, [x10, #32]
+    ldp     x12, x13, [x11, #48]
+    stp     x12, x13, [x10, #48]
+    ldr     x12, [x11, #64]
+    str     x12, [x10, #64]
+
+    // Patch dst MAC at +12 from sender_mac stash.
+    ldrh    w12, [sp, #112]
+    strh    w12, [x10, #12]
+    ldrh    w12, [sp, #114]
+    strh    w12, [x10, #14]
+    ldrh    w12, [sp, #116]
+    strh    w12, [x10, #16]
+
+    // Patch THA at +44 from sender_mac stash.
+    ldrh    w12, [sp, #112]
+    strh    w12, [x10, #44]
+    ldrh    w12, [sp, #114]
+    strh    w12, [x10, #46]
+    ldrh    w12, [sp, #116]
+    strh    w12, [x10, #48]
+
+    // Patch TPA at +50 from sender_ip stash (two halves; +50 is
+    // 2-aligned only).
+    ldrh    w12, [sp, #108]
+    strh    w12, [x10, #50]
+    ldrh    w12, [sp, #110]
+    strh    w12, [x10, #52]
+
+    // x10 stays = tx_arp_buf base for the desc.addr write below.
+
+    adr     x1, arp_reply_msg
+    mov     w2, #(arp_reply_msg_end - arp_reply_msg)
+    bl      emit_bytes
+
+    // emit_bytes preserves x10 per the helper's preserve list
+    // (x0, x5, x6, x7, x8, x30 only — but the implementation
+    // doesn't touch x9-x18 either). To stay robust against a
+    // future emit_bytes that *does* clobber x10, re-derive
+    // tx_arp_buf base here.
+    adrp    x10, __memreq_addr__tx_arp_buf
+    add     x10, x10, :lo12:__memreq_addr__tx_arp_buf
+    ldr     x10, [x10]
+    b       .Larp_have_tx_addr
+.Larp_use_canary:
     adrp    x10, tx_test_pkt
-    add     x10, x10, :lo12:tx_test_pkt           // runtime addr
+    add     x10, x10, :lo12:tx_test_pkt           // runtime addr of canary
+
+.Larp_have_tx_addr:
     add     x11, x19, #TX_QUEUE_OFF               // x11 = TX desc[0] base
     add     x11, x11, x16, lsl #4                 // x11 = TX desc[desc_idx] base (16 B/desc)
     str     x10, [x11, #0]                        // desc.addr (u64)
-    mov     w12, #TX_TEST_PKT_LEN
+    mov     w12, #TX_TEST_PKT_LEN                 // = 72; identical for canary + ARP reply
     str     w12, [x11, #8]                        // desc.len
     strh    wzr, [x11, #12]                       // desc.flags = 0
     strh    wzr, [x11, #14]                       // desc.next  = 0
@@ -615,7 +749,7 @@ l2_dispatch:
     ldp     x22, x23, [sp, #32]
     ldp     x20, x21, [sp, #16]
     ldp     x29, x30, [sp]
-    add     sp, sp, #112                          // FSA-4: 112-byte frame
+    add     sp, sp, #128                          // FSA-4/FSA-4(A): 128-byte frame
     ret
 
 // --- Strings used by l2_dispatch (file-local .rodata) ---
@@ -663,3 +797,42 @@ tx_used_len_msg_end:
 tx_bad_id_msg:
     .ascii  "TX:FAIL bad_id="
 tx_bad_id_msg_end:
+
+// FSA-4(A) ARP responder markers.
+arp_request_msg:
+    .ascii  "ARP:REQUEST\n"
+arp_request_msg_end:
+arp_reply_msg:
+    .ascii  "ARP:REPLY\n"
+arp_reply_msg_end:
+
+// FSA-4(A) ARP reply template — 72 bytes, copied verbatim into
+// tx_arp_buf then patched with dst MAC / THA / TPA from the
+// stashed request info. Pre-baked fields: src MAC (GUEST_MAC),
+// EtherType (ARP), HTYPE / PTYPE / HLEN / PLEN, OPER (reply),
+// SHA (GUEST_MAC), SPA (GUEST_IP = 192.168.42.2).
+//
+// GUEST_MAC = 02:00:00:00:00:01 (locally-administered, matches
+// the tx_test_pkt canary's src MAC for ARP-table consistency).
+.align 4
+arp_reply_template:
+    // virtio_net_hdr (12 bytes zero)
+    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    // Ethernet header
+    .byte   0, 0, 0, 0, 0, 0                              // dst MAC (patched)
+    .byte   0x02, 0x00, 0x00, 0x00, 0x00, 0x01           // src MAC = GUEST_MAC
+    .byte   0x08, 0x06                                   // EtherType = ARP (BE)
+    // ARP payload (28 bytes)
+    .byte   0x00, 0x01                                   // HTYPE = Ethernet (BE)
+    .byte   0x08, 0x00                                   // PTYPE = IPv4 (BE)
+    .byte   0x06                                         // HLEN  = 6
+    .byte   0x04                                         // PLEN  = 4
+    .byte   0x00, 0x02                                   // OPER  = reply (BE)
+    .byte   0x02, 0x00, 0x00, 0x00, 0x00, 0x01           // SHA   = GUEST_MAC
+    .byte   0xC0, 0xA8, 0x2A, 0x02                       // SPA   = GUEST_IP (192.168.42.2)
+    .byte   0, 0, 0, 0, 0, 0                              // THA   (patched)
+    .byte   0, 0, 0, 0                                    // TPA   (patched)
+    // Ethernet padding to 60-byte minimum frame (12+14+28 = 54;
+    // need 12+60 = 72 total → 18 bytes of zero pad below).
+    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+arp_reply_template_end:
