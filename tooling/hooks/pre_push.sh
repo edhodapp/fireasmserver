@@ -149,6 +149,53 @@ run_pytest_suite() {
     "$REPO_ROOT/.venv/bin/pytest" -q --no-header
 }
 
+run_l2_integration_tests() {
+    echo
+    echo "=== pre-push: L2 integration tests (x86_64/firecracker) ==="
+    # Production-bar Tier B per docs/l2/HARNESS.md and the
+    # 2026-05-22 production-readiness shift: marker-chain
+    # assertions in run_local_cell are necessary but not
+    # sufficient for layer completion. This gate boots a fresh
+    # Firecracker per test and verifies real protocol behavior
+    # against the wire (scapy frame send + sniff on tap0).
+    #
+    # Currently covers ARP-001, ARP-004, ARP-011. Expands as
+    # each row of docs/l2/TEST_PLAN.md §1-§4 lands.
+    #
+    # Skip rules:
+    #   - missing pytest          → SKIP (matches other gates)
+    #   - missing CAP_NET_RAW     → WARNING + SKIP (visible
+    #                               environment regression)
+    #   - missing firecracker     → conftest SKIPs (the
+    #                               tracer-bullet would already
+    #                               have failed earlier anyway)
+    # Test failures → FAIL the push.
+    if [[ ! -x "$REPO_ROOT/.venv/bin/pytest" ]]; then
+        echo "SKIP: no .venv/bin/pytest (run: pip install -e .[dev])"
+        return 0
+    fi
+    # Probe CAP_NET_RAW via the harness's own check. We surface
+    # the missing-cap case as a visible WARNING (not a silent
+    # SKIP) because losing the cap is a developer-env regression
+    # — e.g., a venv rebuild — that production-bar policy says
+    # should NOT degrade the gate silently.
+    if ! "$REPO_ROOT/.venv/bin/python" -c \
+        "from l2_harness.firecracker import has_root_or_capability; \
+import sys; \
+sys.exit(0 if has_root_or_capability() else 1)" \
+        2>/dev/null; then
+        echo "WARNING: L2 integration tests SKIPPED — venv Python"
+        echo "         lacks CAP_NET_RAW. Restore with:"
+        echo "         sudo setcap cap_net_raw+eip \\"
+        echo "             \$(readlink -f .venv/bin/python3)"
+        echo "         (See docs/l2/HARNESS.md §3.3.)"
+        return 0
+    fi
+    "$REPO_ROOT/.venv/bin/pytest" \
+        tooling/tests/integration/ \
+        -q --no-header -p no:randomly
+}
+
 run_ontology_audit() {
     echo
     echo "=== pre-push: ontology audit (D051) ==="
@@ -174,6 +221,10 @@ run_local_cell x86_64  firecracker   || fail=1
 # tests that exercise every branch.
 run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
+# L2 integration tests come right after the boot-smoke cells:
+# tracer-bullet proved the guest boots; this gate proves the L2
+# protocol behavior on top of that boot.
+run_l2_integration_tests             || fail=1
 run_c_gates                          || fail=1
 run_memlayout_diff                   || fail=1
 run_crypto_tests                     || fail=1
