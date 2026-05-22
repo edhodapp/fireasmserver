@@ -159,7 +159,17 @@ l2_dispatch:
 .Lrx_wait_loop:
     yield                                // KVM liveness; see comment above
     ldarh   w10, [x11]                   // load-acquire UsedRing.idx
-    cmp     w10, w28
+    // Post-Gemini-review (HIGH): w10 is u16 (zero-extended from
+    // the 16-bit ldarh); w28 is a 32-bit counter that increments
+    // uncapped. After 65,536 frames consumed across the lifetime
+    // of the dispatcher's persistent shadow (FSA-4+), w28 would
+    // exceed 65,535 while w10 wraps modulo 65,536 — a naive
+    // `cmp w10, w28` would mis-detect "queue drained" as "new
+    // frame available" forever. Fix: extended-register cmp with
+    // UXTH masks w28 to its low 16 bits before compare, matching
+    // the Virtio u16 wrap semantics. Latent today (single-shot
+    // resets w28 to 0 every call; max 16 frames per dispatch).
+    cmp     w10, w28, uxth
     b.ne    .Lrx_received
     subs    w9, w9, #1
     b.ne    .Lrx_wait_loop
@@ -226,10 +236,21 @@ l2_dispatch:
     cmp     w20, #VIRTQ_MAX_SIZE
     b.hs    .Lrx_bad_id_fail
 
-    // Buffer addr: __memreq_addr__rx_buffer + id * 2048.
+    // Buffer addr: load the rx_buffer pool base, then add id*2048.
+    //
+    // memreq indirection (codegen convention, easy to misread):
+    // `__memreq_addr__rx_buffer` is an .equ ALIAS for the label
+    // `__memreq_assigned__rx_buffer`, which marks an 8-byte
+    // storage slot in .memreq holding the assigned runtime
+    // address of the rx_buffer pool. So:
+    //   adrp/add  → x9 = address of the storage slot
+    //   ldr x9    → x9 = value at slot = the actual pool base
+    // The ldr is REQUIRED — not a double-dereference bug. See
+    // tooling/src/memreq_codegen/ for the codegen emitting the
+    // `__memreq_addr__X equ __memreq_assigned__X` aliases.
     adrp    x9, __memreq_addr__rx_buffer
     add     x9, x9, :lo12:__memreq_addr__rx_buffer
-    ldr     x9, [x9]                              // pool base
+    ldr     x9, [x9]                              // pool base (see comment above)
     lsl     x10, x20, #11                         // id * 2048
     add     x9, x9, x10                           // buffer addr
 
@@ -300,7 +321,7 @@ l2_dispatch:
     // savings.
     add     x11, x26, #2                 // x11 = &RX UsedRing.idx
     ldarh   w10, [x11]
-    cmp     w10, w28
+    cmp     w10, w28, uxth               // u16 wrap-safe compare (see wait loop)
     b.ne    .Lrx_consume_body
     // else: idx == shadow → queue drained, fall through
 
@@ -412,7 +433,7 @@ l2_dispatch:
 .Ltx_wait_loop:
     yield                                // KVM liveness
     ldarh   w10, [x11]                   // load-acquire TX UsedRing.idx
-    cmp     w10, w28
+    cmp     w10, w28, uxth               // u16 wrap-safe compare (see RX wait loop)
     b.ne    .Ltx_reclaimed
     subs    w9, w9, #1
     b.ne    .Ltx_wait_loop

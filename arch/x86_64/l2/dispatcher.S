@@ -226,7 +226,16 @@ l2_dispatch:
     cmp edi, VIRTQ_MAX_SIZE
     jae .l2_rx_bad_id_fail
 
-    ; Buffer addr: __memreq_addr__rx_buffer + id*2048.
+    ; Buffer addr: load rx_buffer pool base, then add id*2048.
+    ;
+    ; memreq indirection (codegen convention): __memreq_addr__X
+    ; is a NASM `equ` alias for the label __memreq_assigned__X,
+    ; which marks an 8-byte storage slot holding the assigned
+    ; runtime address. `mov rax, [rel __memreq_addr__rx_buffer]`
+    ; reads from that slot to get the actual pool base. The
+    ; bracketed deref is REQUIRED — without it we'd get the
+    ; address of the slot, not the pool. See codegen at
+    ; tooling/src/memreq_codegen/.
     mov rax, [rel __memreq_addr__rx_buffer]
     mov ecx, edi
     shl ecx, 11
