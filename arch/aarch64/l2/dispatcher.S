@@ -101,14 +101,25 @@ l2_dispatch:
     //   [sp +   8..15]: x30 (lr)
     //   [sp +  16..79]: x20-x27 callee-saved pairs
     //   [sp +  80..87]: x28
-    //   [sp +  88..95]: per-dispatch frame counter (FSA-4)
-    //   [sp +  96..103]: tx_next_avail stash (FSA-4)
-    //   [sp + 104..111]: padding for 16-alignment
+    //   [sp +  88..91]: per-dispatch frame counter (u32; FSA-4)
+    //   [sp +  92..95]: padding
+    //   [sp +  96..99]: tx_next_avail stash (u32; FSA-4)
+    //   [sp + 100..111]: padding for 16-alignment
     //
     // The per-dispatch counter and the tx_next_avail stash both
     // live on the stack rather than in registers because all the
     // callee-saved registers (x19-x28) are already spoken for and
     // we don't want to grow the prologue save list further.
+    //
+    // l2_state addressing note: this function re-derives
+    // &l2_state via the `adrp + add + ldr` triple at four
+    // sites (RX shadow load, RX shadow store, TX shadow load,
+    // TX shadow store) rather than pinning the pointer in a
+    // callee-saved register. Same register-pressure tradeoff:
+    // pinning would require extending the prologue save list,
+    // and 3 instructions × 4 sites = ~12 cycles of overhead per
+    // dispatch is well under the cost of any single emit_bytes
+    // call already on the path.
     sub     sp, sp, #112
     stp     x29, x30, [sp]
     stp     x20, x21, [sp, #16]
@@ -545,6 +556,16 @@ l2_dispatch:
 
 .Lrx_bad_id_fail:
     // RX UsedRing.ring[slot].id is out of range. w20 = observed id.
+    //
+    // FSA-4 writeback intentionally skipped on validation-fail
+    // paths: l2_dispatch returns w0 = 1 → caller sets
+    // VIRTIO_STATUS_FAILED and halts the system. There is no
+    // subsequent dispatch to consume the persisted shadow state,
+    // so leaving l2_state at its on-entry values is correct
+    // (any partial advance through .Lrx_consume_body is lost,
+    // matching the device's own torn view of the failed frame).
+    // Same logic applies to .Lrx_num_bufs_fail and
+    // .Ltx_bad_id_fail below.
     adr     x1, rx_bad_id_msg
     mov     w2, #(rx_bad_id_msg_end - rx_bad_id_msg)
     bl      emit_bytes

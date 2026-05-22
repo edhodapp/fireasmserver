@@ -47,17 +47,16 @@
 ;     function; the prologue/epilogue save+restore them.
 ;   - r12, r13, r15 are also callee-saved AND read-only inside
 ;     this function; preserved trivially.
-;   - r14 is SysV callee-saved AND modified inside this function
-;     (the RX-consume path advances next_avail by 0..RX_FRAME_BUDGET).
-;     Post-Gemini-review (HIGH finding): the prologue now
-;     `push r14` and the epilogue `pop r14`, so caller's r14 value
-;     is preserved as the SysV ABI requires. The dispatcher uses
-;     r14 internally as a working register, advances it through
-;     the consume loop, and restores the caller's value before
-;     return. The internal advance is therefore LOST — if a
-;     future reentrant caller needs the new next_avail to persist
-;     across invocations, the value must move to persistent
-;     storage (memreq region) or be returned via a new contract.
+;   - r14 is SysV callee-saved AND used inside this function as
+;     a working register for the RX next_avail counter. The
+;     prologue `push r14` / epilogue `pop r14` preserves the
+;     caller's value as the SysV ABI requires.
+;     FSA-4: the actual next_avail value persists across calls
+;     via `l2_state` (a memreq region), not via r14 — the
+;     dispatcher loads l2_state.rx_next_avail into r14 at entry
+;     and writes the advanced value back at exit. r14's role
+;     here is "scratch working register for the RX recycle loop,"
+;     not "input/output parameter."
 ;   - On return: eax = 0 → caller jmps to .halt (clean halt
 ;                — both success and timeout paths land here;
 ;                pre-FSA-1 behavior, no return-code differentiation
@@ -472,6 +471,15 @@ l2_dispatch:
     ; additional completions up to TX_RECLAIM_BUDGET (analogous
     ; to .l2_rx_consume_body for the RX side). x86 TSO provides
     ; acquire-on-load for the slot reads.
+    ;
+    ; Note vs .l2_rx_consume_body: that block has `lfence` pairs
+    ; around its slot reads (a defensive residual from FSA-1
+    ; before the TSO analysis at the top of this file matured);
+    ; the new TX reclaim block omits them because they are
+    ; redundant under TSO. Either remove the RX lfences in a
+    ; future cleanup pass, or leave both styles as they are —
+    ; documented here so a maintainer reading the two side by
+    ; side doesn't have to wonder which is correct.
     mov eax, ebp                                     ; eax = shadow
     lea ecx, [r13d - 1]                              ; ecx = mask = N - 1
     and eax, ecx                                     ; eax = slot
@@ -534,6 +542,13 @@ l2_dispatch:
     jmp .l2_ok
 
 .l2_rx_bad_id_fail:
+    ; FSA-4 writeback intentionally skipped on validation-fail
+    ; paths: l2_dispatch returns eax = 1 → caller sets
+    ; VIRTIO_STATUS_FAILED and halts. No subsequent dispatch
+    ; will consume the persisted shadows, so leaving l2_state
+    ; at its on-entry values is correct. Same applies to
+    ; .l2_rx_num_bufs_fail and .l2_tx_bad_id_fail below.
+    ;
     ; Strict SysV: 1-arg fail path. A single push would leave
     ; rsp ≡ 8 (mod 16) for the subsequent CALL — instead, reserve
     ; a 16-byte aligned scratch frame and stash the saved value

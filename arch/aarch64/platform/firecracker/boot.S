@@ -771,10 +771,22 @@ _entry:
     //
     // Match the AvailRing.idx just published (= VIRTQ_MAX_SIZE,
     // since we filled all 256 descriptors and advertised them).
+    // aarch64 hardcodes VIRTQ_MAX_SIZE for both the AvailRing.idx
+    // publish above AND for this shadow init, so the two values
+    // agree by construction — x86_64 uses r13w (runtime-clamped
+    // queue size) in both places for the same reason.
+    //
     // The other three shadows (rx_used_shadow, tx_next_avail,
-    // tx_used_shadow) are zero-init via the allocator pass and
-    // advance from there. See arch/aarch64/.../regions.yaml's
-    // l2_state entry for the layout.
+    // tx_used_shadow) read as zero on first call because
+    // Firecracker pre-zeros guest RAM on VM creation. The
+    // allocator pass writes assigned_addr / assigned_size into
+    // each memreq record but does NOT zero the backing storage,
+    // so the pre-zeroed RAM is the load-bearing precondition.
+    // Same assumption the virtqueue uninhabited-at-boot reasoning
+    // relies on (per the comment block in regions.yaml).
+    //
+    // See arch/aarch64/.../regions.yaml's l2_state entry for the
+    // layout.
     mov     w9, #VIRTQ_MAX_SIZE
     adrp    x10, __memreq_addr__l2_state
     add     x10, x10, :lo12:__memreq_addr__l2_state

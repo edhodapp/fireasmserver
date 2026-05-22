@@ -681,11 +681,23 @@ kernel_main_64:
 
     ; --- FSA-4: initialise l2_state.rx_next_avail ---
     ;
-    ; Match the AvailRing.idx just published (= VIRTQ_MAX_SIZE).
-    ; The other three shadows zero-init via the allocator pass.
+    ; Match the AvailRing.idx just published, which used r13w
+    ; (the runtime-clamped queue size, MIN(QueueNumMax, VIRTQ_MAX_SIZE)).
+    ; Hardcoding VIRTQ_MAX_SIZE here would diverge if a future
+    ; VMM ever reports QueueNumMax < VIRTQ_MAX_SIZE — clean-Claude
+    ; flagged this in the pre-push review.
+    ;
+    ; The other three shadows (rx_used_shadow, tx_next_avail,
+    ; tx_used_shadow) are not initialised here: they read as zero
+    ; on first call because Firecracker pre-zeros guest RAM on VM
+    ; creation. (The allocator pass writes assigned_addr /
+    ; assigned_size into each memreq record but does NOT zero the
+    ; backing storage.) Same precondition the existing virtqueue
+    ; uninhabited-at-boot reasoning relies on.
+    ;
     ; Layout in arch/x86_64/.../regions.yaml's l2_state entry.
     mov rax, [rel __memreq_addr__l2_state]
-    mov word [rax + 0], VIRTQ_MAX_SIZE                ; rx_next_avail = N
+    mov word [rax + 0], r13w                          ; rx_next_avail = N (clamped)
     mfence
 
     ; --- FSA-1: hand off to L2 dispatcher ---

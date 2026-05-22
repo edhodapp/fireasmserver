@@ -95,7 +95,7 @@ regions:
     owner: 0
     writable: true
     size: 16          # 4 × u16 shadows + 8 B padding for FSA-5+ growth
-    align: 8          # natural u64 alignment for the storage word
+    align: 8          # natural u64 boundary; all current accesses are u16 (mov word) but the alignment leaves room to widen to batched u32/u64 loads later without realignment
     doc: >
       Persistent shadow storage for l2_dispatch (FSA-4). Four u16
       counters at fixed offsets:
