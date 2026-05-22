@@ -308,12 +308,28 @@ l2_dispatch:
     jne .l2_no_arp
 
     ; ARP match. Stash sender MAC + IP.
-    mov edx, [rax + 34]                              ; SHA bytes 0-3
-    mov [rsp + 24], edx
-    movzx edx, word [rax + 38]                       ; SHA bytes 4-5
-    mov [rsp + 28], dx
-    mov edx, [rax + 40]                              ; SPA
-    mov [rsp + 20], edx
+    ;
+    ; CRITICAL — diagnosed via the L2 integration harness on
+    ; 2026-05-22 — we MUST NOT clobber dx here. dx carries
+    ; COM1_PORT (0x3F8) across the dispatcher per the emit_bytes
+    ; helper's contract (see boot.S, emit_bytes header). The
+    ; prior version used edx and corrupted dx → every subsequent
+    ; emit_bytes wedged in its LSR-poll loop reading a bogus
+    ; port, producing the bus_error spam Firecracker logs.
+    ;
+    ; r10d is caller-saved per SysV and not live at this point
+    ; (we last used r10 for the slot entry base above, computed
+    ; from rbp+r13, no further use). emit_bytes clobbers it
+    ; freely, but we only use it BEFORE the marker emit, so the
+    ; clobber doesn't matter to us. Same fix applies to any
+    ; future dispatcher addition that needs a scratch register
+    ; across an emit_bytes call: use r10/r11/eax — anything but dx.
+    mov r10d, [rax + 34]                             ; SHA bytes 0-3
+    mov [rsp + 24], r10d
+    movzx r10d, word [rax + 38]                      ; SHA bytes 4-5
+    mov [rsp + 28], r10w
+    mov r10d, [rax + 40]                             ; SPA
+    mov [rsp + 20], r10d
     mov dword [rsp + 16], 1                          ; arp_match = 1
 
     lea rsi, [rel arp_request_msg]

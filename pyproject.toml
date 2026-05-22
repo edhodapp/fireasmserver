@@ -24,6 +24,11 @@ dev = [
     "pytest-randomly",
     "hypothesis>=6.0",
     "types-PyYAML>=6.0",
+    # L2 integration harness (tooling/src/l2_harness/) — scapy
+    # provides raw-socket frame send + capture on tap0. Per
+    # docs/l2/HARNESS.md §3.4; production-bar verification of L2
+    # adopted 2026-05-22.
+    "scapy>=2.5",
 ]
 
 [project.scripts]
