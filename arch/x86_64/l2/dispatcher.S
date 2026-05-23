@@ -367,6 +367,23 @@ l2_dispatch:
     test byte [rax + 18], 1                          ; src MAC byte 0, bit 0
     jnz .l2_rx_drop_src
 
+    ; --- ETH-018: PAUSE frame drop ---
+    ;
+    ; Per IEEE 802.3x-1997 §31B.1, receivers that do not
+    ; implement link-level flow control MUST silently discard
+    ; MAC Control frames. PAUSE is the canonical MAC Control
+    ; frame: EtherType 0x8808 (= 0x0888 LE16) at buffer + 24.
+    ; We don't inspect the opcode (PAUSE = 0x0001, MPCP = 0x0002,
+    ; etc.) — any 0x8808 frame is discarded as a class.
+    ;
+    ; Acting on received PAUSE (throttling our TX) is the
+    ; inverse direction and stays deferred per D045's "PAUSE
+    ; rate response stays deferred" list. This gate just makes
+    ; sure such frames don't surface as RX:FRAME and confuse
+    ; whatever the dispatcher hands them to.
+    cmp word [rax + 24], 0x0888                      ; EtherType (PAUSE = 0x8808 BE)
+    je .l2_rx_drop_pause
+
     ; virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
     lfence
     movzx esi, word [rax + 2]                        ; hdr_len
@@ -830,6 +847,25 @@ l2_dispatch:
     call emit_bytes
 
     mov edi, [rsp + 12]                              ; restore id
+    jmp .l2_rx_drop_recycle
+
+.l2_rx_drop_pause:
+    ; --- ETH-018: drop a PAUSE / MAC Control RX frame ---
+    ;
+    ; Branched here when EtherType = 0x8808 (MAC Control). The
+    ; frame passed every other gate (size, dst MAC, src MAC) —
+    ; we just don't act on flow-control frames at all, per
+    ; D045's deferred-feature list and ETH-018's "silently
+    ; discard" mandate. Counter (rx_pause_dropped) deferred
+    ; until stats infrastructure exists; the serial marker is
+    ; the testable artifact today.
+    mov [rsp + 12], edi                              ; save id
+
+    lea rsi, [rel rx_drop_pause_msg]
+    mov ecx, rx_drop_pause_len
+    call emit_bytes
+
+    mov edi, [rsp + 12]                              ; restore id
     ; fall through to recycle
 
 .l2_rx_drop_recycle:
@@ -947,6 +983,8 @@ rx_drop_mac_msg:         db 'RX:DROP mac', 10
 rx_drop_mac_len          equ $ - rx_drop_mac_msg
 rx_drop_src_msg:         db 'RX:DROP src', 10
 rx_drop_src_len          equ $ - rx_drop_src_msg
+rx_drop_pause_msg:       db 'RX:DROP pause', 10
+rx_drop_pause_len        equ $ - rx_drop_pause_msg
 
 rx_returned_msg:         db 'RX:RETURNED', 10
 rx_returned_len          equ $ - rx_returned_msg

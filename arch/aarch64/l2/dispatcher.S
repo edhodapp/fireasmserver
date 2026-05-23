@@ -375,6 +375,23 @@ l2_dispatch:
     ldrb    w14, [x9, #18]                        // src MAC byte 0
     tbnz    w14, #0, .Lrx_drop_src
 
+    // --- ETH-018: PAUSE frame drop ---
+    //
+    // Per IEEE 802.3x-1997 §31B.1, receivers that do not
+    // implement link-level flow control MUST silently discard
+    // MAC Control frames (EtherType 0x8808 = 0x0888 LE16).
+    // We don't inspect the MAC Control opcode — any 0x8808
+    // frame is discarded as a class. Acting on received
+    // PAUSE (throttling our TX) stays deferred per D045.
+    //
+    // w14 reused as scratch (freshly loaded here; no liveness
+    // with prior values). 0x0888 doesn't fit a 12-bit cmp imm,
+    // so movz a comparison register from the wide constant.
+    ldrh    w14, [x9, #24]                        // EtherType
+    mov     w15, #0x0888                          // PAUSE BE = 0x0888 LE16
+    cmp     w14, w15
+    b.eq    .Lrx_drop_pause
+
     // Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
     ldrh    w22, [x9, #2]                         // hdr_len
     ldrh    w23, [x9, #10]                        // num_buffers
@@ -823,6 +840,21 @@ l2_dispatch:
     mov     w2, #(rx_drop_src_msg_end - rx_drop_src_msg)
     bl      emit_bytes
     ldp     x20, x21, [sp], #16                  // restore id+used_len
+    b       .Lrx_drop_recycle
+
+.Lrx_drop_pause:
+    // --- ETH-018: drop a PAUSE / MAC Control RX frame ---
+    //
+    // Branched here when EtherType = 0x8808 (MAC Control). The
+    // frame passed every other gate (size, dst MAC, src MAC) —
+    // we just don't act on flow-control frames per ETH-018's
+    // silent-discard mandate. Counter (rx_pause_dropped) deferred
+    // until stats infrastructure exists.
+    stp     x20, x21, [sp, #-16]!                // save id+used_len
+    adr     x1, rx_drop_pause_msg
+    mov     w2, #(rx_drop_pause_msg_end - rx_drop_pause_msg)
+    bl      emit_bytes
+    ldp     x20, x21, [sp], #16                  // restore id+used_len
     // fall through to recycle
 
 .Lrx_drop_recycle:
@@ -947,6 +979,10 @@ rx_drop_mac_msg_end:
 rx_drop_src_msg:
     .ascii  "RX:DROP src\n"
 rx_drop_src_msg_end:
+
+rx_drop_pause_msg:
+    .ascii  "RX:DROP pause\n"
+rx_drop_pause_msg_end:
 
 rx_returned_msg:
     .ascii  "RX:RETURNED\n"
