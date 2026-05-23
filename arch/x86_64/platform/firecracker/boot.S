@@ -108,8 +108,68 @@ VIRTIO_STATUS_FEATURES_OK equ 8
 VIRTIO_STATUS_FAILED      equ 0x80
 
 ; Feature bit (Virtio 1.2 §6 — VIRTIO_F_VERSION_1 is bit 32 globally,
-; bit 0 of the high page). MVP accepts VERSION_1 only.
+; bit 0 of the high page).
 VIRTIO_F_VERSION_1_HIBIT  equ 1
+
+; ================================================================
+; Virtio feature negotiation policy
+; ================================================================
+; The driver negotiates a SUBSET of the features the device
+; offers. Three classes per Virtio 1.2 §2.2:
+;
+;   REQUIRED — must be offered by the device AND set in our
+;              driver_features. If the device doesn't offer one
+;              of these, we fail fast at .features_fail_no_v1.
+;
+;   ACCEPTED — set in driver_features iff offered by the device.
+;              An offered ACCEPTED bit becomes a driver-side
+;              capability; an unoffered one is silently absent.
+;
+;   REJECTED — implicit: any bit not in REQUIRED or ACCEPTED.
+;              These bits stay zero in driver_features regardless
+;              of whether the device offered them.
+;
+; Negotiation formula:
+;     driver_features = (offered & ACCEPTED) | REQUIRED
+;
+; Today's policy (minimum viable for an actual L2-only guest):
+;
+;   REQUIRED_LO = 0 — no net-specific feature in the low page is
+;     architecturally load-bearing today.
+;   REQUIRED_HI = VIRTIO_F_VERSION_1_HIBIT — the entire MMIO 1.2
+;     protocol assumes modern mode. Legacy mode would need a
+;     completely different driver shape.
+;
+;   ACCEPTED_LO = 0 — every §5.1.3 bit is rejected because we
+;     have no infrastructure for the feature it advertises:
+;       F_CSUM / F_GUEST_CSUM (0,1):    no checksum offload yet
+;       F_CTRL_GUEST_OFFLOADS (2):      no control vq
+;       F_MTU (3):                      MTU is implicit
+;       F_MAC (5):                      we hardcode GUEST_MAC
+;       F_GSO / GUEST_TSO* / UFO (6-10):need RX reassembly
+;       F_HOST_TSO* / HOST_UFO (11-14): no segmented TX
+;       F_MRG_RXBUF (15):               we assume num_buffers=1
+;       F_STATUS (16):                  link state not consumed yet
+;       F_CTRL_VQ + variants (17-23):   no control vq
+;       F_MQ (22):                      single queue pair
+;       F_CTRL_MAC_ADDR (23):           MAC is hardcoded
+;   ACCEPTED_HI = VIRTIO_F_VERSION_1_HIBIT — these high-page
+;     extensions are explicitly REJECTED today:
+;       VIRTIO_F_ACCESS_PLATFORM (33):  no IOMMU
+;       VIRTIO_F_RING_PACKED (34):      we implement split rings
+;       VIRTIO_F_IN_ORDER (35):         no in-order optimization
+;       VIRTIO_F_ORDER_PLATFORM (36):   TSO + LDARH cover ordering
+;       VIRTIO_F_SR_IOV (37):           no PCI / SR-IOV
+;       VIRTIO_F_NOTIFICATION_DATA (38):not consumed
+;
+; Future expansion: adding a feature to ACCEPTED requires adding
+; the consuming code that USES that feature. Don't expand the
+; mask speculatively — every accepted bit is a wire-protocol
+; contract we have to honor.
+VIRTIO_REQUIRED_FEATURES_LO   equ 0
+VIRTIO_REQUIRED_FEATURES_HI   equ VIRTIO_F_VERSION_1_HIBIT
+VIRTIO_ACCEPTED_FEATURES_LO   equ 0
+VIRTIO_ACCEPTED_FEATURES_HI   equ VIRTIO_F_VERSION_1_HIBIT
 
 ; ----- External symbols (resolved by linker) -----
 
@@ -486,9 +546,18 @@ kernel_main_64:
     call emit_bytes
 
     ; --- Feature negotiation (VIO-004..006) ---
+    ;
+    ; Policy-driven per VIRTIO_REQUIRED_FEATURES_* /
+    ; VIRTIO_ACCEPTED_FEATURES_* defined near the top of this
+    ; file. The formula:
+    ;     driver_features = (offered & ACCEPTED) | REQUIRED
+    ; expresses both halves at once — required bits are pinned
+    ; on, accepted bits pass through iff the device offered
+    ; them, rejected bits stay off no matter what.
 
-    ; VIO-004 part 1a: read low-page offered features (saved in ebx
-    ; for diagnostic dump on no-v1 fail; preserved across emit_bytes).
+    ; VIO-004 part 1a: read low-page offered features (saved in
+    ; ebx for the AND with ACCEPTED_LO below AND for the
+    ; diagnostic dump on no-required fail).
     mfence
     mov dword [r12 + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 0
     mfence
@@ -497,25 +566,45 @@ kernel_main_64:
     lfence
     mov ebx, eax
 
-    ; VIO-004 part 1b: check VERSION_1 in high page.
+    ; VIO-004 part 1b: read high-page offered features.
     mfence
     mov dword [r12 + VIRTIO_MMIO_DEVICE_FEATURES_SEL], 1
     mfence
     lfence
     mov eax, [r12 + VIRTIO_MMIO_DEVICE_FEATURES]
     lfence
-    test eax, VIRTIO_F_VERSION_1_HIBIT
-    jz .features_fail_no_v1
 
-    ; VIO-004 part 2: write driver features. Low page = 0; high = VERSION_1.
+    ; Verify every REQUIRED_HI bit is offered by the device.
+    ; The `and` masks off non-required bits, then the equality
+    ; compare confirms every required bit survived. With
+    ; REQUIRED_HI == VIRTIO_F_VERSION_1_HIBIT today this is
+    ; equivalent to the prior `test eax, VIRTIO_F_VERSION_1_HIBIT
+    ; / jz` form; it generalises when REQUIRED gains bits.
+    ; (Low-page required check is omitted today because
+    ; REQUIRED_LO = 0 — every bit is satisfied vacuously. Add
+    ; the symmetric ebx-based check when REQUIRED_LO is non-
+    ; zero.)
+    mov ecx, eax
+    and ecx, VIRTIO_REQUIRED_FEATURES_HI
+    cmp ecx, VIRTIO_REQUIRED_FEATURES_HI
+    jne .features_fail_no_v1
+
+    ; VIO-004 part 2: compute and write driver features.
+    ;     driver = (offered & ACCEPTED) | REQUIRED
+    ; ebx still holds offered_lo; eax holds offered_hi.
+    and ebx, VIRTIO_ACCEPTED_FEATURES_LO
+    or  ebx, VIRTIO_REQUIRED_FEATURES_LO
+    and eax, VIRTIO_ACCEPTED_FEATURES_HI
+    or  eax, VIRTIO_REQUIRED_FEATURES_HI
+
     mfence
     mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 0
     mfence
-    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES], 0
+    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES], ebx
     mfence
     mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES_SEL], 1
     mfence
-    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES], VIRTIO_F_VERSION_1_HIBIT
+    mov dword [r12 + VIRTIO_MMIO_DRIVER_FEATURES], eax
     mfence
 
     ; VIO-005: RMW FEATURES_OK.

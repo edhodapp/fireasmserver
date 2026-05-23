@@ -137,9 +137,41 @@
 // are 64-wide; MMIO exposes them via two 32-bit pages selected by
 // DeviceFeaturesSel / DriverFeaturesSel (0=bits 0-31, 1=bits 32-63).
 // VIRTIO_F_VERSION_1 is bit 32 globally → bit 0 of the high page.
-// MVP policy: accept VERSION_1 only. MAC, STATUS, MQ, CSUM, GSO,
-// EVENT_IDX stay off until the code paths that consume them land.
 .equ VIRTIO_F_VERSION_1_HIBIT,    1    // bit 32 == 1 in the high page
+
+// ================================================================
+// Virtio feature negotiation policy
+// ================================================================
+// Mirrors arch/x86_64/platform/firecracker/boot.S — see that file
+// for the full per-bit rationale. Three classes:
+//
+//   REQUIRED — must be offered by the device AND set in our
+//              driver_features. Missing → fail at
+//              .Lfeatures_fail_no_v1.
+//   ACCEPTED — set in driver_features iff offered by device.
+//   REJECTED — implicit (any bit not in REQUIRED or ACCEPTED).
+//
+// Negotiation formula:
+//     driver_features = (offered & ACCEPTED) | REQUIRED
+//
+// Today's minimum-viable policy:
+//   REQUIRED_LO = 0
+//   REQUIRED_HI = VIRTIO_F_VERSION_1_HIBIT  (bit 32: modern virtio)
+//   ACCEPTED_LO = 0   (every §5.1.3 net feature rejected — see
+//                      x86_64 boot.S for the bit-by-bit rationale)
+//   ACCEPTED_HI = VIRTIO_F_VERSION_1_HIBIT
+//     (other high-page transport extensions — ACCESS_PLATFORM,
+//      RING_PACKED, IN_ORDER, ORDER_PLATFORM, SR_IOV,
+//      NOTIFICATION_DATA — all explicitly rejected today)
+//
+// Future expansion: adding a feature to ACCEPTED requires adding
+// the consuming code that USES that feature. Don't expand the
+// mask speculatively — every accepted bit is a wire-protocol
+// contract we have to honor.
+.equ VIRTIO_REQUIRED_FEATURES_LO,  0
+.equ VIRTIO_REQUIRED_FEATURES_HI,  VIRTIO_F_VERSION_1_HIBIT
+.equ VIRTIO_ACCEPTED_FEATURES_LO,  0
+.equ VIRTIO_ACCEPTED_FEATURES_HI,  VIRTIO_F_VERSION_1_HIBIT
 
 // Per-queue programming macro used by VIO-007 Slice 2. Selects
 // the queue, reads QueueNumMax and clamps, programs physical
@@ -532,29 +564,54 @@ _entry:
     ldr     w9, [x6, #VIRTIO_MMIO_DEVICE_FEATURES]        // dev_lo → w9
     dsb     sy
 
-    // VIO-004 part 1b: read dev_hi, check VERSION_1 offered.
+    // VIO-004 part 1b: read dev_hi (high-page offered features).
     mov     w7, #1
     dsb     sy
     str     w7, [x6, #VIRTIO_MMIO_DEVICE_FEATURES_SEL]    // SEL = 1
     dsb     sy
     ldr     w7, [x6, #VIRTIO_MMIO_DEVICE_FEATURES]        // dev_hi → w7
     dsb     sy
-    tst     w7, #VIRTIO_F_VERSION_1_HIBIT
-    b.eq    .Lfeatures_fail_no_v1
 
-    // VIO-004 part 2: write driver features.
-    //   low-page = 0 (we accept nothing bits 0-31).
-    //   high-page = VIRTIO_F_VERSION_1_HIBIT only.
+    // Verify every REQUIRED_HI bit is offered by the device.
+    // The `and w10, w7, #MASK` masks off non-required bits, then
+    // `cmp w10, #MASK` confirms every required bit survived.
+    // With REQUIRED_HI = VIRTIO_F_VERSION_1_HIBIT today this is
+    // equivalent to the prior `tst w7, #...` / `b.eq` form;
+    // generalises when REQUIRED gains bits.
+    // (Low-page required check omitted today because REQUIRED_LO
+    // = 0 — every bit is satisfied vacuously. Add the symmetric
+    // w9-based check when REQUIRED_LO is non-zero.)
+    and     w10, w7, #VIRTIO_REQUIRED_FEATURES_HI
+    cmp     w10, #VIRTIO_REQUIRED_FEATURES_HI
+    b.ne    .Lfeatures_fail_no_v1
+
+    // VIO-004 part 2: compute and write driver features.
+    //     driver = (offered & ACCEPTED) | REQUIRED
+    // w9 = offered_lo, w7 = offered_hi.
+    //
+    // Use register-form `and`/`orr` rather than immediate form
+    // for both pages: ARMv8 logical-immediate encoding can't
+    // represent #0 (no valid bitmask), so the LO path needs
+    // a register-loaded zero. Same form on HI keeps the
+    // sequence symmetric and grep-friendly.
+    mov     w10, #VIRTIO_ACCEPTED_FEATURES_LO
+    mov     w11, #VIRTIO_REQUIRED_FEATURES_LO
+    and     w9, w9, w10
+    orr     w9, w9, w11
+    mov     w10, #VIRTIO_ACCEPTED_FEATURES_HI
+    mov     w11, #VIRTIO_REQUIRED_FEATURES_HI
+    and     w7, w7, w10
+    orr     w7, w7, w11
+
     dsb     sy
     str     wzr, [x6, #VIRTIO_MMIO_DRIVER_FEATURES_SEL]   // SEL = 0
     dsb     sy
-    str     wzr, [x6, #VIRTIO_MMIO_DRIVER_FEATURES]       // low = 0
+    str     w9, [x6, #VIRTIO_MMIO_DRIVER_FEATURES]        // driver_lo
     dsb     sy
     mov     w5, #1
     str     w5, [x6, #VIRTIO_MMIO_DRIVER_FEATURES_SEL]    // SEL = 1
     dsb     sy
-    mov     w5, #VIRTIO_F_VERSION_1_HIBIT
-    str     w5, [x6, #VIRTIO_MMIO_DRIVER_FEATURES]        // high = 1
+    str     w7, [x6, #VIRTIO_MMIO_DRIVER_FEATURES]        // driver_hi
     dsb     sy
 
     // VIO-005: RMW FEATURES_OK into Status.
