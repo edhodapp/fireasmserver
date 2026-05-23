@@ -331,12 +331,14 @@ l2_dispatch:
     ;     paths don't read r10 at all.
     ; So clobbering r10d here is safe across every successor.
     ;
-    ; DO NOT use rdx here — it carries COM1_PORT across
-    ; emit_bytes, and corrupting it produces the same 0xa8c5
-    ; bus_error symptom that drove the FSA-4(A) ARP-recognition
-    ; register swap. Reads from rax+N, never writes to rax —
-    ; buffer base stays valid for the hdr_len / num_buffers
-    ; loads below.
+    ; (rdx is also safe to use now — emit_bytes self-loads
+    ; COM1_PORT on entry as of 2026-05-22, so the prior project-
+    ; wide "do not clobber dx across emit_bytes" rule no longer
+    ; applies. r10d was chosen for this MAC filter mostly because
+    ; it was free; either register would work today.)
+    ;
+    ; Reads from rax+N, never writes to rax — buffer base stays
+    ; valid for the hdr_len / num_buffers loads below.
     mov r10d, [rax + 12]                             ; dst MAC bytes 0-3 (LE u32)
     test r10d, 1                                     ; multicast/broadcast?
     jnz .l2_mac_accept
@@ -393,27 +395,25 @@ l2_dispatch:
 
     ; ARP match. Stash sender MAC + IP.
     ;
-    ; CRITICAL — diagnosed via the L2 integration harness on
-    ; 2026-05-22 — we MUST NOT clobber dx here. dx carries
-    ; COM1_PORT (0x3F8) across the dispatcher per the emit_bytes
-    ; helper's contract (see boot.S, emit_bytes header). The
-    ; prior version used edx and corrupted dx → every subsequent
-    ; emit_bytes wedged in its LSR-poll loop reading a bogus
-    ; port, producing the bus_error spam Firecracker logs.
+    ; Historical context (kept because the bug shaped the
+    ; project): pre-2026-05-22 this code used edx as scratch and
+    ; corrupted COM1_PORT (which emit_bytes carried in dx across
+    ; calls). Every subsequent emit_bytes wedged in its LSR-poll
+    ; loop reading a bogus port, producing the 0xa8c5 bus_error
+    ; spam visible in Firecracker logs. Diagnosed via the L2
+    ; integration harness. The structural fix moved the dx pin
+    ; INTO emit_bytes (see boot.S header) so dx is no longer
+    ; load-bearing across calls.
     ;
     ; r10d is caller-saved per SysV and dead at this point (last
-    ; used as the slot entry-base; no further read). emit_bytes
-    ; clobbers it freely, but we only use it BEFORE the marker
-    ; emit, so the clobber doesn't matter to us.
+    ; used as the slot entry-base; no further read). Today rdx
+    ; would also work; r10d is kept for diff-minimal continuity
+    ; with the live code.
     ;
-    ; Future dispatcher additions that need a scratch register
-    ; across an emit_bytes call: pick r10/eax (caller-saved, no
-    ; emit_bytes invariant). DON'T pick rdx (carries COM1_PORT;
-    ; corrupting it produces the 0xa8c5 bus_error symptom this
-    ; fix was originally for) and DON'T pick rdi/r11 around the
-    ; RX:FRAME emit chain — rdi carries the descriptor id and
-    ; r11 carries num_buffers, both pushed for the emit chain
-    ; below.
+    ; Still-applicable register avoidance around the RX:FRAME
+    ; emit chain below: rdi carries the descriptor id and r11
+    ; carries num_buffers — both PUSHED for the emit chain
+    ; before being clobbered. Don't pick those.
     mov r10d, [rax + 34]                             ; SHA bytes 0-3
     mov [rsp + 24], r10d
     movzx r10d, word [rax + 38]                      ; SHA bytes 4-5

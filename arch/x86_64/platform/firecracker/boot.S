@@ -267,10 +267,15 @@ emit_bytes_32:
 ;         32-bit displacement and so cannot be used directly as
 ;         absolute disp32 in [bits 64]. RAM addresses (VIRTQ_BASE,
 ;         RX_BUFFER_BASE) are < 2 GiB and use direct disp32.
-;   dx  — COM1_PORT pinned across emit_bytes calls.
 ;   eax/ebx/ecx/edx/esi/edi/ebp — same roles as the prior [bits 32]
 ;         code; long-mode auto-zero-extends 32-bit writes to the
 ;         full 64-bit register. Pointer ops use rax/rbx/rsi/rdi/rbp.
+;         No register is reserved across emit_bytes / emit_hex32
+;         beyond SysV's standard callee-saved set — those helpers
+;         self-load COM1_PORT into dx on entry so callers can use
+;         rdx freely. (Pre-2026-05-22 dx was pinned to COM1_PORT
+;         across every call; that constraint produced two real
+;         bugs and is now lifted at the source.)
 
 ; Per-queue programming macro — [bits 64] form using r12 indirect.
 ; Same logic as the prior [bits 32] macro; only the addressing
@@ -371,10 +376,12 @@ kernel_main_64:
     add rax, [rel __memreq_size__kstack_boot]
     mov rsp, rax
 
-    ; UART base for all emit_bytes / emit_hex32 calls. Set BEFORE
-    ; the LAYOUT-OK emit below so the marker can land immediately
-    ; on init_memory_layout's return.
-    mov dx, COM1_PORT
+    ; (No dx pin needed — emit_bytes / emit_hex32 load COM1_PORT
+    ; internally on each call. Pre-2026-05-22 this slot held a
+    ; `mov dx, COM1_PORT` to pin the UART base across the whole
+    ; function; the pin was removed when the COM1_PORT load was
+    ; moved into emit_bytes itself, freeing rdx as a normal
+    ; caller-saved scratch register.)
 
     ; Emit "LAYOUT-OK\n" — D060 step 4.2 success marker. Reached
     ; only when init_memory_layout returned cleanly (it halts
@@ -863,10 +870,24 @@ kernel_main_64:
 ; kernel_main_64. `in/out` work identically in long mode (port I/O
 ; is unchanged across protected / long modes).
 ;
-;   In:  RSI = source ptr, ECX = byte count, DX = COM1_PORT.
+;   In:  RSI = source ptr, ECX = byte count.
 ;   Out: CF = 0 on full success, CF = 1 on UART timeout.
-;   Clobbers: eax, ecx, esi/rsi, edi, flags.
-;   Preserves: dx, rbx, rbp, rsp, r12 (and all other callee-saved).
+;   Clobbers: eax, ecx, edx (loaded with COM1_PORT internally),
+;             esi/rsi, edi, flags.
+;   Preserves: rbx, rbp, rsp, r12 (and all other callee-saved).
+;
+; History (2026-05-22): emit_bytes used to REQUIRE dx = COM1_PORT
+; on entry AND preserved dx across the call. That contract turned
+; rdx into a project-wide "do not clobber across emit_bytes"
+; register and produced two real bugs (FSA-4(A) ARP-recognition
+; clobber → bus_error spam; near-miss in MAC filter's register
+; choice). The pin is now load-internal: emit_bytes derives
+; COM1_PORT from the assemble-time constant on every entry,
+; so callers (a) don't need to set dx and (b) can use rdx as a
+; normal caller-saved scratch register across the call. The
+; cycle cost is a single `mov dx, imm16` per emit_bytes
+; invocation — UART throughput is irrelevant compared to the
+; safety win.
 
 ; Cross-file symbols consumed by arch/x86_64/l2/dispatcher.S:
 ;   emit_bytes, emit_hex32 — UART write helpers
@@ -881,6 +902,11 @@ global tx_test_pkt
 emit_bytes:
     test ecx, ecx
     jz .done
+    ; Load COM1_PORT internally so the caller doesn't have to pin
+    ; it in dx across calls. The .next loop's add/sub COM1_LSR_OFFSET
+    ; dance keeps dx synchronised with COM1_PORT between iterations,
+    ; so this is a one-shot load per call regardless of byte count.
+    mov dx, COM1_PORT
 .next:
     add dx, COM1_LSR_OFFSET
     mov edi, UART_POLL_TIMEOUT
@@ -908,11 +934,12 @@ emit_bytes:
 ; emit_hex32 — [bits 64] hex-emit helper
 ; ================================================================
 ; Renders eax as 8 uppercase hex digits via emit_bytes. 8-byte
-; stack scratch. Preserves dx (caller's COM1_PORT) and rbx (saved
-; on entry); the caller's r12 is preserved because emit_bytes does.
+; stack scratch. Preserves rbx (saved on entry); the caller's r12
+; is preserved because emit_bytes does.
+;
 ;   In:  EAX = 32-bit value to render.
-;   Clobbers: eax, ecx, esi/rsi, edi.
-;   Preserves: dx, rbx, rbp, rsp, r12.
+;   Clobbers: eax, ecx, edx (inherited from emit_bytes), esi/rsi, edi.
+;   Preserves: rbx, rbp, rsp, r12.
 
 emit_hex32:
     push rbx
