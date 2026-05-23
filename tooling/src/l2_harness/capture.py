@@ -92,6 +92,7 @@ class FrameCapturer:
         self._packets: list[Packet] = []
         self._thread: threading.Thread | None = None
         self._started_event = threading.Event()
+        self._sniff_error: BaseException | None = None
 
     @property
     def packets(self) -> list[Packet]:
@@ -112,6 +113,13 @@ class FrameCapturer:
         # captures intermittently dropped the guest's ARP reply
         # because send happened before sniff was bound.
         if not self._started_event.wait(SNIFF_STARTUP_TIMEOUT_SECONDS):
+            # If the thread crashed before signalling start, surface
+            # its exception rather than the generic timeout — much
+            # more useful for the developer than "wedged for 2 s."
+            if self._sniff_error is not None:
+                raise RuntimeError(
+                    "sniff thread failed during startup"
+                ) from self._sniff_error
             raise RuntimeError(
                 f"sniff thread did not call started_callback "
                 f"within {SNIFF_STARTUP_TIMEOUT_SECONDS}s — "
@@ -130,16 +138,39 @@ class FrameCapturer:
             self._thread.join(timeout=self._timeout + 1.0)
         if self._pcap_path is not None:
             wrpcap(str(self._pcap_path), self._packets)
+        # Surface a sniffer exception ONLY when the test body
+        # didn't already raise — masking the test's own failure
+        # with an infrastructure error confuses the failure
+        # signal more than it helps. Per Gemini pre-push
+        # finding: silent exception swallowing hides
+        # PermissionError, scapy.error.Scapy_Exception, etc.,
+        # behind a generic empty-packet result.
+        if self._sniff_error is not None and exc_info[1] is None:
+            raise RuntimeError(
+                "sniff thread raised during capture"
+            ) from self._sniff_error
 
     def _sniff_blocking(self) -> None:
-        captured = sniff(
-            iface=self._iface,
-            filter=self._bpf_filter,
-            timeout=self._timeout,
-            store=True,
-            started_callback=self._started_event.set,
-        )
-        self._packets = list(captured)
+        try:
+            captured = sniff(
+                iface=self._iface,
+                filter=self._bpf_filter,
+                timeout=self._timeout,
+                store=True,
+                started_callback=self._started_event.set,
+            )
+            self._packets = list(captured)
+        except BaseException as exc:  # pylint: disable=broad-except
+            # Stash for the main thread to re-raise. BaseException
+            # is intentional — KeyboardInterrupt / SystemExit
+            # inside the sniff thread should surface to the test
+            # too, otherwise __enter__ deadlocks on
+            # _started_event indefinitely.
+            self._sniff_error = exc
+            # Unblock __enter__'s started_event.wait() so it can
+            # raise rather than time out at
+            # SNIFF_STARTUP_TIMEOUT_SECONDS.
+            self._started_event.set()
 
 
 @contextmanager

@@ -148,6 +148,71 @@ def _wait_for_delta(serial_log: SerialLog,
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
+QUIESCENCE_WINDOW_SECONDS = 0.5
+"""How long the frame-marker count must stay stable before sampling.
+
+After every expected frame appears, wait one quiescence window
+with no further marker count change to catch the over-count
+failure mode (shadow not advancing → re-read of consumed slots
+→ duplicate RX:FRAME emits). Without the quiescence, the test
+could sample immediately at NUM_FRAMES and miss a 31st marker
+that lands 100 ms later. Per Codex pre-push finding.
+"""
+
+
+def _wait_for_marker_target(serial_log: SerialLog,
+                            marker: str,
+                            target: int,
+                            deadline: float) -> None:
+    """Phase 1: poll until marker count >= target or deadline."""
+    while time.monotonic() < deadline:
+        if _count(serial_log.text(), marker) >= target:
+            return
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def _wait_for_marker_quiescent(serial_log: SerialLog,
+                               marker: str,
+                               quiescence: float,
+                               deadline: float) -> int:
+    """Phase 2: poll until marker count is stable for `quiescence`
+    seconds, or deadline. Returns the final count.
+    """
+    last_count = _count(serial_log.text(), marker)
+    last_change = time.monotonic()
+    while time.monotonic() < deadline:
+        current = _count(serial_log.text(), marker)
+        if current != last_count:
+            last_count = current
+            last_change = time.monotonic()
+        elif time.monotonic() - last_change >= quiescence:
+            return last_count
+        time.sleep(POLL_INTERVAL_SECONDS)
+    return last_count
+
+
+def _wait_for_marker_quiescence(serial_log: SerialLog,
+                                marker: str,
+                                baseline: int,
+                                expected_delta: int,
+                                quiescence: float,
+                                timeout: float) -> int:
+    """Wait until marker count reaches `expected_delta` then stays
+    stable for `quiescence` seconds — or hard timeout. Returns
+    the final marker count (caller asserts on the value).
+
+    Right shape for "did the dispatcher emit EXACTLY N markers?"
+    — tolerates burst-tail latency without masking duplicate
+    emits from a regression.
+    """
+    target = baseline + expected_delta
+    deadline = time.monotonic() + timeout
+    _wait_for_marker_target(serial_log, marker, target, deadline)
+    return _wait_for_marker_quiescent(
+        serial_log, marker, quiescence, deadline,
+    )
+
+
 def test_rx_burst_exhausts_budget_and_continues(
     firecracker_guest: FirecrackerGuest,  # pylint: disable=unused-argument
     frame_sender: FrameSender,
@@ -194,27 +259,26 @@ def test_rx_burst_exhausts_budget_and_continues(
     # dispatch's used-ring view. Per Gemini pre-push review.
     frame_sender.send_burst([frame] * NUM_FRAMES)
 
-    # Adaptive poll: wait until at least 2 RX:RETURNED markers
-    # have arrived past baseline (proves budget hit +
-    # continuation), then a short grace for the second TX
-    # chain to finish flushing. Per Gemini pre-push review
-    # (replaces the prior fixed time.sleep).
-    _wait_for_delta(
-        serial_log, "RX:RETURNED",
-        baseline=baseline_returned, delta=2,
+    # Phase A: wait for the EXPECTED frame-marker count to
+    # appear AND stay stable for one quiescence window. This
+    # replaces the prior "wait for 2 RX:RETURNED then sleep
+    # 0.3 s" pattern, which fired the exact-equality check
+    # prematurely when frames trickled in across >2 dispatches
+    # (Codex pre-push finding) and which couldn't surface a
+    # duplicate-emit regression (over-count would land after
+    # the fixed sleep window). The quiescence wait does both:
+    # adapts to load, AND catches duplicates.
+    final_frame_count = _wait_for_marker_quiescence(
+        serial_log, TEST_FRAME_USED_LEN_HEX,
+        baseline=baseline_frame_markers,
+        expected_delta=NUM_FRAMES,
+        quiescence=QUIESCENCE_WINDOW_SECONDS,
         timeout=BURST_SETTLE_TIMEOUT_SECONDS,
     )
-    # Grace window for the trailing TX:RECLAIMED + any straggler
-    # RX:FRAME emit to flush — the prior assertion only waits
-    # for the second RX:RETURNED, but the frame-count assertion
-    # below needs every RX:FRAME line in the log too.
-    time.sleep(0.3)
+    delta_frames = final_frame_count - baseline_frame_markers
 
     text = serial_log.text()
     delta_returned = _count(text, "RX:RETURNED") - baseline_returned
-    delta_frames = (
-        _count(text, TEST_FRAME_USED_LEN_HEX) - baseline_frame_markers
-    )
 
     if delta_returned < 2:
         raise AssertionError(
