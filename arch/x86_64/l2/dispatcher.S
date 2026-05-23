@@ -298,6 +298,55 @@ l2_dispatch:
     shl ecx, 11
     add rax, rcx
 
+    ; --- ETH-006/008, MAC-001..005: MAC filter ---
+    ;
+    ; Frame's Ethernet destination at buffer + (12 bytes of
+    ; virtio_net_hdr) + 0. Accept on:
+    ;   - multicast / broadcast (bit 0 of byte 0 set) — every
+    ;     real multicast group address (e.g. IPv6 ff02::/16
+    ;     mapping to 33:33:xx:xx:xx:xx) and the all-ones
+    ;     broadcast fit this branch. Multicast filtering at a
+    ;     finer grain (IGMP-aware joined groups only) is out of
+    ;     scope until the project actually uses any.
+    ;   - unicast equal to GUEST_MAC (02:00:00:00:00:01).
+    ;
+    ; LE-loaded u32 of bytes 0-3: 02 00 00 00 → 0x00000002.
+    ; Followed by LE-loaded u16 of bytes 4-5: 00 01 → 0x0100.
+    ;
+    ; Bit-0-of-byte-0 in wire order = bit 0 of the LE-loaded u32,
+    ; so the multicast/broadcast check is a single `test r10d, 1`.
+    ;
+    ; Register: r10d. SysV caller-saved; verified dead at this
+    ; point. Liveness trace (grep `r10` in this file to confirm):
+    ;   - Last prior r10 read: the slot entry-base ldrs at the
+    ;     top of .l2_rx_consume_body (`lea r10, [r15 + rax*8 +
+    ;     VIRTQ_OFF_USED]` → `mov edi, [r10 + 4]; mov ebx,
+    ;     [r10 + 8]`). r10 is untouched between that pair and
+    ;     here.
+    ;   - Next r10 access: the ARP stash below (`mov r10d, [rax
+    ;     + 34]` and friends) — all WRITES, so observing our
+    ;     value wouldn't be possible even if it were live.
+    ;   - The recycle path at .l2_rx_drained re-derives r10
+    ;     independently. The .l2_rx_drop / .l2_rx_drop_mac
+    ;     paths don't read r10 at all.
+    ; So clobbering r10d here is safe across every successor.
+    ;
+    ; DO NOT use rdx here — it carries COM1_PORT across
+    ; emit_bytes, and corrupting it produces the same 0xa8c5
+    ; bus_error symptom that drove the FSA-4(A) ARP-recognition
+    ; register swap. Reads from rax+N, never writes to rax —
+    ; buffer base stays valid for the hdr_len / num_buffers
+    ; loads below.
+    mov r10d, [rax + 12]                             ; dst MAC bytes 0-3 (LE u32)
+    test r10d, 1                                     ; multicast/broadcast?
+    jnz .l2_mac_accept
+    cmp r10d, 2                                      ; GUEST_MAC bytes 0-3 LE
+    jne .l2_rx_drop_mac
+    movzx r10d, word [rax + 16]                      ; dst MAC bytes 4-5
+    cmp r10d, 0x100                                  ; GUEST_MAC bytes 4-5 LE
+    jne .l2_rx_drop_mac
+.l2_mac_accept:
+
     ; virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
     lfence
     movzx esi, word [rax + 2]                        ; hdr_len
@@ -730,18 +779,41 @@ l2_dispatch:
     call emit_bytes
 
     mov edi, [rsp + 12]                              ; restore id
+    jmp .l2_rx_drop_recycle
 
-    ; Recycle: write id to AvailRing.ring[next_avail & mask].
-    ; The store uses `di` (low 16 of restored edi); descriptor
-    ; ids are u16 in the AvailRing per Virtio 1.2 §2.7.13. id was
-    ; bounds-checked < VIRTQ_MAX_SIZE (256) above, so the upper
-    ; 16 bits are 0 anyway — the narrow loses no information.
+.l2_rx_drop_mac:
+    ; --- ETH-006/008, MAC-001..005: drop a wrong-MAC RX frame ---
+    ;
+    ; Branched here from the MAC filter when the dst MAC is unicast
+    ; and not GUEST_MAC. used_len (ebx) and frame size are valid;
+    ; we just don't process frames that aren't for us. id (edi)
+    ; needs the same stash discipline as the size-bounds path
+    ; because emit_bytes clobbers edi via its LSR-poll counter.
+    mov [rsp + 12], edi                              ; save id
+
+    lea rsi, [rel rx_drop_mac_msg]
+    mov ecx, rx_drop_mac_len
+    call emit_bytes
+
+    mov edi, [rsp + 12]                              ; restore id
+    ; fall through to recycle
+
+.l2_rx_drop_recycle:
+    ; Shared recycle code reached by both .l2_rx_drop (size bounds)
+    ; and .l2_rx_drop_mac (MAC filter). Write id to AvailRing.ring
+    ; [next_avail & mask] so the device gets the buffer back, then
+    ; advance the shadows + per-dispatch counter and re-enter the
+    ; consume loop.
+    ;
+    ; The store uses `di` (low 16 of restored edi); descriptor ids
+    ; are u16 in the AvailRing per Virtio 1.2 §2.7.13. id was
+    ; bounds-checked < VIRTQ_MAX_SIZE (256) above, so the upper 16
+    ; bits are 0 anyway — the narrow loses no information.
     mov eax, r14d
     lea ecx, [r13d - 1]
     and eax, ecx
     mov [r15 + VIRTQ_OFF_AVAIL + 4 + rax*2], di
 
-    ; Advance next_avail, consumer shadow, per-dispatch counter.
     inc r14d
     inc ebp
     inc dword [rsp + 0]
@@ -837,6 +909,8 @@ rx_num_bufs_len          equ $ - rx_num_bufs_msg
 
 rx_drop_msg:             db 'RX:DROP used_len='
 rx_drop_len              equ $ - rx_drop_msg
+rx_drop_mac_msg:         db 'RX:DROP mac', 10
+rx_drop_mac_len          equ $ - rx_drop_mac_msg
 
 rx_returned_msg:         db 'RX:RETURNED', 10
 rx_returned_len          equ $ - rx_returned_msg

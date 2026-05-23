@@ -322,6 +322,44 @@ l2_dispatch:
     lsl     x10, x20, #11                         // id * 2048
     add     x9, x9, x10                           // buffer addr
 
+    // --- ETH-006/008, MAC-001..005: MAC filter ---
+    //
+    // Ethernet destination at buffer + 12 (past the
+    // 12-byte virtio_net_hdr). Accept on:
+    //   - multicast / broadcast (bit 0 of byte 0 set) — every
+    //     multicast group address (e.g. IPv6 ff02::/16 mapping
+    //     to 33:33:xx:xx:xx:xx) and broadcast (ff:ff:..) match
+    //     this branch. Finer-grain multicast filtering (IGMP-
+    //     aware joined groups) is out of scope until the
+    //     project actually uses any.
+    //   - unicast equal to GUEST_MAC (02:00:00:00:00:01).
+    //
+    // LE u32 of bytes 0-3 = 0x00000002, LE u16 of bytes 4-5 =
+    // 0x0100. Both immediates fit `cmp` 12-bit imm12 (max 4095).
+    //
+    // Bit 0 of byte 0 wire-order = bit 0 of the LE-loaded u32,
+    // so `tbnz w14, #0` is the multicast/broadcast check.
+    //
+    // Register: w14. Caller-saved scratch; verified dead at this
+    // point. Liveness trace (grep `w14` in this file to confirm):
+    //   - No prior w14 use in l2_dispatch's body — first write
+    //     in the function is here in the MAC filter.
+    //   - Next w14 access: the ARP recognition's EtherType /
+    //     OPER / TPA ldrh's below (`ldrh w14, [x9, #24]` and
+    //     friends) — all WRITES, so observing our value would
+    //     not be possible even if it were live.
+    // So clobbering w14 here is safe across every successor.
+    // Reads from x9+N, never writes to x9 — buffer base stays
+    // valid for hdr_len / num_buffers loads below.
+    ldr     w14, [x9, #12]                        // dst MAC bytes 0-3
+    tbnz    w14, #0, .Lmac_accept                 // multicast/broadcast → accept
+    cmp     w14, #2                               // GUEST_MAC bytes 0-3 LE
+    b.ne    .Lrx_drop_mac
+    ldrh    w14, [x9, #16]                        // dst MAC bytes 4-5
+    cmp     w14, #0x100                           // GUEST_MAC bytes 4-5 LE
+    b.ne    .Lrx_drop_mac
+.Lmac_accept:
+
     // Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
     ldrh    w22, [x9, #2]                         // hdr_len
     ldrh    w23, [x9, #10]                        // num_buffers
@@ -739,17 +777,38 @@ l2_dispatch:
     bl      emit_bytes
 
     ldp     x20, x21, [sp], #16                  // restore id+used_len
+    b       .Lrx_drop_recycle
 
-    // Recycle: write id to AvailRing.ring[next_avail & mask].
+.Lrx_drop_mac:
+    // --- ETH-006/008, MAC-001..005: drop a wrong-MAC RX frame ---
+    //
+    // Branched here from the MAC filter when dst MAC is unicast
+    // and not GUEST_MAC. used_len (w21) and frame size are valid;
+    // we just don't process frames that aren't for us.
+    //
+    // Defensive stash same as .Lrx_drop: emit_bytes today doesn't
+    // touch x19-x28 but a future helper-contract change shouldn't
+    // silently corrupt the slot id we hand back to the device.
+    stp     x20, x21, [sp, #-16]!                // save id+used_len
+    adr     x1, rx_drop_mac_msg
+    mov     w2, #(rx_drop_mac_msg_end - rx_drop_mac_msg)
+    bl      emit_bytes
+    ldp     x20, x21, [sp], #16                  // restore id+used_len
+    // fall through to recycle
+
+.Lrx_drop_recycle:
+    // Shared recycle code reached by both .Lrx_drop (size bounds)
+    // and .Lrx_drop_mac (MAC filter). Recycle: write id to
+    // AvailRing.ring[next_avail & mask] so the device gets the
+    // buffer back, then advance shadows + per-dispatch counter
+    // and re-enter the consume loop. The drop counts toward
+    // RX_FRAME_BUDGET because it consumed work the dispatcher
+    // must do (read + recycle).
     and     w10, w24, w25
     add     x11, x19, #VIRTQ_OFF_AVAIL
     add     x11, x11, #4
     strh    w20, [x11, x10, lsl #1]
 
-    // Advance next_avail, consumer shadow, and per-dispatch
-    // counter — same triple as the RX consume body's tail.
-    // The drop counts toward RX_FRAME_BUDGET because it
-    // consumed work the dispatcher must do (read + recycle).
     add     w24, w24, #1
     add     w28, w28, #1
     ldr     w9, [sp, #88]
@@ -851,6 +910,10 @@ rx_num_bufs_msg_end:
 rx_drop_msg:
     .ascii  "RX:DROP used_len="
 rx_drop_msg_end:
+
+rx_drop_mac_msg:
+    .ascii  "RX:DROP mac\n"
+rx_drop_mac_msg_end:
 
 rx_returned_msg:
     .ascii  "RX:RETURNED\n"
