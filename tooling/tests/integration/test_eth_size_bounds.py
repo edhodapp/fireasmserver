@@ -14,15 +14,12 @@ Per `docs/l2/REQUIREMENTS.md` §1 and `TEST_PLAN.md` §1.2:
   - `ETH-011`: frames longer than the maximum MUST be discarded
     (oversize).
 
-The boundary OK cases (ETH-003, ETH-004) are regression guards
-on the dispatcher's `cmp …, 72 / jb` and `cmp …, 1530 / ja`
-checks — both use strict comparison so the boundary value
-itself passes. A future bug that switches either to non-strict
-(`jbe` / `jae`) would silently flip the boundary frame into a
-drop; these tests catch that.
-
-The discard cases (ETH-010, ETH-011) were the original size-
-bounds work that landed with the dispatcher's drop path.
+Each assertion narrows on the marker that uniquely identifies
+THIS test's frame: `used_len=<hex>` for the specific virtio-side
+size. The iter-1 kernel NDP frame (122 bytes / `used_len=0000007A`)
+shares the dispatcher with the test's frame, so a naked
+`assert_marker_observed("RX:FRAME")` would succeed on the NDP
+alone and miss test-frame-specific bugs.
 """
 
 from __future__ import annotations
@@ -40,7 +37,18 @@ from l2_harness.serial import SerialLog
 from l2_harness.tap0 import host_mtu_of
 
 
-CAPTURE_WINDOW_SECONDS = 1.5
+# Worst-case time we'll wait for a marker to land. The dispatcher
+# processes a frame within a few ms once virtio delivers it, but
+# the boot path takes ~150 ms before l2_dispatch is even running,
+# and AF_PACKET → tap0 → Firecracker → guest RX has its own
+# latency. 1.5 s covers all of that with comfortable slack.
+MARKER_TIMEOUT_SECONDS = 1.5
+
+# After the dispatcher has had time to process our frame (RX:DROP
+# observed, or RX:FRAME observed via used_len match), this short
+# additional window catches a delayed second emit — e.g. if a
+# bogus duplicate landed and we want to know about it.
+POST_MARKER_QUIESCE_SECONDS = 0.3
 
 MAX_FRAME_REQUIRED_MTU = 1700
 """Minimum tap0 MTU for ETH-004 / ETH-011 to actually send their frames.
@@ -58,11 +66,28 @@ opaquely on EMSGSIZE.
 """
 
 
+def _virtio_used_len_hex(wire_bytes: int) -> str:
+    """Format the marker suffix for a given wire frame size.
+
+    Dispatcher emits `used_len=` followed by an 8-hex-digit
+    representation of the virtio used_len, which is wire bytes
+    plus the 12-byte virtio_net_hdr prepended by the device.
+    """
+    return f"used_len={(wire_bytes + 12):08X}"
+
+
 def _no_arp_reply_assert(cap_packets: list[Packet],
                          captured_pcap: Path,
                          serial_text: str,
                          case_id: str) -> None:
-    """Helper: assert no ARP reply landed on tap0."""
+    """Helper: assert no ARP reply landed on tap0.
+
+    Belt-and-braces guard — the test frames have a non-ARP
+    EtherType so a reply shouldn't be possible regardless, but
+    a dispatcher bug that mis-routes any frame to the ARP
+    reply path (e.g., the TX side firing on stale state) would
+    show up here.
+    """
     parsed = [parse_arp_reply(bytes(p)) for p in cap_packets]
     replies = [r for r in parsed if r is not None]
     if replies:
@@ -99,19 +124,28 @@ def test_min_size_frame_accepted(
     assert len(frame) == 60, (
         f"ETH-003 test frame must be 60 wire bytes, got {len(frame)}"
     )
+    expected_used_len = _virtio_used_len_hex(60)   # "used_len=00000048"
 
     captured_pcap = artifact_dir / "captured-eth003.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=CAPTURE_WINDOW_SECONDS,
+        timeout=POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
+        # Specific marker — `used_len=00000048` is uniquely this
+        # frame's. The iter-1 kernel NDP frame has used_len=0x7A
+        # so its RX:FRAME marker doesn't satisfy this assertion.
         serial_log.assert_marker_observed(
-            "RX:FRAME", timeout=CAPTURE_WINDOW_SECONDS,
+            expected_used_len, timeout=MARKER_TIMEOUT_SECONDS,
         )
-        serial_log.assert_marker_absent("RX:DROP", window=0.5)
+        # And no drop for any frame in this dispatch — this also
+        # catches a regression that turns the iter-1 NDP into a
+        # drop (would imply a different bug, but worth knowing).
+        serial_log.assert_marker_absent(
+            "RX:DROP", window=POST_MARKER_QUIESCE_SECONDS,
+        )
 
     _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(), "ETH-003",
@@ -150,19 +184,22 @@ def test_max_size_frame_accepted(
     assert len(frame) == 1518, (
         f"ETH-004 test frame must be 1518 wire bytes, got {len(frame)}"
     )
+    expected_used_len = _virtio_used_len_hex(1518)  # "used_len=000005FA"
 
     captured_pcap = artifact_dir / "captured-eth004.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=CAPTURE_WINDOW_SECONDS,
+        timeout=POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
         serial_log.assert_marker_observed(
-            "RX:FRAME", timeout=CAPTURE_WINDOW_SECONDS,
+            expected_used_len, timeout=MARKER_TIMEOUT_SECONDS,
         )
-        serial_log.assert_marker_absent("RX:DROP", window=0.5)
+        serial_log.assert_marker_absent(
+            "RX:DROP", window=POST_MARKER_QUIESCE_SECONDS,
+        )
 
     _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(), "ETH-004",
@@ -175,7 +212,7 @@ def test_oversize_frame_dropped(
     serial_log: SerialLog,
     artifact_dir: Path,
 ) -> None:
-    """ETH-011: frame > 1518 bytes (wire) → drop, no ARP, no reply."""
+    """ETH-011: frame > 1518 bytes (wire) → drop, no further processing."""
     mtu = host_mtu_of("tap0")
     if mtu is None or mtu < MAX_FRAME_REQUIRED_MTU:
         pytest.skip(
@@ -184,8 +221,8 @@ def test_oversize_frame_dropped(
             "without kernel EMSGSIZE. Bump with:\n"
             "    sudo ip link set tap0 mtu 2000"
         )
-    # 1600-byte payload + 14-byte header = 1614 bytes wire,
-    # comfortably above the 1518 ceiling.
+    # 1600-byte payload + 14-byte header = 1614 bytes wire = 1626
+    # virtio bytes (0x65A). Comfortably above the 1530 ceiling.
     payload = b"\xAB" * 1600
     oversize = raw_eth_frame(
         dst_mac=frames.GUEST_DEFAULT_MAC,
@@ -193,28 +230,29 @@ def test_oversize_frame_dropped(
         ethertype=0x88B5,           # local-experimental EtherType
         payload=payload,
     )
+    expected_drop = (
+        f"RX:DROP used_len={(len(oversize) + 12):08X}"
+    )
 
     captured_pcap = artifact_dir / "captured-eth011.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=CAPTURE_WINDOW_SECONDS,
+        timeout=POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(oversize)
-        # Wait for the capture window; assert the guest never
-        # processed it as a regular frame.
-        serial_log.assert_marker_absent(
-            "ARP:REQUEST", window=CAPTURE_WINDOW_SECONDS,
+        # Wait for the SPECIFIC drop marker for our frame, with
+        # a fast-resolution timeout — Gemini-review feedback on
+        # the unconditional sleep-window pattern that the
+        # original test used.
+        serial_log.assert_marker_observed(
+            expected_drop, timeout=MARKER_TIMEOUT_SECONDS,
         )
 
     _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(), "ETH-011",
     )
-    # The guest must explicitly emit RX:DROP for the dropped frame
-    # — the production-bar requirement is observability of the
-    # drop, not just absence of further processing.
-    serial_log.assert_marker_observed("RX:DROP", timeout=0.0)
 
 
 def test_runt_frame_dropped(
@@ -223,9 +261,20 @@ def test_runt_frame_dropped(
     serial_log: SerialLog,
     artifact_dir: Path,
 ) -> None:
-    """ETH-010: frame < 60 bytes (wire) → drop, no ARP, no reply."""
-    # 30-byte payload + 14-byte header = 44 bytes wire,
-    # well below the 60-byte runt threshold.
+    """ETH-010: frame < 60 bytes (wire) → drop, no further processing.
+
+    On Linux, AF_PACKET SOCK_RAW + tap0 does NOT pad runt frames
+    on the way out — scapy.sendp delivers our bytes verbatim
+    to the kernel and the tap driver hands them to Firecracker
+    unchanged. (PF_PACKET SOCK_DGRAM would pad; we use SOCK_RAW.)
+    If a future host kernel started padding here, the runt would
+    arrive as 60+ bytes and the dispatcher would accept it; this
+    test's `expected_drop` substring assertion would fail with
+    a clear "marker not observed" message rather than passing
+    silently — surfaces the regression rather than hiding it.
+    """
+    # 30-byte payload + 14-byte header = 44 bytes wire = 56 virtio
+    # (0x38). Well below the 72-virtio runt threshold.
     payload = b"\xCD" * 30
     runt = raw_eth_frame(
         dst_mac=frames.GUEST_DEFAULT_MAC,
@@ -233,20 +282,22 @@ def test_runt_frame_dropped(
         ethertype=0x88B5,
         payload=payload,
     )
+    expected_drop = (
+        f"RX:DROP used_len={(len(runt) + 12):08X}"
+    )
 
     captured_pcap = artifact_dir / "captured-eth010.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=CAPTURE_WINDOW_SECONDS,
+        timeout=POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(runt)
-        serial_log.assert_marker_absent(
-            "ARP:REQUEST", window=CAPTURE_WINDOW_SECONDS,
+        serial_log.assert_marker_observed(
+            expected_drop, timeout=MARKER_TIMEOUT_SECONDS,
         )
 
     _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(), "ETH-010",
     )
-    serial_log.assert_marker_observed("RX:DROP", timeout=0.0)
