@@ -144,9 +144,22 @@ class FrameCapturer:
             # after that, the sniffer is wedged — leave the
             # daemon to die with the process rather than blocking
             # the test teardown.
+            #
+            # Known limitation (task #34): __exit__ always waits
+            # for sniff's natural timeout because scapy.sniff
+            # isn't interruptible from another thread. Switching
+            # to scapy.AsyncSniffer with .stop() would let
+            # __exit__ return as soon as the test body finishes,
+            # cutting ~5-10 s off the suite. Deferred until
+            # focused tooling-cleanup pass.
             self._thread.join(timeout=self._timeout + 1.0)
+        # append=True so a test that points BOTH a FrameSender
+        # AND this FrameCapturer at the same pcap path (to
+        # capture send + receive as one conversation) doesn't
+        # lose the sender's already-written frames at exit.
         if self._pcap_path is not None:
-            wrpcap(str(self._pcap_path), self._packets)
+            wrpcap(str(self._pcap_path), self._packets,
+                   append=True)
         # Surface a sniffer exception ONLY when the test body
         # didn't already raise — masking the test's own failure
         # with an infrastructure error confuses the failure
@@ -161,14 +174,23 @@ class FrameCapturer:
 
     def _sniff_blocking(self) -> None:
         try:
-            captured = sniff(
+            # prn=self._packets.append + store=False populates
+            # the list in real-time as frames arrive, rather than
+            # waiting for sniff() to return. This means that even
+            # if __exit__ exits before sniff's full timeout (e.g.
+            # the test body raised), self._packets reflects
+            # everything seen up to that point. Gemini pre-push
+            # finding on 240b3fc: the prior store=True / list()
+            # pattern left self._packets empty whenever the
+            # context manager exited early.
+            sniff(
                 iface=self._iface,
                 filter=self._bpf_filter,
                 timeout=self._timeout,
-                store=True,
+                prn=self._packets.append,
+                store=False,
                 started_callback=self._started_event.set,
             )
-            self._packets = list(captured)
         except BaseException as exc:  # pylint: disable=broad-except
             # Stash for the main thread to re-raise. BaseException
             # is intentional — KeyboardInterrupt / SystemExit
