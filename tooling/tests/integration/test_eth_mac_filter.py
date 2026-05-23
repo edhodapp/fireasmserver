@@ -1,4 +1,4 @@
-"""Ethernet MAC filter — `ETH-006`, `ETH-007`, `ETH-008`, `MAC-001..005`.
+"""Ethernet MAC filter — `ETH-006`, `ETH-007`, `MAC-001`.
 
 Per `docs/l2/REQUIREMENTS.md` and `TEST_PLAN.md` §1.4: the L2
 receiver must accept frames whose Ethernet destination is the
@@ -10,13 +10,19 @@ processing into frames that physically reached its tap but
 were destined for someone else — a real attack surface once
 multiple guests share a bridge.
 
-These tests exist BEFORE the dispatcher implements the check —
-test-first per CLAUDE.md's "Repro before fix" discipline. The
-negative test will fail until the MAC filter lands in
-arch/<isa>/l2/dispatcher.S; the positive test passes today
-(any unicast frame is accepted) but is included as a
-regression guard so a future bug that turns the filter into a
-"drop everything not broadcast" policy gets caught.
+Covered here:
+  - MAC-001: unicast frame to GUEST_MAC accepted.
+  - ETH-006: wrong-MAC unicast frame dropped.
+  - ETH-007: multicast destination accepted.
+
+NOT covered here (broader MAC filter rows that need their own
+files or shapes):
+  - ETH-008: broadcast accept (currently implicit via the ARP
+    tests which broadcast their request; explicit guard
+    queued).
+  - MAC-002..005: specific multicast group filtering, joined-
+    group tracking, etc. — out of scope until we implement
+    IGMP / MLD subscription state.
 """
 
 from __future__ import annotations
@@ -103,10 +109,14 @@ def test_unicast_to_guest_mac_accepted(
     )
 
     captured_pcap = artifact_dir / "captured-mac-accept.pcap"
+    # Capture window outlasts the serial wait + the absent-
+    # window so a late guest TX (the case _no_arp_reply_assert
+    # below is meant to catch) can't slip through after the
+    # sniffer ends but before the test exits the with block.
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=CAPTURE_WINDOW_SECONDS,
+        timeout=CAPTURE_WINDOW_SECONDS + 0.5,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
@@ -150,10 +160,12 @@ def test_unicast_to_wrong_mac_dropped(
     )
 
     captured_pcap = artifact_dir / "captured-mac-drop.pcap"
+    # See test_unicast_to_guest_mac_accepted for the capture-
+    # timeout rationale — sniffer must outlast the serial wait.
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=CAPTURE_WINDOW_SECONDS,
+        timeout=CAPTURE_WINDOW_SECONDS + 0.5,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
