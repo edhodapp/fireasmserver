@@ -360,6 +360,21 @@ l2_dispatch:
     b.ne    .Lrx_drop_mac
 .Lmac_accept:
 
+    // --- ETH-015: source MAC unicast-bit check ---
+    //
+    // The source MAC field identifies the originating station,
+    // which is by definition a unicast endpoint (IEEE 802.3-2018
+    // §4.1.2.1). Frames with bit 0 of byte 0 = 1 (multicast or
+    // broadcast source) are malformed and MUST be dropped.
+    //
+    // Source MAC at buffer + 18 (12 virtio_net_hdr + 6 dst MAC).
+    // One byte-test is enough; we don't care about the rest of
+    // the source MAC for this gate. w14 reuses the same register
+    // as the MAC filter above — it's freshly written here, so
+    // no liveness concern with the prior value.
+    ldrb    w14, [x9, #18]                        // src MAC byte 0
+    tbnz    w14, #0, .Lrx_drop_src
+
     // Read virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
     ldrh    w22, [x9, #2]                         // hdr_len
     ldrh    w23, [x9, #10]                        // num_buffers
@@ -794,6 +809,20 @@ l2_dispatch:
     mov     w2, #(rx_drop_mac_msg_end - rx_drop_mac_msg)
     bl      emit_bytes
     ldp     x20, x21, [sp], #16                  // restore id+used_len
+    b       .Lrx_drop_recycle
+
+.Lrx_drop_src:
+    // --- ETH-015: drop a malformed-source-MAC RX frame ---
+    //
+    // Branched here from the source-MAC check when src MAC's
+    // byte 0 bit 0 is set (multicast / broadcast source — invalid
+    // per IEEE 802.3 §4.1.2.1). Frame is structurally well-formed
+    // through the dst MAC filter; only the src field is wrong.
+    stp     x20, x21, [sp, #-16]!                // save id+used_len
+    adr     x1, rx_drop_src_msg
+    mov     w2, #(rx_drop_src_msg_end - rx_drop_src_msg)
+    bl      emit_bytes
+    ldp     x20, x21, [sp], #16                  // restore id+used_len
     // fall through to recycle
 
 .Lrx_drop_recycle:
@@ -914,6 +943,10 @@ rx_drop_msg_end:
 rx_drop_mac_msg:
     .ascii  "RX:DROP mac\n"
 rx_drop_mac_msg_end:
+
+rx_drop_src_msg:
+    .ascii  "RX:DROP src\n"
+rx_drop_src_msg_end:
 
 rx_returned_msg:
     .ascii  "RX:RETURNED\n"

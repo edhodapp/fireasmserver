@@ -349,6 +349,24 @@ l2_dispatch:
     jne .l2_rx_drop_mac
 .l2_mac_accept:
 
+    ; --- ETH-015: source MAC unicast-bit check ---
+    ;
+    ; The source MAC field identifies the originating station,
+    ; which is by definition a unicast endpoint (IEEE 802.3-2018
+    ; §4.1.2.1). Frames with bit 0 of byte 0 = 1 (multicast or
+    ; broadcast source) are malformed and MUST be dropped per
+    ; ETH-015. Defensive against a malicious or buggy peer that
+    ; spoofs a multicast source to confuse downstream MAC
+    ; learning or trigger reply storms — neither matters to
+    ; this guest today, but rejecting the frame is cheap and
+    ; correct.
+    ;
+    ; Source MAC lives at buffer + 18 (12 virtio_net_hdr + 6
+    ; dst MAC). One byte-test is enough; we don't care about
+    ; the rest of the source MAC for this gate.
+    test byte [rax + 18], 1                          ; src MAC byte 0, bit 0
+    jnz .l2_rx_drop_src
+
     ; virtio_net_hdr.hdr_len (u16 @ +2) and num_buffers (u16 @ +10).
     lfence
     movzx esi, word [rax + 2]                        ; hdr_len
@@ -796,6 +814,22 @@ l2_dispatch:
     call emit_bytes
 
     mov edi, [rsp + 12]                              ; restore id
+    jmp .l2_rx_drop_recycle
+
+.l2_rx_drop_src:
+    ; --- ETH-015: drop a malformed-source-MAC RX frame ---
+    ;
+    ; Branched here from the source-MAC check when the source MAC's
+    ; byte 0 bit 0 is set (multicast / broadcast source — invalid
+    ; per IEEE 802.3 §4.1.2.1). Frame is structurally well-formed
+    ; through the dst MAC filter; only the src field is wrong.
+    mov [rsp + 12], edi                              ; save id
+
+    lea rsi, [rel rx_drop_src_msg]
+    mov ecx, rx_drop_src_len
+    call emit_bytes
+
+    mov edi, [rsp + 12]                              ; restore id
     ; fall through to recycle
 
 .l2_rx_drop_recycle:
@@ -911,6 +945,8 @@ rx_drop_msg:             db 'RX:DROP used_len='
 rx_drop_len              equ $ - rx_drop_msg
 rx_drop_mac_msg:         db 'RX:DROP mac', 10
 rx_drop_mac_len          equ $ - rx_drop_mac_msg
+rx_drop_src_msg:         db 'RX:DROP src', 10
+rx_drop_src_len          equ $ - rx_drop_src_msg
 
 rx_returned_msg:         db 'RX:RETURNED', 10
 rx_returned_len          equ $ - rx_returned_msg
