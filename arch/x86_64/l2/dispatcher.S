@@ -732,6 +732,10 @@ l2_dispatch:
     mov edi, [rsp + 12]                              ; restore id
 
     ; Recycle: write id to AvailRing.ring[next_avail & mask].
+    ; The store uses `di` (low 16 of restored edi); descriptor
+    ; ids are u16 in the AvailRing per Virtio 1.2 §2.7.13. id was
+    ; bounds-checked < VIRTQ_MAX_SIZE (256) above, so the upper
+    ; 16 bits are 0 anyway — the narrow loses no information.
     mov eax, r14d
     lea ecx, [r13d - 1]
     and eax, ecx

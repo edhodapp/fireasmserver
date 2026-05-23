@@ -191,6 +191,21 @@ sys.exit(0 if has_root_or_capability() else 1)" \
         echo "         (See docs/l2/HARNESS.md §3.3.)"
         return 0
     fi
+    # MTU floor check: WARN loudly if tap0 is below the threshold
+    # tests that send oversize stimuli need (ETH-003). Don't fail
+    # the push — individual tests skip cleanly — but make the
+    # regression visible at push time so it doesn't sit unnoticed
+    # under green status. fireasm-tap0-up bumps this to 2000 on
+    # boot; if it's lower here the operator likely skipped that
+    # step or something reset the MTU.
+    local tap0_mtu
+    tap0_mtu=$(cat /sys/class/net/tap0/mtu 2>/dev/null || echo "missing")
+    if [[ "$tap0_mtu" == "missing" || "$tap0_mtu" -lt 1700 ]]; then
+        echo "WARNING: tap0 MTU is $tap0_mtu (recommended >= 1700)."
+        echo "         The ETH-003 oversize test will SKIP."
+        echo "         Bump with: sudo ip link set tap0 mtu 2000"
+        echo "         (or re-run ~/bin/fireasm-tap0-up)."
+    fi
     "$REPO_ROOT/.venv/bin/pytest" \
         tooling/tests/integration/ \
         -q --no-header -p no:randomly

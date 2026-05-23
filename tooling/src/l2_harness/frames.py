@@ -46,6 +46,14 @@ without. With one 802.1Q VLAN tag the limit grows to 1518
 without FCS / 1522 with. The dispatcher's oversize check uses
 the no-VLAN value as the conservative bound (ETH-003); VLAN
 support is its own TEST_PLAN row (§2).
+
+Reference value only — the dispatcher hardcodes the equivalent
+virtio-side constant `ETH_MAX_FRAME_LEN + 12` (= 1530) directly
+in the .S files (see the `cmp w21, #1530` / `cmp ebx, 1530`
+lines in arch/<isa>/l2/dispatcher.S). Tests use this Python
+constant to construct frames at, just above, or just below the
+boundary so a future spec change (e.g., 9000-byte jumbos) is a
+single-place update.
 """
 
 

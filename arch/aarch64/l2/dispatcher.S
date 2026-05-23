@@ -717,16 +717,28 @@ l2_dispatch:
     // processing (ARP recognition, RX:FRAME emit, num_bufs check)
     // is skipped.
     //
-    // w20 (id) and w21 (used_len) are AAPCS64 callee-saved and
-    // survive emit_bytes / emit_hex32 calls.
+    // Defensive stash: w20 (id) and w21 (used_len) are AAPCS64
+    // callee-saved AND emit_bytes/emit_hex32 today don't touch
+    // x19-x28 either. But the recycle below depends on w20 being
+    // correct, and silent corruption of the slot id would hand
+    // the device a wrong descriptor index (then we leak / corrupt
+    // the ring on the next consume). Save the pair on the stack
+    // across the emit chain so a future helper-contract change
+    // can't silently break the recycle. Mirrors the x86_64
+    // [rsp + 12] discipline. stp pre-indexed keeps sp 16-aligned
+    // for the bl emit_* calls.
+    stp     x20, x21, [sp, #-16]!                // save id+used_len
+
     adr     x1, rx_drop_msg
     mov     w2, #(rx_drop_msg_end - rx_drop_msg)
     bl      emit_bytes
-    mov     w5, w21                              // used_len
+    ldr     w5, [sp, #8]                         // reload used_len
     bl      emit_hex32
     adr     x1, newline_msg
     mov     w2, #NEWLINE_MSG_LEN
     bl      emit_bytes
+
+    ldp     x20, x21, [sp], #16                  // restore id+used_len
 
     // Recycle: write id to AvailRing.ring[next_avail & mask].
     and     w10, w24, w25

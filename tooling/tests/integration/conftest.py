@@ -21,7 +21,22 @@ from l2_harness.firecracker import (
     launched_guest,
 )
 from l2_harness.serial import SerialLog
-from l2_harness.tap0 import flush_arp_cache, require_tap0
+from l2_harness.tap0 import (
+    flush_arp_cache,
+    host_mtu_of,
+    require_tap0,
+)
+
+
+TAP0_RECOMMENDED_MTU = 1700
+"""tap0 MTU floor that lets every integration test actually run.
+
+Tests that need to send frames above this (currently the
+ETH-003 oversize test) skip cleanly if MTU is lower, but the
+silent skip masks a real coverage gap. The session-level env
+check below WARNS loudly when MTU is below this floor so a
+silent regression is at least visible.
+"""
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -71,6 +86,23 @@ def _check_environment() -> None:
             "and re-run pytest."
         )
     require_tap0(expected_host_ip=frames.HOST_DEFAULT_IP)
+    # MTU floor: WARN loudly if below the recommended threshold.
+    # Tests that need a bigger MTU SKIP individually rather than
+    # failing the session, but the warning makes the regression
+    # visible at session-start time instead of buried in per-test
+    # skip messages. fireasm-tap0-up bumps this to 2000 on boot;
+    # if it's lower here, either the operator skipped that step
+    # or something reset the MTU after.
+    mtu = host_mtu_of("tap0")
+    if mtu is None or mtu < TAP0_RECOMMENDED_MTU:
+        print(
+            f"\nWARNING: tap0 MTU is {mtu}; below "
+            f"{TAP0_RECOMMENDED_MTU} recommended. Tests that "
+            "send oversize stimuli will SKIP. Bump with:\n"
+            "    sudo ip link set tap0 mtu 2000\n"
+            "(See docs/l2/HARNESS.md §3.3a.)",
+            flush=True,
+        )
 
 
 @pytest.fixture(scope="session", autouse=True)
