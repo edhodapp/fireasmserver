@@ -204,12 +204,26 @@ def _wait_for_marker_quiescence(serial_log: SerialLog,
     Right shape for "did the dispatcher emit EXACTLY N markers?"
     — tolerates burst-tail latency without masking duplicate
     emits from a regression.
+
+    Phase 2 (quiescence) gets its OWN deadline rather than
+    sharing the phase-1 budget. Without that, a slow phase 1
+    that consumes most of the `timeout` window would leave
+    phase 2 only milliseconds to verify quiescence, defeating
+    the duplicate-catch purpose. Gemini pre-push finding on
+    ba706f1.
     """
     target = baseline + expected_delta
-    deadline = time.monotonic() + timeout
-    _wait_for_marker_target(serial_log, marker, target, deadline)
+    phase1_deadline = time.monotonic() + timeout
+    _wait_for_marker_target(serial_log, marker, target,
+                            phase1_deadline)
+    # Phase 2 starts fresh: at least `quiescence` seconds of
+    # wall-clock to actually observe stability, regardless of
+    # how long phase 1 ate. We add a small safety margin
+    # (1.5x quiescence) so two consecutive change-and-settle
+    # cycles can both fit if late emits are bursty.
+    phase2_deadline = time.monotonic() + (quiescence * 1.5)
     return _wait_for_marker_quiescent(
-        serial_log, marker, quiescence, deadline,
+        serial_log, marker, quiescence, phase2_deadline,
     )
 
 

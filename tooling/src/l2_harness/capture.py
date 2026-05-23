@@ -112,14 +112,23 @@ class FrameCapturer:
         # failure mode under the harness was exactly this:
         # captures intermittently dropped the guest's ARP reply
         # because send happened before sniff was bound.
-        if not self._started_event.wait(SNIFF_STARTUP_TIMEOUT_SECONDS):
-            # If the thread crashed before signalling start, surface
-            # its exception rather than the generic timeout — much
-            # more useful for the developer than "wedged for 2 s."
-            if self._sniff_error is not None:
-                raise RuntimeError(
-                    "sniff thread failed during startup"
-                ) from self._sniff_error
+        signalled = self._started_event.wait(
+            SNIFF_STARTUP_TIMEOUT_SECONDS,
+        )
+        # Two paths set _started_event: the real
+        # `started_callback` (sniffer is live) and the exception
+        # handler in `_sniff_blocking` (sniffer crashed before
+        # ever calling the callback). Both make `wait()` return
+        # True, so checking _sniff_error AFTER the wait — not
+        # just on timeout — is what catches the crashed-before-
+        # ready case. Without this the test body runs against
+        # a dead capturer and the real error surfaces only at
+        # __exit__ teardown (Codex pre-push finding on ba706f1).
+        if self._sniff_error is not None:
+            raise RuntimeError(
+                "sniff thread failed during startup"
+            ) from self._sniff_error
+        if not signalled:
             raise RuntimeError(
                 f"sniff thread did not call started_callback "
                 f"within {SNIFF_STARTUP_TIMEOUT_SECONDS}s — "
