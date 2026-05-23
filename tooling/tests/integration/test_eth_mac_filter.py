@@ -54,11 +54,21 @@ it, and the guest must drop it as not-for-us.
 """
 
 
-def _no_reply_assert(cap_packets: list[Packet],
-                     captured_pcap: Path,
-                     serial_text: str,
-                     case_id: str) -> None:
-    """Helper: assert no ARP reply (or any other guest TX) on tap0."""
+def _no_arp_reply_assert(cap_packets: list[Packet],
+                         captured_pcap: Path,
+                         serial_text: str,
+                         case_id: str) -> None:
+    """Helper: assert no ARP reply landed on tap0.
+
+    The capturing() context uses `bpf_filter="arp"` so only ARP
+    frames reach `cap_packets` in the first place — non-ARP
+    guest TX (today: the canary tx_test_pkt) is invisible to
+    this assertion. That's intentional: this helper exists to
+    catch the "guest replied to our stimulus" case, which only
+    happens via the ARP responder. Broader "no unexpected
+    guest TX" coverage would need a different filter + parser
+    and is tracked separately.
+    """
     parsed = [parse_arp_reply(bytes(p)) for p in cap_packets]
     replies = [r for r in parsed if r is not None]
     if replies:
@@ -111,7 +121,7 @@ def test_unicast_to_guest_mac_accepted(
         # the filter polarity.
         serial_log.assert_marker_absent("RX:DROP", window=0.5)
 
-    _no_reply_assert(
+    _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(),
         "MAC-001",
     )
@@ -159,7 +169,7 @@ def test_unicast_to_wrong_mac_dropped(
             "ARP:REQUEST", window=0.0,
         )
 
-    _no_reply_assert(
+    _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(),
         "ETH-006",
     )
@@ -198,10 +208,17 @@ def test_multicast_destination_accepted(
     expected_used_len = f"used_len={(len(frame) + 12):08X}"
 
     captured_pcap = artifact_dir / "captured-eth007.pcap"
+    # Capture timeout MUST outlast the serial wait window — if
+    # capture ends before serial wait, a late reply (e.g. one
+    # that arrives 500 ms into a 1.5 s serial wait) would never
+    # land in cap.packets and _no_arp_reply_assert would silently
+    # pass. Set capture to the serial wait + the quiescence
+    # window so the capture window is a strict superset of the
+    # interval during which a guest reply could land.
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_WINDOW_SECONDS + POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
@@ -216,7 +233,7 @@ def test_multicast_destination_accepted(
             "RX:DROP", window=POST_MARKER_QUIESCE_SECONDS,
         )
 
-    _no_reply_assert(
+    _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(),
         "ETH-007",
     )
