@@ -1,4 +1,4 @@
-"""Ethernet MAC filter — `ETH-006`, `ETH-008`, `MAC-001..005`.
+"""Ethernet MAC filter — `ETH-006`, `ETH-007`, `ETH-008`, `MAC-001..005`.
 
 Per `docs/l2/REQUIREMENTS.md` and `TEST_PLAN.md` §1.4: the L2
 receiver must accept frames whose Ethernet destination is the
@@ -33,6 +33,17 @@ from l2_harness.serial import SerialLog
 
 
 CAPTURE_WINDOW_SECONDS = 1.5
+POST_MARKER_QUIESCE_SECONDS = 0.3
+
+MULTICAST_DST_MAC = "33:33:00:00:00:01"
+"""IPv6 all-nodes link-local multicast MAC.
+
+Byte 0 = 0x33 = 0b00110011 — bit 0 set → multicast. Real
+networks regularly deliver this address (it's the IPv6 NDP
+all-nodes group); a guest that wants to support any IPv6
+must accept it. Even without IPv6 in scope today, the L2
+filter's multicast-accept rule is the same.
+"""
 
 WRONG_UNICAST_MAC = "02:00:00:00:00:99"
 """A locally-administered MAC that is NOT the guest MAC.
@@ -151,4 +162,61 @@ def test_unicast_to_wrong_mac_dropped(
     _no_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(),
         "ETH-006",
+    )
+
+
+def test_multicast_destination_accepted(
+    firecracker_guest: FirecrackerGuest,  # pylint: disable=unused-argument
+    frame_sender: FrameSender,
+    serial_log: SerialLog,
+    artifact_dir: Path,
+) -> None:
+    """ETH-007: multicast destination frame → accept, no drop.
+
+    The iter-1 kernel NDP frame on the laptop hits this same
+    code path incidentally, but we don't have an explicit test
+    that controls the multicast address bits and asserts on
+    acceptance. This is the regression guard against a future
+    bug that flips the multicast-bit check (the `tbnz w14, #0`
+    on aarch64 / `test r10d, 1` on x86_64) to its opposite
+    sense — every multicast / broadcast frame would then drop.
+
+    Asserts on the frame-specific `used_len` marker so we
+    distinguish OUR test frame from any iter-1 kernel traffic
+    (NDP at used_len=0x7A) that might also fire RX:FRAME.
+    """
+    payload = b"\x66" * 46
+    frame = raw_eth_frame(
+        dst_mac=MULTICAST_DST_MAC,
+        src_mac=frames.HOST_DEFAULT_MAC,
+        ethertype=0x88B5,
+        payload=payload,
+    )
+    assert len(frame) == 60, (
+        f"ETH-007 test frame must be 60 wire bytes, got {len(frame)}"
+    )
+    expected_used_len = f"used_len={(len(frame) + 12):08X}"
+
+    captured_pcap = artifact_dir / "captured-eth007.pcap"
+    with capturing(
+        iface="tap0",
+        bpf_filter="arp",
+        timeout=POST_MARKER_QUIESCE_SECONDS,
+        pcap_path=captured_pcap,
+    ) as cap:
+        frame_sender.send(frame)
+        serial_log.assert_marker_observed(
+            expected_used_len, timeout=CAPTURE_WINDOW_SECONDS,
+        )
+        # No drop for this frame — the MAC filter accepted it
+        # via the multicast bit branch, and the size + src MAC
+        # gates are satisfied too. A regression in any of those
+        # would surface here.
+        serial_log.assert_marker_absent(
+            "RX:DROP", window=POST_MARKER_QUIESCE_SECONDS,
+        )
+
+    _no_reply_assert(
+        list(cap.packets), captured_pcap, serial_log.text(),
+        "ETH-007",
     )
