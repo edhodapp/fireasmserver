@@ -52,6 +52,23 @@ class FrameSender:
         if self._pcap_path is not None:
             wrpcap(str(self._pcap_path), [pkt], append=True)
 
+    def send_burst(self, raw_list: list[bytes]) -> None:
+        """Inject a list of raw frames in one scapy.sendp call.
+
+        Single-call delivery is much faster than N separate
+        `send` calls because scapy amortises the AF_PACKET
+        socket setup across all packets. For burst tests (e.g.,
+        FSA-4 budget exhaustion), the higher density is what
+        guarantees the guest's RX ring actually holds at least
+        RX_FRAME_BUDGET frames at consume-loop entry — rather
+        than trickling in one-at-a-time at a rate the guest can
+        keep up with iteratively.
+        """
+        pkts = [Ether(r) for r in raw_list]
+        sendp(pkts, iface=self._iface, verbose=False)
+        if self._pcap_path is not None:
+            wrpcap(str(self._pcap_path), pkts, append=True)
+
 
 class FrameCapturer:
     """Background sniffer with a BPF filter + timeout.
