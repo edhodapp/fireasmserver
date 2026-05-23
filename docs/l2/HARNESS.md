@@ -156,10 +156,75 @@ setup on the developer's venv:
 
     sudo setcap cap_net_raw+eip $(readlink -f .venv/bin/python3)
 
-Known limitation: setcap'd Python runs in `AT_SECURE=1`, which
-strips `PYTHONPATH`/`PYTHONHOME` etc. CI runners that rely on
-these for plugin discovery will need a different approach.
-Tracked as task #25.
+The `setcap` is applied to the actual interpreter binary (the
+symlink target of `.venv/bin/python3`, typically a per-user
+custom Python build under `~/python/...`), not to a per-venv
+copy. File capabilities don't propagate across hard / symbolic
+links, so the kernel checks caps on the resolved binary.
+
+#### Known limitation: AT_SECURE strips environment hints
+
+Linux marks a process as `AT_SECURE=1` when it executes a
+binary with file capabilities. CPython detects this via
+`PyConfig.use_environment = 0` (driven indirectly by the
+init logic that respects `secure_getenv`) and IGNORES every
+`PYTHON*` environment variable on startup. glibc's loader
+similarly strips `LD_LIBRARY_PATH` (outside default trusted
+dirs), `LD_PRELOAD`, and `LD_AUDIT` from the environment.
+
+Practical consequences for the L2 harness:
+
+- `.venv/bin/activate`-based site-packages discovery still
+  works, because the venv's `pyvenv.cfg` is read from the
+  filesystem (not env) and the venv's `bin/python3` symlink
+  chain establishes the site-packages search path via
+  Python's compiled-in defaults.
+- `PYTHONPATH` (used by some pytest plugins for discovering
+  test fixtures via env, instead of via `pyproject.toml`) is
+  silently ignored. Plugins that need this won't load.
+- `PYTHONHOME` (alternative site-packages root) is silently
+  ignored. Custom Python distributions that rely on this
+  break.
+- `PYTHONUSERBASE` (per-user site-packages override) is
+  silently ignored. `pip install --user` paths don't get
+  picked up.
+- `PYTHONDEVMODE`, `PYTHONFAULTHANDLER`, `PYTHONIOENCODING`,
+  and other CPython runtime knobs are all ignored.
+
+For the project's own local development this is fine — the
+venv is the source of truth and we don't rely on env-driven
+plugin discovery. **For hosted CI** (when we eventually run
+these tests on GHA), a different approach is needed:
+
+1. **Run pytest under `sudo`** instead of granting caps. Loses
+   the developer-ergonomic no-sudo run path but keeps env
+   intact. Requires passwordless sudo on the runner.
+2. **Use a setuid-root helper binary** that does only the raw
+   I/O on pytest's behalf. Keeps the test process unprivileged
+   and env-intact; adds an IPC layer.
+3. **Use ambient capabilities** (`prctl(PR_CAP_AMBIENT_RAISE)`)
+   to propagate CAP_NET_RAW from a privileged wrapper to the
+   pytest child. Less common; needs the runner to support it.
+
+No CI integration is in scope yet — when it lands we choose
+based on runner constraints.
+
+#### Verifying the cap is still in place
+
+A `pip install --upgrade` of the venv's Python interpreter
+(e.g., a python3.11 → python3.12 rebuild) silently loses the
+capability. The pre-push gate's `run_l2_integration_tests`
+detects this via the conftest's `has_root_or_capability`
+probe and SKIPS with a visible warning rather than failing
+the push opaquely. To restore:
+
+    sudo setcap cap_net_raw+eip \
+        $(readlink -f .venv/bin/python3)
+
+Verify:
+
+    getcap $(readlink -f .venv/bin/python3)
+    # should print: ... cap_net_raw=eip
 
 ### 3.3a Other one-time operator prereqs
 
