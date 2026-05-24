@@ -81,6 +81,18 @@ L2_TX_OK               equ 0
 L2_TX_FULL             equ 1
 L2_TX_POOL_IDX_FULL    equ 0xFFFFFFFF
 
+; Pool buffer layout — the consumer (dispatcher TX phase)
+; builds the wire frame in-place by writing the
+; virtio_net_hdr + Ethernet header in front of the producer's
+; payload. Layout per pool buffer (2048 bytes):
+;   +0   12 bytes virtio_net_hdr (zero-filled by consumer)
+;   +12  6 bytes dst MAC          (from request)
+;   +18  6 bytes src MAC = GUEST_MAC (consumer)
+;   +24  2 bytes ethertype        (from request, BE wire)
+;   +26  payload_len bytes        (PRODUCER writes here)
+;   +26+plen+pad  zero-pad if needed to reach 60 wire / 72 virtio
+L2_TX_PAYLOAD_OFFSET   equ 26                  ; bytes 0-25 = virtio_net_hdr + Eth header
+
 extern __memreq_addr__l2_tx_pending
 extern __memreq_addr__l2_tx_buffer_pool
 

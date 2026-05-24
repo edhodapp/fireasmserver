@@ -402,6 +402,18 @@ _entry:
     mov     w2, #(layout_ok_msg_end - layout_ok_msg)
     bl      emit_bytes
 
+    // --- TX API: one-time Vyukov ring pre-init ---
+    //
+    // The l2_tx_pending region holds the producer-facing send queue
+    // (docs/l2/TX_API.md). The Vyukov MPSC discipline requires
+    // seq[i] = i at start; the allocator's zero-init leaves all
+    // seq fields at 0, which is correct only for slot 0. Walk the
+    // ring once here to fix the other slots. After this point any
+    // caller (test scaffolding today, L3 later) can call
+    // l2_tx_enqueue safely. l2_tx_pending_init clobbers x9/x10/w11,
+    // none of which are live across this point.
+    bl      l2_tx_pending_init
+
     // ============================================================
     // P4 (H5 part 2) — init / notify path barrier policy.
     //

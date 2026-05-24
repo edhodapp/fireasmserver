@@ -175,7 +175,8 @@ VIRTIO_ACCEPTED_FEATURES_HI   equ VIRTIO_F_VERSION_1_HIBIT
 
 extern mode_switch_to_long_mode
 extern init_memory_layout
-extern l2_dispatch    ; arch/x86_64/l2/dispatcher.S (FSA-1)
+extern l2_dispatch          ; arch/x86_64/l2/dispatcher.S (FSA-1)
+extern l2_tx_pending_init   ; arch/x86_64/l2/tx_api.S — Vyukov ring seq[] pre-init
 
 ; ----- PVH ELF note -----
 
@@ -450,6 +451,17 @@ kernel_main_64:
     lea rsi, [rel layout_ok_msg]
     mov ecx, layout_ok_len
     call emit_bytes
+
+    ; --- TX API: one-time Vyukov ring pre-init ---
+    ;
+    ; The l2_tx_pending region holds the producer-facing send queue
+    ; (docs/l2/TX_API.md). The Vyukov MPSC discipline requires
+    ; seq[i] = i at start; the allocator's zero-init leaves all
+    ; seq fields at 0, which is correct only for slot 0. Walk the
+    ; ring once here to fix the other slots. After this point any
+    ; caller (test scaffolding today, L3 later) can call
+    ; l2_tx_enqueue safely.
+    call l2_tx_pending_init
 
     ; Pin VIRTIO_MMIO_BASE in r12 for the rest of the function.
     ; The 32-bit-dest form `mov r12d, imm32` zero-extends to r12,

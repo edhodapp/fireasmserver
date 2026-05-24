@@ -51,6 +51,16 @@
 // (zero-extension of -1 = 0xFFFFFFFF). Same value.
 .equ L2_TX_POOL_IDX_FULL,    0xFFFFFFFF
 
+// Pool buffer layout — the consumer builds the wire frame in
+// front of the producer's payload:
+//   +0   12 bytes virtio_net_hdr (zero-filled by consumer)
+//   +12  6 bytes dst MAC          (from request)
+//   +18  6 bytes src MAC = GUEST_MAC (consumer)
+//   +24  2 bytes ethertype        (from request, BE wire)
+//   +26  payload_len bytes        (PRODUCER writes here)
+//   +26+plen+pad  zero-pad if needed to reach 60 wire / 72 virtio
+.equ L2_TX_PAYLOAD_OFFSET,   26
+
 .text
 .global l2_tx_pending_init
 .global l2_tx_buffer_pool_alloc
