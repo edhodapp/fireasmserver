@@ -52,6 +52,46 @@ if ! ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" true 2>/dev/null; then
     exit 0
 fi
 
+### 1a. Ensure tap0 exists on the Pi ################################
+# Mirror pi_aarch64_firecracker.sh's pre-persistent / ephemeral
+# pattern (Codex P2 review: a previous production-tracer run may
+# have created+destroyed tap0 ephemerally before us, leaving
+# Firecracker no tap to bind virtio-net to). The failpath stub
+# itself doesn't use the network, but Firecracker's config
+# references tap0 to attach a virtio-net device at 0x40003000 so
+# the dispatcher's MMIO writes (QueueNotify) absorb into a real
+# emulated device rather than triggering MissingAddressRange
+# bus errors in the Firecracker log.
+PI_TAP_CREATED=0
+PI_TAP_PROBE=$(ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+    '[[ -d /sys/class/net/tap0 ]] && echo present || echo missing')
+case "$PI_TAP_PROBE" in
+    present)
+        echo "--- tap0 on Pi exists — reusing"
+        ;;
+    missing)
+        echo "--- tap0 on Pi missing — creating ephemeral"
+        PI_TAP_CREATED=1
+        ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+            "sudo ip tuntap add dev tap0 mode tap user '$PI_USER' \
+             && sudo ip link set tap0 up" \
+            || { echo "ERROR: failed to create tap0 on Pi" >&2; exit 1; }
+        ;;
+    *)
+        echo "ERROR: unexpected tap0 probe result: '$PI_TAP_PROBE'" >&2
+        exit 1
+        ;;
+esac
+
+cleanup_tap() {
+    if [[ "$PI_TAP_CREATED" -eq 1 ]]; then
+        echo "--- cleanup: removing ephemeral tap0 on Pi ---"
+        ssh "${SSH_OPTS[@]}" "$PI_USER@$PI_HOST" \
+            "sudo ip link delete tap0" 2>/dev/null || true
+    fi
+}
+trap cleanup_tap EXIT
+
 SCENARIOS=(BAD_ID NUM_BUFS TX_BAD_ID)
 
 # Expected fail markers per scenario. These mirror the dispatcher's
