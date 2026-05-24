@@ -226,12 +226,15 @@ l2_tx_enqueue:
     jl .full                                     ; seq < head → another round in flight (ring full from our perspective)
     jne .cas_retry                               ; seq > head → another producer mid-publish; retry
     ; seq == head → slot ready for this producer's round.
-    ; Try to claim head → head + 1 via CAS.
-    lea r10d, [eax + 1]
+    ; Try to claim head → head + 1 via CAS. r9 holds head+1 from
+    ; here on through the field writes (r9 was previously holding
+    ; ring base — no longer needed since r11 = &ring[slot]).
+    lea r9d, [eax + 1]
+    mov r10d, r9d                                ; CAS new value
     lock cmpxchg [r8 + L2_TX_PENDING_HEAD], r10d
     jne .cas_retry
 
-    ; Successfully claimed. Write entry fields.
+    ; Successfully claimed. Write entry fields. r10 is now scratch.
     ; dst_mac: 6 bytes from [rdi]. Use mov dword + mov word.
     mov r10d, [rdi]                              ; bytes 0-3
     mov [r11 + L2_TX_SLOT_DST_MAC], r10d
@@ -246,8 +249,9 @@ l2_tx_enqueue:
 
     ; Release-store seq = head + 1 (publish). Under x86 TSO,
     ; a regular store provides release ordering against prior
-    ; stores; no fence needed.
-    mov [r11 + L2_TX_SLOT_SEQ], r10d
+    ; stores; no fence needed. r9d carries head+1 across the
+    ; field writes since r10d was the dst-MAC scratch.
+    mov [r11 + L2_TX_SLOT_SEQ], r9d
 
     xor eax, eax                                 ; eax = L2_TX_OK (0)
     ret

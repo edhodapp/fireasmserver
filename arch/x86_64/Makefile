@@ -47,8 +47,43 @@ ifeq ($(PLATFORM),failpath)
 ASFLAGS += -DFAILPATH_SCENARIO_$(SCENARIO)=1
 endif
 
+# TX API end-to-end test pre-bake (phase b.4). When TXAPI_PREBAKE=1
+# is set, the firecracker boot.S enqueues one TX API request before
+# entering the dispatch loop. Builds into a separate BUILD_DIR so
+# the production binary at build/firecracker/ is not overwritten;
+# the test pytest at tooling/tests/integration/test_l2_tx_api.py
+# invokes this build explicitly. OFF by default — Pi deploys + the
+# normal L2 integration suite use the unflagged production binary.
+TXAPI_PREBAKE ?= 0
+ifeq ($(TXAPI_PREBAKE),1)
+ifneq ($(PLATFORM),firecracker)
+$(error TXAPI_PREBAKE=1 only meaningful with PLATFORM=firecracker)
+endif
+ASFLAGS += -DTXAPI_PREBAKE=1
+BUILD_SUFFIX := _txapi
+else
+BUILD_SUFFIX :=
+endif
+
 SRC_DIR := platform/$(PLATFORM)
-BUILD_DIR := build/$(PLATFORM)
+BUILD_DIR := build/$(PLATFORM)$(BUILD_SUFFIX)
+
+# Re-point NASM include path to BUILD_DIR so the memreq incs are
+# searched in the same dir where the codegen rule below writes them.
+# Late re-assignment + ASFLAGS rebuild because the initial
+# NASM_INCLUDE definition above pinned the non-suffixed path.
+NASM_INCLUDE := -i ../../tooling/memlayout_diffharness/ -i $(BUILD_DIR)/
+ifneq ($(filter $(PLATFORM),firecracker failpath),)
+ASFLAGS := -f elf64 $(NASM_INCLUDE)
+else
+ASFLAGS := -f elf32 $(NASM_INCLUDE)
+endif
+ifeq ($(PLATFORM),failpath)
+ASFLAGS += -DFAILPATH_SCENARIO_$(SCENARIO)=1
+endif
+ifeq ($(TXAPI_PREBAKE),1)
+ASFLAGS += -DTXAPI_PREBAKE=1
+endif
 
 # Codegen for `.memreq` records and hot-tier register pins.
 # Triggered by any change to the YAML source-of-truth or the

@@ -177,6 +177,15 @@ extern mode_switch_to_long_mode
 extern init_memory_layout
 extern l2_dispatch          ; arch/x86_64/l2/dispatcher.S (FSA-1)
 extern l2_tx_pending_init   ; arch/x86_64/l2/tx_api.S — Vyukov ring seq[] pre-init
+%ifdef TXAPI_PREBAKE
+; arch/x86_64/l2/tx_api.S — producer-side functions for the TX
+; API end-to-end test pre-bake. Build-flag-gated so production
+; builds (TXAPI_PREBAKE undefined) don't pull these symbols.
+extern l2_tx_buffer_pool_alloc
+extern l2_tx_buffer_addr
+extern l2_tx_enqueue
+L2_TX_PAYLOAD_OFFSET equ 26
+%endif
 
 ; ----- PVH ELF note -----
 
@@ -825,6 +834,54 @@ kernel_main_64:
     ; observe the reply land via tap0. rbx holds the counter
     ; across `call l2_dispatch` (SysV callee-saved; dispatcher
     ; saves/restores rbx in its prologue/epilogue).
+%ifdef TXAPI_PREBAKE
+    ; --- TX API end-to-end test pre-bake (phase b.4) ---
+    ;
+    ; Build-flag-gated: -DTXAPI_PREBAKE=1 turns this on. OFF for
+    ; production builds (Pi deploys, normal CD). ON for the
+    ; tooling/tests/integration/test_l2_tx_api.py test which
+    ; sniffs tap0 for the resulting wire frame.
+    lea rsi, [rel txapi_prebake_msg]
+    mov ecx, txapi_prebake_len
+    call emit_bytes
+    ;
+    ; Allocates one pool buffer, writes the ASCII payload
+    ; "TXAPI-TEST" at +PAYLOAD_OFFSET, enqueues one request
+    ; targeting broadcast MAC with the Local Experimental
+    ; ethertype 0x88B5. The dispatcher's TX phase drains the
+    ; queue on the first iteration of .dispatch_loop and submits
+    ; the wire frame to the host's virtio-net device.
+    ;
+    ; Caller-pin discipline: r12 (VIRTIO_MMIO_BASE), r13 (N),
+    ; r15 (virtq base) are not touched by any call in this block
+    ; per the tx_api.S clobber lists (none use r12-r15). r14 is
+    ; freshly loaded by the dispatcher's prologue from l2_state
+    ; on the first .dispatch_loop iteration, so its pre-call
+    ; contents don't matter here.
+    call l2_tx_buffer_pool_alloc                ; eax = pool_idx
+    push rax                                    ; save idx across the addr call
+    mov edi, eax
+    call l2_tx_buffer_addr                      ; rax = pool buffer base
+    add rax, L2_TX_PAYLOAD_OFFSET               ; rax = producer payload slot
+    ; ASCII bytes "TXAPI-TEST" = 0x54 58 41 50 49 2D 54 45 53 54.
+    ; As LE 64-bit at +0: bytes 0..7 = T X A P I - T E
+    ;   = 0x4554_2D49_5041_5854
+    mov rcx, 0x45542D4950415854
+    mov [rax + 0], rcx
+    mov word [rax + 8], 0x5453                  ; bytes 8-9 = 'S' 'T' (LE = 0x5453)
+    pop rax                                     ; rax = pool_idx
+    lea rdi, [rel txapi_prebake_dst_mac]
+    ; ethertype wire bytes 0x88 0xB5 — stored LE in slot so the
+    ; consumer's strh copies them verbatim to wire bytes 24,25.
+    mov esi, 0xB588
+    mov edx, eax                                ; pool_idx
+    mov ecx, 10                                 ; payload_len
+    call l2_tx_enqueue
+    ; eax = 0 (OK) or 1 (FULL). The first enqueue cannot fail —
+    ; pool just inited and ring is empty. We do not assert; a
+    ; FULL return would result in no frame being sent and the
+    ; pytest assertion would catch it as a missing capture.
+%endif
     mov ebx, 100
 .dispatch_loop:
     call l2_dispatch
@@ -1165,6 +1222,16 @@ tx_test_pkt:
        GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  ; src MAC = GUEST_MAC
     db 0x88, 0xB5                                    ; EtherType 0x88B5
     times 46 db 0xAB                                 ; 46-byte canary payload
+
+%ifdef TXAPI_PREBAKE
+; Broadcast dst MAC for the TX API end-to-end test pre-bake.
+; Distinct label so the rodata pointer is stable for the
+; `lea rdi, [rel ...]` load.
+txapi_prebake_dst_mac:
+    db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+txapi_prebake_msg:     db 'TXAPI:PREBAKE', 10
+txapi_prebake_len      equ $ - txapi_prebake_msg
+%endif
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
