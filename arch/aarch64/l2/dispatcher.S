@@ -439,6 +439,18 @@ l2_dispatch:
     cmp     w23, #1
     b.ne    .Lrx_num_bufs_fail
 
+    // Defense-in-depth: virtio_net_hdr.flags + gso_type must
+    // both be 0 under our VERSION_1-only feature policy (no
+    // F_CSUM, no F_GUEST_CSUM, no F_GSO, no F_GUEST_TSO*, no
+    // F_GUEST_UFO). A device that asserts them silently — or
+    // a future feature negotiated without updating the
+    // dispatcher — would have semantics propagate unchecked.
+    // Single u16 load + cbnz covers both fields. New fail
+    // label .Lrx_hdr_flags_fail mirrors the bad_id / num_bufs
+    // shape. Mirrors x86_64 dispatcher.S.
+    ldrh    w14, [x9, #0]                         // flags | (gso_type << 8)
+    cbnz    w14, .Lrx_hdr_flags_fail
+
     // --- FSA-4(A): ARP request recognition ---
     //
     // x9 still holds the buffer base. We inspect three fields
@@ -951,6 +963,23 @@ l2_dispatch:
     bl      emit_bytes
     b       .Lfail
 
+.Lrx_hdr_flags_fail:
+    // Defense-in-depth: virtio_net_hdr.flags + gso_type
+    // non-zero. w14 holds (flags | (gso_type << 8)) — dump
+    // it in the marker so the diagnostic shows what bits
+    // were set. Stash w14 across the emit chain (emit_bytes
+    // / emit_hex32 don't formally preserve w14).
+    mov     w20, w14
+    adr     x1, rx_hdr_flags_msg
+    mov     w2, #(rx_hdr_flags_msg_end - rx_hdr_flags_msg)
+    bl      emit_bytes
+    mov     w5, w20
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #NEWLINE_MSG_LEN
+    bl      emit_bytes
+    b       .Lfail
+
 .Ltx_bad_id_fail:
     // TX UsedRing.ring[slot].id is out of range. w20 = observed id.
     adr     x1, tx_bad_id_msg
@@ -1006,6 +1035,10 @@ rx_bad_id_msg_end:
 rx_num_bufs_msg:
     .ascii  "RX:FAIL num_bufs="
 rx_num_bufs_msg_end:
+
+rx_hdr_flags_msg:
+    .ascii  "RX:FAIL hdr_flags="
+rx_hdr_flags_msg_end:
 
 rx_drop_msg:
     .ascii  "RX:DROP used_len="

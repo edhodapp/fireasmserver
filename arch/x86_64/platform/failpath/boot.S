@@ -48,6 +48,10 @@
 ;               Expected marker: "RX:FAIL bad_id=00000100".
 ;   NUM_BUFS  — RX frame's virtio_net_hdr.num_buffers != 1.
 ;               Expected marker: "RX:FAIL num_bufs=00000002".
+;   HDR_FLAGS — RX frame's virtio_net_hdr.flags or .gso_type
+;               non-zero (defense-in-depth check, added
+;               2026-05-24).
+;               Expected marker: "RX:FAIL hdr_flags=00000001".
 ;   TX_BAD_ID — valid RX completes, then TX UsedRing entry
 ;               has id >= VIRTQ_MAX_SIZE.
 ;               Expected marker: "TX:FAIL bad_id=00000100"
@@ -64,11 +68,14 @@
 %ifdef FAILPATH_SCENARIO_NUM_BUFS
 %assign FAILPATH_SCENARIO_COUNT FAILPATH_SCENARIO_COUNT + 1
 %endif
+%ifdef FAILPATH_SCENARIO_HDR_FLAGS
+%assign FAILPATH_SCENARIO_COUNT FAILPATH_SCENARIO_COUNT + 1
+%endif
 %ifdef FAILPATH_SCENARIO_TX_BAD_ID
 %assign FAILPATH_SCENARIO_COUNT FAILPATH_SCENARIO_COUNT + 1
 %endif
 %if FAILPATH_SCENARIO_COUNT != 1
-%error "Exactly one of FAILPATH_SCENARIO_{BAD_ID,NUM_BUFS,TX_BAD_ID} must be defined via -D"
+%error "Exactly one of FAILPATH_SCENARIO_{BAD_ID,NUM_BUFS,HDR_FLAGS,TX_BAD_ID} must be defined via -D"
 %endif
 
 ; ----- Constants (duplicated from production firecracker boot.S) -----
@@ -274,6 +281,38 @@ kernel_main_64:
     ; EtherType 0x88B5 BE (local-experimental — bypasses PAUSE
     ; and ARP gates, lands in the "generic frame" path that
     ; ultimately reaches the num_bufs check).
+    mov byte  [rax + 24], 0x88
+    mov byte  [rax + 25], 0xB5
+%endif
+
+%ifdef FAILPATH_SCENARIO_HDR_FLAGS
+    ; Same RX UsedRing + Ethernet header setup as NUM_BUFS, but
+    ; with num_buffers=1 (valid) and virtio_net_hdr.flags=1
+    ; (= VIRTIO_NET_HDR_F_NEEDS_CSUM). With our negotiated
+    ; feature set (no F_CSUM), the device should NEVER set
+    ; this. Dispatcher's defense-in-depth check fires:
+    ; "RX:FAIL hdr_flags=00000001".
+    mov word  [r15 + VIRTQ_OFF_USED + 2], 1
+    mov dword [r15 + VIRTQ_OFF_USED + 4], 0
+    mov dword [r15 + VIRTQ_OFF_USED + 8], 100
+
+    mov rax, [rel __memreq_addr__rx_buffer]
+    mov qword [rax +  0], 0
+    mov qword [rax +  8], 0
+    mov qword [rax + 16], 0
+    mov qword [rax + 24], 0
+    ; virtio_net_hdr.flags (u8 @ +0) = 1; gso_type (u8 @ +1) = 0.
+    ; Combined u16 read in the dispatcher = 0x0001.
+    mov byte  [rax + 0], 1
+    mov word  [rax + 10], 1                            ; num_buffers = 1
+    mov byte  [rax + 12], FP_GUEST_MAC_BYTE_0
+    mov byte  [rax + 13], FP_GUEST_MAC_BYTE_1
+    mov byte  [rax + 14], FP_GUEST_MAC_BYTE_2
+    mov byte  [rax + 15], FP_GUEST_MAC_BYTE_3
+    mov byte  [rax + 16], FP_GUEST_MAC_BYTE_4
+    mov byte  [rax + 17], FP_GUEST_MAC_BYTE_5
+    mov dword [rax + 18], 0x00000002
+    mov word  [rax + 22], 0x4200
     mov byte  [rax + 24], 0x88
     mov byte  [rax + 25], 0xB5
 %endif

@@ -424,6 +424,27 @@ l2_dispatch:
     cmp r11d, 1
     jne .l2_rx_num_bufs_fail
 
+    ; --- Defense-in-depth: virtio_net_hdr.flags + gso_type ---
+    ;
+    ; With our VERSION_1-only feature policy (no F_CSUM, no
+    ; F_GUEST_CSUM, no F_GSO, no F_GUEST_TSO*, no F_GUEST_UFO),
+    ; flags (u8 @ +0) and gso_type (u8 @ +1) MUST be 0. The
+    ; device's virtio-net contract says it won't set them
+    ; without the corresponding feature negotiated. We don't
+    ; rely on that contract — a misbehaving or future device
+    ; that silently writes non-zero bytes there would have its
+    ; semantics propagate through our dispatcher unchecked
+    ; (csum_flag asking us to fix up a checksum we don't
+    ; understand; gso_type asking us to re-segment a frame we
+    ; don't know how to interpret).
+    ;
+    ; Single 16-bit load + compare covers both fields. New fail
+    ; label .l2_rx_hdr_flags_fail mirrors the bad_id / num_bufs
+    ; shape.
+    movzx r10d, word [rax + 0]                       ; flags | (gso_type << 8)
+    test r10d, r10d
+    jnz .l2_rx_hdr_flags_fail
+
     ; --- FSA-4(A): ARP request recognition ---
     ;
     ; Three short-circuit ne-checks on the inbound frame:
@@ -960,6 +981,25 @@ l2_dispatch:
     add rsp, 16
     jmp .l2_fail
 
+.l2_rx_hdr_flags_fail:
+    ; Defense-in-depth: virtio_net_hdr.flags + gso_type were
+    ; non-zero, indicating either a device misbehaviour or a
+    ; feature we haven't negotiated being silently asserted.
+    ; r10d holds (flags | (gso_type << 8)) — dump it in the
+    ; marker so the diagnostic shows what bits were set.
+    sub rsp, 16
+    mov [rsp + 0], r10
+    lea rsi, [rel rx_hdr_flags_msg]
+    mov ecx, rx_hdr_flags_len
+    call emit_bytes
+    mov rax, [rsp + 0]
+    call emit_hex32
+    lea rsi, [rel newline]
+    mov ecx, 1
+    call emit_bytes
+    add rsp, 16
+    jmp .l2_fail
+
 .l2_tx_bad_id_fail:
     sub rsp, 16
     mov [rsp + 0], rdi                               ; save id
@@ -1005,6 +1045,8 @@ rx_frame_used_len_len    equ $ - rx_frame_used_len_msg
 
 rx_bad_id_msg:           db 'RX:FAIL bad_id='
 rx_bad_id_len            equ $ - rx_bad_id_msg
+rx_hdr_flags_msg:        db 'RX:FAIL hdr_flags='
+rx_hdr_flags_len         equ $ - rx_hdr_flags_msg
 rx_num_bufs_msg:         db 'RX:FAIL num_bufs='
 rx_num_bufs_len          equ $ - rx_num_bufs_msg
 

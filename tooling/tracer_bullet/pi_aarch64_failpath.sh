@@ -92,14 +92,14 @@ cleanup_tap() {
 }
 trap cleanup_tap EXIT
 
-SCENARIOS=(BAD_ID NUM_BUFS TX_BAD_ID)
+SCENARIOS=(BAD_ID NUM_BUFS HDR_FLAGS TX_BAD_ID)
 
-# Expected fail markers per scenario. These mirror the dispatcher's
-# .l2_*_fail / .Lrx_bad_id_fail / .Lrx_num_bufs_fail /
-# .Ltx_bad_id_fail emit strings.
+# Expected fail markers per scenario. Mirrors the dispatcher's
+# .l2_*_fail / .L*_fail emit strings.
 declare -A FAIL_MARKER=(
     [BAD_ID]="RX:FAIL bad_id=00000100"
     [NUM_BUFS]="RX:FAIL num_bufs=00000002"
+    [HDR_FLAGS]="RX:FAIL hdr_flags=00000001"
     [TX_BAD_ID]="TX:FAIL bad_id=00000100"
 )
 
@@ -109,6 +109,7 @@ declare -A FAIL_MARKER=(
 declare -A REQUIRED_CHAIN=(
     [BAD_ID]="READY FAILPATH:BOOT"
     [NUM_BUFS]="READY FAILPATH:BOOT"
+    [HDR_FLAGS]="READY FAILPATH:BOOT"
     # TX_BAD_ID needs the valid RX phase to complete before the
     # TX fail can fire — so RX:FRAME + RX:RETURNED + TX:SUBMITTED
     # all need to be in the log too.
@@ -117,11 +118,12 @@ declare -A REQUIRED_CHAIN=(
 
 # Markers that MUST NOT appear (gate short-circuit invariants).
 declare -A FORBIDDEN=(
-    # bad_id / num_bufs gates fire BEFORE the dispatcher reaches
-    # RX:FRAME emit. If RX:FRAME shows up, the gate didn't actually
-    # short-circuit.
+    # RX-side fail gates fire BEFORE the dispatcher reaches
+    # RX:FRAME emit. If RX:FRAME shows up, the gate didn't
+    # actually short-circuit.
     [BAD_ID]="RX:FRAME TX:SUBMITTED"
     [NUM_BUFS]="RX:FRAME TX:SUBMITTED"
+    [HDR_FLAGS]="RX:FRAME TX:SUBMITTED"
     # TX_BAD_ID: the TX completion (TX:RECLAIMED) must NOT fire —
     # the dispatcher caught the bad id and bailed before the
     # success-side reclaim emit.

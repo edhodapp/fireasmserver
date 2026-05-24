@@ -19,6 +19,9 @@
 //               (valid dst/src/EtherType so the dispatcher
 //                reaches the num_bufs check), fail marker
 //               "RX:FAIL num_bufs=00000002".
+//   HDR_FLAGS — RX buffer's virtio_net_hdr.flags = 1
+//               (defense-in-depth, added 2026-05-24), fail
+//               marker "RX:FAIL hdr_flags=00000001".
 //   TX_BAD_ID — valid RX → RX:FRAME → TX:SUBMITTED, then TX
 //               UsedRing.ring[0].id = 0x100 trips
 //               "TX:FAIL bad_id=00000100".
@@ -44,11 +47,14 @@
 .ifdef FAILPATH_SCENARIO_NUM_BUFS
     .equ FAILPATH_SCENARIO_COUNT, (FAILPATH_SCENARIO_COUNT + 1)
 .endif
+.ifdef FAILPATH_SCENARIO_HDR_FLAGS
+    .equ FAILPATH_SCENARIO_COUNT, (FAILPATH_SCENARIO_COUNT + 1)
+.endif
 .ifdef FAILPATH_SCENARIO_TX_BAD_ID
     .equ FAILPATH_SCENARIO_COUNT, (FAILPATH_SCENARIO_COUNT + 1)
 .endif
 .if FAILPATH_SCENARIO_COUNT != 1
-    .error "Exactly one of FAILPATH_SCENARIO_{BAD_ID,NUM_BUFS,TX_BAD_ID} must be defined via --defsym"
+    .error "Exactly one of FAILPATH_SCENARIO_{BAD_ID,NUM_BUFS,HDR_FLAGS,TX_BAD_ID} must be defined via --defsym"
 .endif
 
 // ----- Constants (duplicated from production firecracker boot.S) -----
@@ -217,6 +223,58 @@ _entry:
     strb    w9, [x10, #23]
 
     // EtherType 0x88B5 BE (local-experimental — non-PAUSE).
+    mov     w9, #0x88
+    strb    w9, [x10, #24]
+    mov     w9, #0xB5
+    strb    w9, [x10, #25]
+.endif
+
+.ifdef FAILPATH_SCENARIO_HDR_FLAGS
+    // Valid RX UsedRing + Ethernet header (mirror of NUM_BUFS
+    // setup with num_buffers=1 valid), but virtio_net_hdr.flags
+    // (u8 @ +0) = 1 (VIRTIO_NET_HDR_F_NEEDS_CSUM). Without
+    // F_CSUM negotiated, the device should never set this; the
+    // dispatcher's defense-in-depth check fires.
+    mov     w9, #1
+    add     x10, x19, #VIRTQ_OFF_USED
+    strh    w9, [x10, #2]
+    str     wzr, [x10, #4]                       // id = 0
+    mov     w9, #100
+    str     w9, [x10, #8]                        // len = 100
+
+    adrp    x10, __memreq_addr__rx_buffer
+    add     x10, x10, :lo12:__memreq_addr__rx_buffer
+    ldr     x10, [x10]
+
+    stp     xzr, xzr, [x10, #0]
+    stp     xzr, xzr, [x10, #16]
+
+    mov     w9, #1
+    strb    w9, [x10, #0]                        // flags = 1
+    strh    w9, [x10, #10]                       // num_buffers = 1
+
+    mov     w9, #FP_GUEST_MAC_BYTE_0
+    strb    w9, [x10, #12]
+    mov     w9, #FP_GUEST_MAC_BYTE_1
+    strb    w9, [x10, #13]
+    mov     w9, #FP_GUEST_MAC_BYTE_2
+    strb    w9, [x10, #14]
+    mov     w9, #FP_GUEST_MAC_BYTE_3
+    strb    w9, [x10, #15]
+    mov     w9, #FP_GUEST_MAC_BYTE_4
+    strb    w9, [x10, #16]
+    mov     w9, #FP_GUEST_MAC_BYTE_5
+    strb    w9, [x10, #17]
+
+    mov     w9, #0x02
+    strb    w9, [x10, #18]
+    strb    wzr, [x10, #19]
+    strb    wzr, [x10, #20]
+    strb    wzr, [x10, #21]
+    strb    wzr, [x10, #22]
+    mov     w9, #0x42
+    strb    w9, [x10, #23]
+
     mov     w9, #0x88
     strb    w9, [x10, #24]
     mov     w9, #0xB5

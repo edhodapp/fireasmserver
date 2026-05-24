@@ -110,6 +110,18 @@ SCENARIOS: tuple[Scenario, ...] = (
         forbidden_markers=("RX:FRAME", "TX:SUBMITTED"),
     ),
     Scenario(
+        scenario_name="HDR_FLAGS",
+        expected_fail_marker="RX:FAIL hdr_flags=00000001",
+        required_markers=("READY", "FAILPATH:BOOT",
+                          "RX:FAIL hdr_flags=00000001",
+                          "FAILPATH:DONE rc=00000001"),
+        # hdr_flags gate is defense-in-depth — Firecracker's
+        # virtio-net never sets these fields under our
+        # negotiated feature set. Fires AFTER num_bufs but
+        # BEFORE per-frame processing reaches RX:FRAME emit.
+        forbidden_markers=("RX:FRAME", "TX:SUBMITTED"),
+    ),
+    Scenario(
         scenario_name="TX_BAD_ID",
         expected_fail_marker="TX:FAIL bad_id=00000100",
         required_markers=("READY", "FAILPATH:BOOT",
