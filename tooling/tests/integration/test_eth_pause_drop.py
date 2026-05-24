@@ -94,6 +94,7 @@ def test_pause_frame_dropped(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-018: PAUSE frame → drop, no further processing, no wire response."""
     # PAUSE payload layout (IEEE 802.3x §31B.2):
@@ -121,7 +122,7 @@ def test_pause_frame_dropped(
         f"used_len={(len(frame) + VIRTIO_NET_HDR_LEN):08X}"
     )
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,

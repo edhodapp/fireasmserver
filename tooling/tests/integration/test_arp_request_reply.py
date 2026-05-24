@@ -47,6 +47,7 @@ def test_arp_request_for_guest_ip_gets_reply(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ARP-001: GUEST_IP request → guest replies with GUEST_MAC."""
     request = frames.arp_request(
@@ -57,7 +58,7 @@ def test_arp_request_for_guest_ip_gets_reply(
 
     captured_pcap = artifact_dir / "captured.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp and arp[6:2] = 2",  # filter: ARP reply (op=2)
         timeout=CAPTURE_WINDOW_SECONDS,
         pcap_path=captured_pcap,
@@ -119,6 +120,7 @@ def test_arp_request_for_wrong_ip_gets_no_reply(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
     wrong_target: str,
     case_id: str,
 ) -> None:
@@ -131,7 +133,7 @@ def test_arp_request_for_wrong_ip_gets_no_reply(
 
     captured_pcap = artifact_dir / f"captured-{case_id}.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp and arp[6:2] = 2",
         timeout=CAPTURE_WINDOW_SECONDS,
         pcap_path=captured_pcap,

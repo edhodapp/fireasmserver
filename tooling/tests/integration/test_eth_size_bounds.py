@@ -117,6 +117,7 @@ def test_min_size_frame_accepted(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-003: 60-byte wire frame (min) → accept, no drop.
 
@@ -141,7 +142,7 @@ def test_min_size_frame_accepted(
 
     captured_pcap = artifact_dir / "captured-eth003.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
@@ -170,6 +171,7 @@ def test_max_size_frame_accepted(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-004: 1518-byte wire frame (max untagged) → accept, no drop.
 
@@ -201,7 +203,7 @@ def test_max_size_frame_accepted(
 
     captured_pcap = artifact_dir / "captured-eth004.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
@@ -224,6 +226,7 @@ def test_oversize_frame_dropped(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-011: frame > 1518 bytes (wire) → drop, no further processing."""
     mtu = host_mtu_of("tap0")
@@ -249,7 +252,7 @@ def test_oversize_frame_dropped(
 
     captured_pcap = artifact_dir / "captured-eth011.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
@@ -273,6 +276,7 @@ def test_runt_frame_dropped(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-010: frame < 60 bytes (wire) → drop, no further processing.
 
@@ -301,7 +305,7 @@ def test_runt_frame_dropped(
 
     captured_pcap = artifact_dir / "captured-eth010.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,

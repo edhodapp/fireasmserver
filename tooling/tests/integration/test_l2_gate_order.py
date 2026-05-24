@@ -366,6 +366,7 @@ def test_gate_order(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """Verify dispatcher gate order — earlier-gate marker fires,
     later-gate markers don't."""
@@ -382,7 +383,7 @@ def test_gate_order(
 
     captured_pcap = artifact_dir / f"captured-{case.case_id}.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter=PICT_BPF_FILTER,
         timeout=MARKER_TIMEOUT_SECONDS + POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,

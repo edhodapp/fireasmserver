@@ -72,6 +72,7 @@ def test_multicast_source_mac_dropped(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-015: frame with multicast source MAC → drop, no further processing.
 
@@ -94,7 +95,7 @@ def test_multicast_source_mac_dropped(
 
     captured_pcap = artifact_dir / "captured-eth015.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
@@ -121,6 +122,7 @@ def test_unicast_source_mac_accepted(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-015 companion: frame with unicast source MAC → no src drop.
 
@@ -139,7 +141,7 @@ def test_unicast_source_mac_accepted(
 
     captured_pcap = artifact_dir / "captured-eth015-ok.pcap"
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,

@@ -6,6 +6,7 @@ Per `docs/l2/HARNESS.md` §3.2 — the lifecycle is per-test
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -28,8 +29,17 @@ from l2_harness.tap0 import (
 )
 
 
+TAP_IFACE_ENV_VAR = "FIREASM_TAP_IFACE"
+TAP_IFACE_DEFAULT = "tap0"
+"""Default tap interface name; override via FIREASM_TAP_IFACE.
+
+Lets CI runners or parallel test executions point at a
+different tap device without editing per-test source. Default
+is the developer-laptop setup wired in by ~/bin/fireasm-tap0-up.
+"""
+
 TAP0_RECOMMENDED_MTU = 1700
-"""tap0 MTU floor that lets every integration test actually run.
+"""Tap MTU floor that lets every integration test actually run.
 
 Tests that need to send frames above this (currently the
 ETH-003 oversize test) skip cleanly if MTU is lower, but the
@@ -59,14 +69,28 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+@pytest.fixture(scope="session")
+def tap_iface() -> str:
+    """Tap interface name for all L2 tests.
+
+    Defaults to TAP_IFACE_DEFAULT (`tap0`); override via the
+    FIREASM_TAP_IFACE environment variable. Session-scoped
+    because there's no use case for switching interfaces
+    mid-run today; if/when there is, change scope to function
+    + add a parametrize indirection.
+    """
+    return os.environ.get(TAP_IFACE_ENV_VAR, TAP_IFACE_DEFAULT)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _check_environment() -> None:
+# pylint: disable-next=redefined-outer-name
+def _check_environment(tap_iface: str) -> None:
     """Fail fast if the environment can't run integration tests.
 
     Three preconditions:
       1. firecracker binary on PATH
       2. raw-socket capability (effective uid 0)
-      3. tap0 configured at the expected IP
+      3. tap interface configured at the expected IP
 
     Per HARNESS.md §3.3, sudo elevation is the operator's choice;
     we don't try to acquire root automatically.
@@ -85,7 +109,10 @@ def _check_environment() -> None:
             "$(readlink -f .venv/bin/python3)\n"
             "and re-run pytest."
         )
-    require_tap0(expected_host_ip=frames.HOST_DEFAULT_IP)
+    require_tap0(
+        expected_host_ip=frames.HOST_DEFAULT_IP,
+        iface=tap_iface,
+    )
     # MTU floor: WARN loudly if below the recommended threshold.
     # Tests that need a bigger MTU SKIP individually rather than
     # failing the session, but the warning makes the regression
@@ -93,13 +120,13 @@ def _check_environment() -> None:
     # skip messages. fireasm-tap0-up bumps this to 2000 on boot;
     # if it's lower here, either the operator skipped that step
     # or something reset the MTU after.
-    mtu = host_mtu_of("tap0")
+    mtu = host_mtu_of(tap_iface)
     if mtu is None or mtu < TAP0_RECOMMENDED_MTU:
         print(
-            f"\nWARNING: tap0 MTU is {mtu}; below "
+            f"\nWARNING: {tap_iface} MTU is {mtu}; below "
             f"{TAP0_RECOMMENDED_MTU} recommended. Tests that "
             "send oversize stimuli will SKIP. Bump with:\n"
-            "    sudo ip link set tap0 mtu 2000\n"
+            f"    sudo ip link set {tap_iface} mtu 2000\n"
             "(See docs/l2/HARNESS.md §3.3a.)",
             flush=True,
         )
@@ -153,8 +180,11 @@ def serial_log(firecracker_guest: FirecrackerGuest) -> SerialLog:
 
 
 @pytest.fixture()
-def frame_sender(artifact_dir: Path) -> Iterator[FrameSender]:
-    """Frame injector bound to tap0; logs sent frames to pcap."""
+def frame_sender(
+    artifact_dir: Path,
+    tap_iface: str,    # pylint: disable=redefined-outer-name
+) -> Iterator[FrameSender]:
+    """Frame injector bound to the tap interface; logs to pcap."""
     pcap = artifact_dir / "sent.pcap"
-    yield FrameSender(iface="tap0", pcap_path=pcap)
-    flush_arp_cache(frames.GUEST_DEFAULT_IP, iface="tap0")
+    yield FrameSender(iface=tap_iface, pcap_path=pcap)
+    flush_arp_cache(frames.GUEST_DEFAULT_IP, iface=tap_iface)

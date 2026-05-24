@@ -16,6 +16,46 @@ from pathlib import Path
 
 WAIT_POLL_INTERVAL_SECONDS = 0.05
 
+MAX_ASSERT_LOG_LINES = 40
+"""Cap on the line count of the serial log embedded in
+AssertionError messages from assert_marker_* helpers.
+
+The full log can be many KB once a test runs through the boot
+chain and a few dispatch iterations — embedding it in an
+exception message swamps the failure signal and may be
+truncated by CI log aggregators in ways that drop the actually-
+relevant tail (the markers near the failure). Showing the LAST
+N lines + a pointer to the on-disk path keeps the per-error
+output bounded while leaving the full log available for deeper
+diagnostics. Per Gemini LOW finding on the L2 cleanup pass.
+"""
+
+
+def _tail_for_assert(text: str, path: object) -> str:
+    """Format the trailing lines of `text` for an assertion error.
+
+    Returns the last `MAX_ASSERT_LOG_LINES` lines (or fewer if
+    the log is short) bracketed by the path of the on-disk
+    file so a developer reading the failure knows where the
+    full log lives.
+    """
+    lines = text.splitlines()
+    if len(lines) <= MAX_ASSERT_LOG_LINES:
+        return (
+            f"--- serial log ({path}) ---\n"
+            f"{text}\n"
+            "--- end serial log ---"
+        )
+    omitted = len(lines) - MAX_ASSERT_LOG_LINES
+    tail = "\n".join(lines[-MAX_ASSERT_LOG_LINES:])
+    return (
+        f"--- serial log (last {MAX_ASSERT_LOG_LINES} of "
+        f"{len(lines)} lines; full log at {path}) ---\n"
+        f"... [{omitted} earlier lines omitted]\n"
+        f"{tail}\n"
+        "--- end serial log ---"
+    )
+
 
 class SerialLog:
     """Read-only view of the guest's serial output.
@@ -67,9 +107,7 @@ class SerialLog:
         if not self.wait_for(marker, timeout):
             raise AssertionError(
                 f"marker {marker!r} not observed within {timeout}s\n"
-                f"--- serial log ({self._path}) ---\n"
-                f"{self.text()}\n"
-                "--- end serial log ---"
+                f"{_tail_for_assert(self.text(), self._path)}"
             )
 
     def assert_marker_absent(self, marker: str,
@@ -79,7 +117,5 @@ class SerialLog:
         if marker in self.text():
             raise AssertionError(
                 f"marker {marker!r} unexpectedly observed\n"
-                f"--- serial log ({self._path}) ---\n"
-                f"{self.text()}\n"
-                "--- end serial log ---"
+                f"{_tail_for_assert(self.text(), self._path)}"
             )

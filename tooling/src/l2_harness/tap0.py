@@ -33,9 +33,18 @@ class Tap0NotFoundError(RuntimeError):
     """
 
 
+def has_tap(iface: str = "tap0") -> bool:
+    """True if `iface` exists in the kernel."""
+    return (SYSFS_NET_DIR / iface).exists()
+
+
 def has_tap0() -> bool:
-    """True if the tap0 interface exists in the kernel."""
-    return (SYSFS_NET_DIR / "tap0").exists()
+    """Backward-compat alias — True if tap0 exists.
+
+    Kept for callers that haven't moved to the parameterised
+    `has_tap(iface)`. New code should use `has_tap()`.
+    """
+    return has_tap("tap0")
 
 
 def host_ipv4_of(iface: str) -> str | None:
@@ -127,26 +136,29 @@ def host_mtu_of(iface: str) -> int | None:
         return None
 
 
-def require_tap0(expected_host_ip: str = "192.168.42.1") -> None:
-    """Raise if tap0 is missing or not at the expected IP.
+def require_tap0(expected_host_ip: str = "192.168.42.1",
+                 iface: str = "tap0") -> None:
+    """Raise if the tap interface is missing or not at expected IP.
 
     Tests call this from a session-scoped fixture to fail fast
-    with an actionable error if the operator hasn't set up tap0
-    correctly.
+    with an actionable error if the operator hasn't set up the
+    tap interface correctly. Name kept as `require_tap0` for
+    backward compat; the `iface` parameter is the parameterised
+    extension (default `tap0`).
     """
-    if not has_tap0():
+    if not has_tap(iface):
         raise Tap0NotFoundError(
-            "tap0 not present in /sys/class/net. Create it with:\n"
-            "  sudo ip tuntap add dev tap0 mode tap user $USER\n"
-            "  sudo ip link set tap0 up\n"
-            f"  sudo ip addr add {expected_host_ip}/24 dev tap0\n"
+            f"{iface} not present in /sys/class/net. Create it with:\n"
+            f"  sudo ip tuntap add dev {iface} mode tap user $USER\n"
+            f"  sudo ip link set {iface} up\n"
+            f"  sudo ip addr add {expected_host_ip}/24 dev {iface}\n"
             "and re-run the integration tests."
         )
-    actual = host_ipv4_of("tap0")
+    actual = host_ipv4_of(iface)
     if actual != expected_host_ip:
         raise Tap0NotFoundError(
-            f"tap0 exists but has IPv4 {actual!r}; expected "
+            f"{iface} exists but has IPv4 {actual!r}; expected "
             f"{expected_host_ip!r}. Re-configure with:\n"
-            f"  sudo ip addr flush dev tap0\n"
-            f"  sudo ip addr add {expected_host_ip}/24 dev tap0\n"
+            f"  sudo ip addr flush dev {iface}\n"
+            f"  sudo ip addr add {expected_host_ip}/24 dev {iface}\n"
         )

@@ -95,6 +95,7 @@ def test_unicast_to_guest_mac_accepted(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """MAC-001: unicast frame to GUEST_MAC → accept, RX:FRAME, no drop.
 
@@ -118,7 +119,7 @@ def test_unicast_to_guest_mac_accepted(
     # below is meant to catch) can't slip through after the
     # sniffer ends but before the test exits the with block.
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_WINDOW_SECONDS + 0.5,
         pcap_path=captured_pcap,
@@ -146,6 +147,7 @@ def test_unicast_to_wrong_mac_dropped(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-006: unicast frame to wrong MAC → drop, no further processing.
 
@@ -167,7 +169,7 @@ def test_unicast_to_wrong_mac_dropped(
     # See test_unicast_to_guest_mac_accepted for the capture-
     # timeout rationale — sniffer must outlast the serial wait.
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_WINDOW_SECONDS + 0.5,
         pcap_path=captured_pcap,
@@ -196,6 +198,7 @@ def test_multicast_destination_accepted(
     frame_sender: FrameSender,
     serial_log: SerialLog,
     artifact_dir: Path,
+    tap_iface: str,  # pylint: disable=redefined-outer-name
 ) -> None:
     """ETH-007: multicast destination frame → accept, no drop.
 
@@ -232,7 +235,7 @@ def test_multicast_destination_accepted(
     # window so the capture window is a strict superset of the
     # interval during which a guest reply could land.
     with capturing(
-        iface="tap0",
+        iface=tap_iface,
         bpf_filter="arp",
         timeout=CAPTURE_WINDOW_SECONDS + POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
