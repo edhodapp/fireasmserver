@@ -31,12 +31,12 @@ interactions that single-axis tests miss.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from l2_harness import frames
 from l2_harness.capture import FrameSender, capturing
 from l2_harness.firecracker import FirecrackerGuest
 from l2_harness.frames import (
@@ -49,6 +49,23 @@ from l2_harness.frames import (
 )
 from l2_harness.serial import SerialLog
 from l2_harness.tap0 import host_mtu_of
+
+
+ETH_ALEN = 6
+"""Bytes per Ethernet MAC address. Used when splicing the dst
+MAC of a scapy-built ARP frame to override its broadcast
+default."""
+
+PICT_BPF_FILTER = (
+    "ether proto 0x0806 or "         # ARP — for any guest replies
+    "ether proto 0x8808 or "         # MAC Control / PAUSE
+    "ether proto 0x88b5"             # local-experimental (our stimuli)
+)
+"""BPF filter broad enough to capture every EtherType we send
+or expect to receive in this file. Without this the pcap
+artifact for non-ARP cases would be empty, defeating the
+purpose of writing a per-test pcap on failure.
+"""
 
 
 MARKER_TIMEOUT_SECONDS = 1.5
@@ -302,7 +319,6 @@ class CaseFrameBuilder:
     """Helper: build a wire frame from a Case spec."""
 
     case: Case
-    payload: bytes = field(init=False)
     frame: bytes = field(init=False)
 
     def __post_init__(self) -> None:
@@ -324,21 +340,21 @@ class CaseFrameBuilder:
             dst_bytes = bytes(
                 int(b, 16) for b in self.case.dst_mac.split(":")
             )
-            self.frame = dst_bytes + arp[6:]
+            assert len(dst_bytes) == ETH_ALEN
+            self.frame = dst_bytes + arp[ETH_ALEN:]
             if len(self.frame) != self.case.wire_len:
                 raise ValueError(
                     f"{self.case.case_id}: ARP frame is "
                     f"{len(self.frame)} wire bytes, case "
                     f"expected {self.case.wire_len}"
                 )
-            self.payload = b""    # n/a for ARP case
         else:
-            self.payload = b"\xAB" * (self.case.wire_len - 14)
+            payload = b"\xAB" * (self.case.wire_len - 14)
             self.frame = raw_eth_frame(
                 dst_mac=self.case.dst_mac,
                 src_mac=self.case.src_mac,
                 ethertype=self.case.ethertype,
-                payload=self.payload,
+                payload=payload,
             )
             assert len(self.frame) == self.case.wire_len
 
@@ -367,7 +383,7 @@ def test_gate_order(
     captured_pcap = artifact_dir / f"captured-{case.case_id}.pcap"
     with capturing(
         iface="tap0",
-        bpf_filter="arp",
+        bpf_filter=PICT_BPF_FILTER,
         timeout=MARKER_TIMEOUT_SECONDS + POST_MARKER_QUIESCE_SECONDS,
         pcap_path=captured_pcap,
     ):
@@ -375,16 +391,22 @@ def test_gate_order(
         serial_log.assert_marker_observed(
             case.expected_marker, timeout=MARKER_TIMEOUT_SECONDS,
         )
-        # All forbidden markers must be absent through a small
-        # quiescence window past the expected marker — late
-        # firings of "shouldn't fire" gates are exactly what we
-        # want to catch.
-        for forbidden in case.forbidden_markers:
-            serial_log.assert_marker_absent(
-                forbidden, window=POST_MARKER_QUIESCE_SECONDS,
+        # One quiescence wait covers all forbidden checks. The
+        # prior pattern called `assert_marker_absent` in a loop,
+        # which sleeps `window` per call — N × 0.3 s of pure
+        # idle per case. Single sleep + retrospective check
+        # cuts ~0.9 s per case for the typical 4-forbidden set
+        # (Gemini MEDIUM finding on 122a555).
+        time.sleep(POST_MARKER_QUIESCE_SECONDS)
+        log_snapshot = serial_log.text()
+        leaked = [
+            f for f in case.forbidden_markers if f in log_snapshot
+        ]
+        if leaked:
+            raise AssertionError(
+                f"{case.case_id}: gate-order violation — earlier "
+                f"gate fired (expected: {case.expected_marker!r}) "
+                f"but later-gate markers also appeared: {leaked!r}\n"
+                f"Case: {case.description}\n"
+                f"--- serial log ---\n{log_snapshot}"
             )
-    # Helpful debug: dump the case description on failure.
-    # (pytest's failure trace already shows case.case_id via
-    # the parametrize ids; description here is a comment-only
-    # hint for the reader of the failure logs.)
-    _ = frames  # silence unused-import warning (kept for parity)
