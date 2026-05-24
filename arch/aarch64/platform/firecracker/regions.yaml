@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 #
-# Memreq regions for aarch64/firecracker (D066 step 5 — aarch64
-# replication of the x86_64 path, deferred per D066 task #29 until
-# x86_64 stabilized).
+# Memreq regions for x86_64/firecracker (D066 step 5a).
 #
 # Source-of-truth for the regions placed in the `.memreq` ELF
 # section. The codegen at `tooling/src/memreq_codegen/` reads this
-# file and emits two .inc files under `arch/aarch64/build/firecracker/`:
+# file and emits two .inc files under `arch/x86_64/build/firecracker/`:
 #
 #   memreq_records.inc — 48-byte records (one per region) in
 #                        the .memreq section, consumed by the
 #                        init-time bump allocator.
 #   memreq_pin_hot.inc — register pins for hot-tier regions
-#                        (per D066 Q-B aarch64 pool: x19-x25),
-#                        included at kernel entry post-init.
+#                        (currently none), included at
+#                        kernel_main_64 entry.
 #
-# Mirrors arch/x86_64/platform/firecracker/regions.yaml. Same
-# logical regions, same sizes, same lifetimes.
+# Step 5a (this file's initial state): ONE trivial test region,
+# no consumer. The allocator iterates one valid record for the
+# first time; validates the build pipeline and the .memreq
+# section's content without coupling to any kernel behavior.
 
 regions:
   - name: smoke_test
@@ -27,11 +27,12 @@ regions:
     size: 4096
     align: 4096
     doc: >
-      Trivial test region (D066 step 5a equivalent on aarch64).
+      Trivial test region for D066 step 5a — pipeline smoke test.
       Allocated by init_memory_layout but never consumed by boot.S.
       Validates codegen → .memreq section → bytecode VM execution
       → bump allocator → assigned_addr/assigned_size written in
-      place on the aarch64 side.
+      place. If allocation fails the LAYOUT-OK tracer marker
+      won't fire.
 
   - name: rx_buffer
     tier: cold
@@ -41,10 +42,13 @@ regions:
     size: 524288   # 256 buffers × 2048 bytes (0x80000)
     align: 4096
     doc: >
-      RX buffer pool for virtio-net — 256 × 2048-byte slots.
-      Replaces the hardcoded RX_BUFFER_BASE constant. Cold-tier
-      because the RX fill loop runs once at boot and the RX
-      completion path's per-frame lookup is acceptable cost.
+      RX buffer pool for virtio-net — 256 × 2048-byte slots backing
+      the receive descriptor table. D066 step 5b: first real
+      consumer migration. Replaces the hardcoded RX_BUFFER_BASE
+      constant. Cold-tier because the only hot-loop access is the
+      RX completion path's address compute (one per frame); the
+      RX fill loop runs once at boot. Consumers load
+      __memreq_addr__rx_buffer on each access.
 
   - name: virtq
     tier: hot
@@ -55,29 +59,35 @@ regions:
     align: 4096
     doc: >
       Virtqueue memory for the virtio-net device — RX queue at
-      [base + 0], TX queue at [base + VIRTQ_STRIDE]. x19 (first
-      slot of the AAPCS64 hot-tier pool) is pinned to assigned_addr
-      at kernel entry by memreq_pin_hot.inc; subsequent RX/TX
-      queue accesses use [x19 + offset] or [x19 + VIRTQ_STRIDE +
-      offset] instead of the hardcoded VIRTQ_BASE constant.
+      [base + 0], TX queue at [base + VIRTQ_STRIDE]. Each queue's
+      descriptor / avail / used rings span 0x1000 each (Virtio 1.2
+      §2.7). D066 step 5c: first hot-tier region. r15 is pinned to
+      assigned_addr at kernel_main_64 entry (codegen emits the load
+      via memreq_pin_hot.inc); all subsequent RX/TX queue accesses
+      use [r15 + offset] or [r15 + VIRTQ_STRIDE + offset] instead
+      of the hardcoded VIRTQ_BASE / RX_QUEUE_BASE / TX_QUEUE_BASE
+      constants. Hot-tier eliminates per-access cache touch on the
+      RX/TX hot paths (~14 Mpps × 1 cache touch = ~5% of a 3 GHz
+      core if cold).
 
   - name: kstack_boot
     tier: cold
     lifetime: stack
     owner: 0
     writable: true
-    size: 16384    # 16 KiB — matches x86_64 sibling
-    align: 16      # AAPCS64: SP 16-byte aligned at function entry
+    size: 16384    # 16 KiB — generous headroom for kernel_main_64
+    align: 16      # x86_64 SysV ABI: top-of-stack 16-byte aligned
     doc: >
-      Per-core kernel stack for the boot core. D066 step 5d:
-      first lifetime=stack region on aarch64, exercising the
-      allocator's reverse-bump path from __ram_top per AL-002.
-      _entry switches SP from the linker-script bootstrap stack
-      to this region's top (assigned_addr + assigned_size, since
-      aarch64 grows down) immediately after init_memory_layout
-      returns and before any further `bl`. The bootstrap stack is
-      only needed for init_memory_layout itself per MR-003; the
-      kernel-proper stack lives here.
+      Per-core kernel stack for the boot core. D066 step 5d: first
+      lifetime=stack region, exercising the allocator's reverse-bump
+      path from __ram_top per AL-002. kernel_main_64 switches SP from
+      the linker-script bootstrap stack to this region's top
+      (assigned_addr + assigned_size, since x86_64 grows down)
+      immediately after init_memory_layout returns and before any
+      further `call`. The bootstrap stack is only needed for
+      init_memory_layout itself per MR-003; the kernel-proper stack
+      lives here and grows to one region per core when multi-core
+      wake lands.
 
   - name: tx_arp_buf
     tier: cold
@@ -89,17 +99,10 @@ regions:
     doc: >
       Writable TX scratch buffer for FSA-4(A) — the ARP responder
       writes its reply Ethernet frame here when an inbound ARP
-      request for our IP arrives. boot.S submits TX descriptor 0
-      pointing at this region (when arp_match is set during a
+      request for our IP arrives. l2_dispatch submits TX descriptor
+      0 pointing at this region (when arp_match is set during a
       dispatch); otherwise descriptor 0 points at the rodata
-      canary frame (tx_test_pkt) as before.
-
-      The region is intentionally generous (128 B vs the strict 72
-      bytes a single-frame ARP reply needs) so future TX-side
-      additions — ICMP, gratuitous ARP, link-layer probes — have
-      room to share the buffer without a second region. FSA-5 will
-      introduce a free-list and multiple writable TX buffers when
-      reentrant multi-frame TX becomes load-bearing.
+      canary frame (tx_test_pkt) as before. Mirrors aarch64.
 
   - name: l2_state
     tier: cold
@@ -107,7 +110,7 @@ regions:
     owner: 0
     writable: true
     size: 16          # 4 × u16 shadows + 8 B padding for FSA-5+ growth
-    align: 8          # natural u64 boundary; all current accesses are u16 (strh / ldrh) but the alignment leaves room to widen to batched u32/u64 loads later without realignment
+    align: 8          # natural u64 boundary; all current accesses are u16 (mov word) but the alignment leaves room to widen to batched u32/u64 loads later without realignment
     doc: >
       Persistent shadow storage for l2_dispatch (FSA-4). Four u16
       counters at fixed offsets:
@@ -126,6 +129,82 @@ regions:
       The dispatcher reads all four shadows at entry, uses them
       across the RX/TX phases, and writes them back at exit so
       subsequent invocations see the advanced state. Cold-tier
-      because the load+store is two MMIO-free memory ops per
-      dispatch — well below the threshold where a pinned hot-tier
-      register would pay off.
+      because the load+store is two memory ops per dispatch —
+      well below the threshold where a pinned hot-tier register
+      would pay off. Mirrors arch/aarch64/.../regions.yaml.
+
+  - name: l2_tx_pending
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 448          # 64-byte header + 16 entries × 24 bytes
+    align: 64          # cache line — header isolates producer
+                       # head from consumer tail; per-slot seq
+                       # field on its own line for the ring entries
+    doc: >
+      L2 TX request queue (docs/l2/TX_API.md §3, §5). Producer-
+      facing send interface: producers write request entries
+      (dst MAC, ethertype, payload pool index + len) here; the
+      L2 dispatcher's TX phase drains them into virtio TX
+      descriptors. Vyukov MPSC bounded queue with per-slot
+      sequence numbers.
+
+      Layout:
+        +0   atomic u32 head            (producer claim counter)
+        +4   u32 padding_0
+        +8   u32 tail                   (consumer-only)
+        +12  u32 reserved
+        +16  u8[48] padding_1           (fill to 64 B)
+        +64  ring[0..15], 24 bytes each:
+             +0  u32 seq                (Vyukov publication)
+             +4  u32 reserved_0
+             +8  u8[6] dst_mac
+             +14 u16 ethertype          (BE wire order)
+             +16 u32 payload_pool_idx   (into l2_tx_buffer_pool)
+             +20 u16 payload_len        (no Eth hdr)
+             +22 u16 reserved_1
+
+      Pre-init at boot.S: seq[i] = i for i in 0..15. Allocator
+      zero-init leaves head = tail = 0 which is correct
+      (queue empty).
+
+      Cold tier — the request enqueue + dispatcher drain are
+      both touched at producer + consumer rates that don't
+      benefit from a pinned hot-tier register; the seq +
+      payload writes are dominated by their own memory
+      ordering primitives.
+
+  - name: l2_tx_buffer_pool
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 32832        # 64-byte header + 16 buffers × 2048 bytes
+    align: 4096        # page-aligned so buffer N starts at
+                       # offset 64 + N*2048 cleanly
+    doc: >
+      L2 TX payload buffer pool (docs/l2/TX_API.md §9). 16 ×
+      2 KiB buffers backing the request queue's payload_pool_idx
+      field. Free-list managed via a generation counter ring
+      (same shape as virtio descriptor ring — alloc head and
+      free tail counters; in-flight = alloc - free; pool full
+      when in-flight >= POOL_SIZE).
+
+      Layout:
+        +0   atomic u32 next_alloc      (producer claim counter)
+        +4   u32 padding_0
+        +8   u32 next_free              (consumer-only release counter)
+        +12  u32 reserved
+        +16  u8[48] padding_1           (fill to 64 B)
+        +64  buffer[0..15], 2048 B each (payload storage)
+
+      Buffer N at offset 64 + N * 2048. Producer alloc returns
+      idx = next_alloc & POOL_MASK; consumer free advances
+      next_free monotonically. FIFO discipline matches the
+      dispatcher's in-order TX consume + virtio in-order TX
+      reclaim, so the consumer naturally releases buffers in
+      the order producers allocated them.
+
+      Allocator zero-init leaves next_alloc = next_free = 0
+      (pool empty / all buffers free) which is correct.

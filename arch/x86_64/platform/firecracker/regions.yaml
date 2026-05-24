@@ -132,3 +132,79 @@ regions:
       because the load+store is two memory ops per dispatch —
       well below the threshold where a pinned hot-tier register
       would pay off. Mirrors arch/aarch64/.../regions.yaml.
+
+  - name: l2_tx_pending
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 448          # 64-byte header + 16 entries × 24 bytes
+    align: 64          # cache line — header isolates producer
+                       # head from consumer tail; per-slot seq
+                       # field on its own line for the ring entries
+    doc: >
+      L2 TX request queue (docs/l2/TX_API.md §3, §5). Producer-
+      facing send interface: producers write request entries
+      (dst MAC, ethertype, payload pool index + len) here; the
+      L2 dispatcher's TX phase drains them into virtio TX
+      descriptors. Vyukov MPSC bounded queue with per-slot
+      sequence numbers.
+
+      Layout:
+        +0   atomic u32 head            (producer claim counter)
+        +4   u32 padding_0
+        +8   u32 tail                   (consumer-only)
+        +12  u32 reserved
+        +16  u8[48] padding_1           (fill to 64 B)
+        +64  ring[0..15], 24 bytes each:
+             +0  u32 seq                (Vyukov publication)
+             +4  u32 reserved_0
+             +8  u8[6] dst_mac
+             +14 u16 ethertype          (BE wire order)
+             +16 u32 payload_pool_idx   (into l2_tx_buffer_pool)
+             +20 u16 payload_len        (no Eth hdr)
+             +22 u16 reserved_1
+
+      Pre-init at boot.S: seq[i] = i for i in 0..15. Allocator
+      zero-init leaves head = tail = 0 which is correct
+      (queue empty).
+
+      Cold tier — the request enqueue + dispatcher drain are
+      both touched at producer + consumer rates that don't
+      benefit from a pinned hot-tier register; the seq +
+      payload writes are dominated by their own memory
+      ordering primitives.
+
+  - name: l2_tx_buffer_pool
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 32832        # 64-byte header + 16 buffers × 2048 bytes
+    align: 4096        # page-aligned so buffer N starts at
+                       # offset 64 + N*2048 cleanly
+    doc: >
+      L2 TX payload buffer pool (docs/l2/TX_API.md §9). 16 ×
+      2 KiB buffers backing the request queue's payload_pool_idx
+      field. Free-list managed via a generation counter ring
+      (same shape as virtio descriptor ring — alloc head and
+      free tail counters; in-flight = alloc - free; pool full
+      when in-flight >= POOL_SIZE).
+
+      Layout:
+        +0   atomic u32 next_alloc      (producer claim counter)
+        +4   u32 padding_0
+        +8   u32 next_free              (consumer-only release counter)
+        +12  u32 reserved
+        +16  u8[48] padding_1           (fill to 64 B)
+        +64  buffer[0..15], 2048 B each (payload storage)
+
+      Buffer N at offset 64 + N * 2048. Producer alloc returns
+      idx = next_alloc & POOL_MASK; consumer free advances
+      next_free monotonically. FIFO discipline matches the
+      dispatcher's in-order TX consume + virtio in-order TX
+      reclaim, so the consumer naturally releases buffers in
+      the order producers allocated them.
+
+      Allocator zero-init leaves next_alloc = next_free = 0
+      (pool empty / all buffers free) which is correct.
