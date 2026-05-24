@@ -64,6 +64,19 @@ def test_arp_request_for_guest_ip_gets_reply(
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(request)
+        # Wait for the dispatcher's ARP:REPLY marker INSIDE the
+        # with block. The AsyncSniffer refactor (commit 0b6234d)
+        # made __exit__ return immediately via .stop() instead
+        # of waiting for sniff's natural timeout — without an
+        # explicit wait here, exit can race the wire reply and
+        # cap.packets ends up empty. The marker observation
+        # proves the dispatcher already emitted the reply on
+        # virtio TX; the wire copy is then guaranteed to be in
+        # the sniff buffer (or about to land within a few ms,
+        # which AsyncSniffer's poll-tick handles).
+        serial_log.assert_marker_observed(
+            "ARP:REPLY", timeout=CAPTURE_WINDOW_SECONDS,
+        )
 
     parsed = [parse_arp_reply(bytes(p)) for p in cap.packets]
     replies = [r for r in parsed if r is not None]
