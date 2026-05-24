@@ -18,7 +18,7 @@ from contextlib import contextmanager
 
 from scapy.layers.l2 import Ether
 from scapy.packet import Packet
-from scapy.sendrecv import sendp, sniff
+from scapy.sendrecv import AsyncSniffer, sendp
 from scapy.utils import wrpcap
 
 
@@ -74,10 +74,23 @@ class FrameCapturer:
     """Background sniffer with a BPF filter + timeout.
 
     Used as a context manager: enter starts the sniff thread,
-    exit stops it and exposes the captured frames as a list.
-    Writes the captured frames to a pcap file when configured,
-    even on the empty-capture path (so the test artifact dir
-    always has a `captured.pcap` to look at on failure).
+    exit stops it (asynchronously, no wait-for-timeout) and
+    exposes the captured frames as a list. Writes the captured
+    frames to a pcap file when configured.
+
+    Backed by `scapy.AsyncSniffer` (task #34 refactor on bd7aa1f's
+    successor) — replaces the prior `threading.Thread` +
+    `scapy.sniff` pattern that blocked __exit__ for the FULL
+    timeout window. The async sniffer responds to .stop() within
+    one scapy-internal poll tick (~10 ms), letting tests exit as
+    soon as their body finishes rather than waiting out the
+    capture window.
+
+    Captured packets are appended via a prn callback (kept
+    from the prior implementation, NOT AsyncSniffer's default
+    store=True), so `self.packets` is live during the with
+    block — useful for tests that want to inspect the capture
+    in-progress.
     """
 
     def __init__(self,
@@ -90,118 +103,101 @@ class FrameCapturer:
         self._timeout = timeout
         self._pcap_path = pcap_path
         self._packets: list[Packet] = []
-        self._thread: threading.Thread | None = None
+        self._sniffer: AsyncSniffer | None = None
         self._started_event = threading.Event()
-        self._sniff_error: BaseException | None = None
 
     @property
     def packets(self) -> list[Packet]:
-        """Captured packets (empty until __exit__ has run)."""
+        """Captured packets — populated live via prn callback."""
         return self._packets
 
     def __enter__(self) -> "FrameCapturer":
-        self._thread = threading.Thread(
-            target=self._sniff_blocking,
-            daemon=True,
+        # AsyncSniffer handles its own background thread; we
+        # just pass the same prn / store / started_callback /
+        # timeout we used to pass to sniff(). store=False keeps
+        # AsyncSniffer.results empty (we use prn for everything
+        # so we have a live view rather than a post-hoc one).
+        self._sniffer = AsyncSniffer(
+            iface=self._iface,
+            filter=self._bpf_filter,
+            timeout=self._timeout,
+            prn=self._packets.append,
+            store=False,
+            started_callback=self._started_event.set,
         )
-        self._thread.start()
-        # Block until scapy.sniff has actually bound its
-        # AF_PACKET socket and is ready to receive — otherwise
-        # any reply that arrives in the (small but non-zero)
-        # socket-setup window is missed. The empirical 2026-05-22
-        # failure mode under the harness was exactly this:
-        # captures intermittently dropped the guest's ARP reply
-        # because send happened before sniff was bound.
+        self._sniffer.start()
+        # Block until scapy has bound its AF_PACKET socket —
+        # otherwise any reply that arrives in the (small but
+        # non-zero) socket-setup window is missed. The 2026-05-22
+        # ARP-reply intermittent-drop failure mode that motivated
+        # adding this gate is unchanged by the AsyncSniffer
+        # refactor; we still need it.
         signalled = self._started_event.wait(
             SNIFF_STARTUP_TIMEOUT_SECONDS,
         )
-        # Two paths set _started_event: the real
-        # `started_callback` (sniffer is live) and the exception
-        # handler in `_sniff_blocking` (sniffer crashed before
-        # ever calling the callback). Both make `wait()` return
-        # True, so checking _sniff_error AFTER the wait — not
-        # just on timeout — is what catches the crashed-before-
-        # ready case. Without this the test body runs against
-        # a dead capturer and the real error surfaces only at
-        # __exit__ teardown (Codex pre-push finding on ba706f1).
-        if self._sniff_error is not None:
+        # AsyncSniffer exposes a captured-exception attribute
+        # (.exception) populated by its thread on failure. If
+        # the sniffer crashed before firing started_callback,
+        # _started_event stays unset; if it crashed AFTER, we
+        # might see signalled=True but .exception non-None.
+        # Check both paths.
+        if self._sniffer.exception is not None:
             raise RuntimeError(
-                "sniff thread failed during startup"
-            ) from self._sniff_error
+                "AsyncSniffer failed during startup"
+            ) from self._sniffer.exception
         if not signalled:
             raise RuntimeError(
-                f"sniff thread did not call started_callback "
+                f"AsyncSniffer did not call started_callback "
                 f"within {SNIFF_STARTUP_TIMEOUT_SECONDS}s — "
-                "raw-socket setup may be wedged or scapy version "
-                "doesn't support started_callback"
+                "raw-socket setup may be wedged"
             )
         return self
 
-    def __exit__(self, *exc_info: object) -> None:
-        if self._thread is not None:
-            # sniff has a `timeout=` so it exits on its own;
-            # join with a small grace window. If it's still alive
-            # after that, the sniffer is wedged — leave the
-            # daemon to die with the process rather than blocking
-            # the test teardown.
-            #
-            # Known limitation (task #34): __exit__ always waits
-            # for sniff's natural timeout because scapy.sniff
-            # isn't interruptible from another thread. Switching
-            # to scapy.AsyncSniffer with .stop() would let
-            # __exit__ return as soon as the test body finishes,
-            # cutting ~5-10 s off the suite. Deferred until
-            # focused tooling-cleanup pass.
-            self._thread.join(timeout=self._timeout + 1.0)
-        # append=True so a test that points BOTH a FrameSender
-        # AND this FrameCapturer at the same pcap path (to
-        # capture send + receive as one conversation) doesn't
-        # lose the sender's already-written frames at exit.
+    def _stop_sniffer(self) -> None:
+        """Stop the AsyncSniffer if it's still running.
+
+        .stop() signals the sniff loop to exit at its next poll
+        tick (~10 ms) AND joins the thread. Replaces the prior
+        `thread.join(timeout=sniff_timeout+1)` that waited the
+        FULL capture window. Treat a stop-after-natural-timeout
+        race as benign — we have whatever the prn callback
+        collected.
+        """
+        if self._sniffer is None or not self._sniffer.running:
+            return
+        try:
+            self._sniffer.stop(join=True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+    def _write_pcap(self) -> None:
+        """Flush captured packets to the configured pcap path.
+
+        append=True so a test pointing BOTH a FrameSender AND
+        this FrameCapturer at the same path doesn't overwrite
+        the sender's already-written frames.
+        """
         if self._pcap_path is not None:
             wrpcap(str(self._pcap_path), self._packets,
                    append=True)
-        # Surface a sniffer exception ONLY when the test body
-        # didn't already raise — masking the test's own failure
-        # with an infrastructure error confuses the failure
-        # signal more than it helps. Per Gemini pre-push
-        # finding: silent exception swallowing hides
-        # PermissionError, scapy.error.Scapy_Exception, etc.,
-        # behind a generic empty-packet result.
-        if self._sniff_error is not None and exc_info[1] is None:
-            raise RuntimeError(
-                "sniff thread raised during capture"
-            ) from self._sniff_error
 
-    def _sniff_blocking(self) -> None:
-        try:
-            # prn=self._packets.append + store=False populates
-            # the list in real-time as frames arrive, rather than
-            # waiting for sniff() to return. This means that even
-            # if __exit__ exits before sniff's full timeout (e.g.
-            # the test body raised), self._packets reflects
-            # everything seen up to that point. Gemini pre-push
-            # finding on 240b3fc: the prior store=True / list()
-            # pattern left self._packets empty whenever the
-            # context manager exited early.
-            sniff(
-                iface=self._iface,
-                filter=self._bpf_filter,
-                timeout=self._timeout,
-                prn=self._packets.append,
-                store=False,
-                started_callback=self._started_event.set,
-            )
-        except BaseException as exc:  # pylint: disable=broad-except
-            # Stash for the main thread to re-raise. BaseException
-            # is intentional — KeyboardInterrupt / SystemExit
-            # inside the sniff thread should surface to the test
-            # too, otherwise __enter__ deadlocks on
-            # _started_event indefinitely.
-            self._sniff_error = exc
-            # Unblock __enter__'s started_event.wait() so it can
-            # raise rather than time out at
-            # SNIFF_STARTUP_TIMEOUT_SECONDS.
-            self._started_event.set()
+    def _maybe_raise_sniffer_error(self, test_body_exc: object) -> None:
+        """Surface a sniffer exception iff the test body didn't
+        already raise. Masking the test's own failure with an
+        infrastructure error confuses the failure signal more
+        than it helps.
+        """
+        if (self._sniffer is not None
+                and self._sniffer.exception is not None
+                and test_body_exc is None):
+            raise RuntimeError(
+                "AsyncSniffer raised during capture"
+            ) from self._sniffer.exception
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._stop_sniffer()
+        self._write_pcap()
+        self._maybe_raise_sniffer_error(exc_info[1])
 
 
 @contextmanager
