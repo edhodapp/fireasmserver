@@ -4449,6 +4449,132 @@ during D066's authoring automatically injected the canonical
 schema, so the data-model claims could no longer drift unnoticed.
 
 
+## 2026-05-24
+
+### D067: L2 RX side substantively complete — close milestone, freeze contract for L3
+
+**Requirements:** N/A — this is a milestone-closure decision,
+not a requirements implementation. It RECORDS the state of
+REQUIREMENTS.md §1 (Ethernet framing) and §3 (ARP) row-by-row
+rather than introducing new requirements; the per-row
+attribution lives in `docs/l2/STATUS.md`.
+
+---
+
+**What this decision records.**
+
+L2's receive-side processing — frame validation, MAC
+filtering, source-MAC sanity, PAUSE-frame silent discard,
+ARP request/reply, defensive fail-path detection — is
+**substantively complete** as of commit `57d8c41` (the
+fail-path coverage push closing 2026-05-24).
+
+"Substantively complete" means every REQUIREMENTS.md §1 row
+that doesn't depend on infrastructure we don't have yet (the
+TX API per D067/`docs/l2/TX_API.md`, virtio FCS offload
+negotiation, control-queue features explicitly rejected in
+the feature negotiation policy) is either implemented +
+tested, implemented + build-time-asserted, or out-of-scope
+with documented rationale.
+
+The full per-row coverage map is in `docs/l2/STATUS.md`. As
+of this decision: 13 of 16 §1 rows have explicit coverage
+(test or build-time assertion); 2 are TX-side deferred
+pending the TX API; 3 are infrastructure-N/A (PHY-level,
+virtio-offloaded, or informational-only).
+
+Beyond §1, four additional invariant classes have explicit
+test coverage that wasn't in the original spec but emerged
+as production-bar requirements during the 2026-05-22 →
+2026-05-24 hardening push:
+
+  - FSA-4 persistent shadow correctness (RX consume budget
+    + reentrance across multiple `l2_dispatch` calls)
+  - Dispatcher gate ORDER (size > dst MAC > src MAC > PAUSE
+    > ARP > accept) — 10 PICT-style multi-violation cases
+  - Fail-path defensive checks (RX bad_id, RX num_bufs, TX
+    bad_id) — verified end-to-end on both arches via the
+    guest-side stub at `arch/{x86_64,aarch64}/platform/
+    failpath/`
+  - virtio feature negotiation policy expressed as
+    REQUIRED/ACCEPTED bitmasks (rather than hardcoded
+    VERSION_1)
+
+---
+
+**Why this is a decision, not just a status note.**
+
+Three pieces of L2 design now move from "subject to revision
+as we learn" to "stable contract for L3 to consume":
+
+1. **The dispatcher's RX gate pipeline order.** PICT
+   gate-order tests pin it. Reordering is a real change
+   that should land in a follow-up DECISIONS entry rather
+   than a silent commit.
+2. **The marker vocabulary the dispatcher emits.** RX:FRAME,
+   RX:DROP <reason>, RX:RETURNED, RX:FAIL <reason>=<hex>,
+   TX:SUBMITTED, TX:RECLAIMED, TX:FAIL, ARP:REQUEST,
+   ARP:REPLY. The tracer-bullet harnesses and the L2
+   integration tests all assert on these. Renaming requires
+   updating every test plus the documentation; do it via a
+   superseding DECISIONS entry.
+3. **The guest-side fail-path stub architecture** at
+   `arch/{x86_64,aarch64}/platform/failpath/boot.S`.
+   Production dispatcher is unchanged; the stub injects
+   malformed virtqueue contents and runs the same
+   `l2_dispatch` to exercise paths Firecracker's spec-
+   compliant virtio-net can't reach. This is the right
+   pattern; future fail-path coverage (in L3 or elsewhere)
+   should follow it.
+
+---
+
+**What "complete" explicitly does NOT mean.**
+
+- The TX side is **not** implemented. `docs/l2/TX_API.md`
+  captures the Vyukov MPSC ring + buffer-pool design chosen
+  2026-05-23; build when L3 lands as the first real
+  consumer. ETH-012/013 (outgoing-padding tests) and the
+  ARP-responder-through-queue migration ride with that
+  implementation pass.
+- ARP cache state machine (ARP-005..008) is deferred — has
+  no consumer without outbound IP. L3 will pull it in.
+- VLAN tagging, IGMP/MLD joined-group filtering, FCS
+  computation wire-in, multi-queue, multi-core dispatcher —
+  all explicitly out of scope today, each documented with
+  rationale in `docs/l2/STATUS.md`.
+
+---
+
+**Test inventory at the close.**
+
+29 integration tests under `tooling/tests/integration/`,
+~13 s suite runtime on x86_64. Plus Pi-side tracer-bullet
+scripts for aarch64 hardware coverage. Plus 1289 unit /
+property / differential tests under `tooling/tests/` that
+cover crypto primitives, memreq codegen, branch coverage
+tooling, and host-side harness internals. Pre-push pipeline
+runs every gate; the L2 milestone is gated by all of them
+passing.
+
+---
+
+**Forward-pointer for L3 work.**
+
+The next big architectural commit (start of L3 / IPv4) should
+re-read `docs/l2/STATUS.md` § "What's out of scope today" and
+explicitly accept or revise each deferred item. The TX API
+implementation in particular needs an L3 first-draft to
+validate against — `docs/l2/TX_API.md`'s open design
+questions (backpressure policy, completion notification,
+priority ordering) should resolve there.
+
+If L3 work surfaces a need that this milestone-closure
+implicitly forbade (e.g., a different RX gate ordering, a
+different fail-path response, a different marker shape),
+that's a superseding-D067 case. Don't silently revise;
+write a new DECISIONS entry that names what changed and why.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
