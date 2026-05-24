@@ -1158,3 +1158,5 @@ driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='
 driver_ok_fail_len     equ $ - driver_ok_fail_msg
 
 newline:         db 10
+
+section .note.GNU-stack noalloc noexec nowrite progbits

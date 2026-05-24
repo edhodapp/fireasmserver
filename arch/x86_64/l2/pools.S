@@ -11,3 +11,5 @@ RX_BUF_COUNT    equ 256
 RX_BUF_SIZE     equ 2048
 TX_BUF_COUNT    equ 1
 TX_BUF_SIZE     equ 72
+
+section .note.GNU-stack noalloc noexec nowrite progbits

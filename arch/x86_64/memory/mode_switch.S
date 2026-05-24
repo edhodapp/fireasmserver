@@ -263,3 +263,10 @@ boot_gdt_end:
 boot_gdtr:
     dw boot_gdt_end - boot_gdt - 1
     dd boot_gdt
+
+; Explicit non-exec stack marker — silences the binutils ≥ 2.39
+; deprecation warning ("missing .note.GNU-stack section implies
+; executable stack"). Bare-metal guest never executes from the
+; stack; the marker pins that intent so a future binutils that
+; flips the missing-section default doesn't surprise us.
+section .note.GNU-stack noalloc noexec nowrite progbits

@@ -6,3 +6,5 @@
 ; the per-event logic inline. FSA-2 will pull the RX-consume and
 ; TX-submit transitions out into named, callable functions here.
 ; See arch/aarch64/l2/transitions.S for the FSA-2 contract sketch.
+
+section .note.GNU-stack noalloc noexec nowrite progbits
