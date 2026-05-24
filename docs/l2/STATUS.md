@@ -1,36 +1,47 @@
 # L2 status — 2026-05-24
 
-Snapshot of the L2 (Ethernet + ARP) layer's state at the close
-of the fail-path coverage push. Reference document for "what
-does L2 cover today?" — updated when L2 scope changes
-materially, not on every commit.
+Snapshot of the L2 (Ethernet + ARP) layer's state. Reference
+document for "what does L2 cover today?" — updated when L2
+scope changes materially.
 
-## Bottom line
+## Bottom line (revised 2026-05-24 per DECISIONS.md D068)
 
-**L2 RX side is substantively complete.** Every spec row in
-`REQUIREMENTS.md` §1 that doesn't depend on infrastructure we
-don't have yet (TX API, virtio FCS offload negotiation,
-control queue) is implemented in `arch/{x86_64,aarch64}/l2/
-dispatcher.S` and covered by either integration tests
-(`tooling/tests/integration/`) or build-time assertions or
-fail-path stub tests.
+**L2's RX-side defensive validation is at production-bar
+quality.** Size bounds, MAC filter, src MAC unicast, PAUSE
+silent discard, ARP responder, FSA-4 reentrance, gate-order
+invariants, fail-path defensive checks (bad_id, num_bufs,
+hdr_flags, TX bad_id), virtio feature negotiation policy —
+all explicit, all tested.
 
-**L2 TX side is design-only.** `docs/l2/TX_API.md` captures
-the Vyukov MPSC ring + buffer-pool design chosen 2026-05-23;
-implementation is deferred until L3 lands as the first real
-consumer. Per-layer pieces of the design (ARP responder
-through-queue migration, ETH-012/013 outgoing-padding tests)
-ride along with the implementation pass.
+**L2 as a complete layer is roughly 30% built.** The RX-side
+validation above is the part that's done. The send side, the
+upper-layer interface, and operational visibility are missing:
 
-**Layer is ready to be a stable foundation for L3.** The
-contract L3 will consume — a real `l2_tx_enqueue` API and the
-shape of the dispatcher's bounded transitions — is captured in
-the TX_API doc. The L2 RX path is hardened enough that L3
-code reading from L2 won't encounter "did the dispatcher
-handle malformed frame X" questions; every malformed frame
-class either gates out (drop with marker) or is type-system-
-unrepresentable (fail-path defensive checks plus their
-fail-path stub tests).
+  - **TX API** — no producer-facing send interface
+    (`docs/l2/TX_API.md` has the design; not yet built)
+  - **L3-callable receive surface** — dispatcher emits
+    serial markers but doesn't hand inbound frames to a
+    registered upper-layer consumer
+  - **ARP initiator + cache** — we REPLY to ARP requests
+    but can't SEND them; no cache state machine
+  - **Statistics counters** — qualitative markers only; no
+    RX/TX bytes/frames/drops/errors for ops visibility
+  - **Link state monitoring** — `VIRTIO_NET_F_STATUS`
+    rejected in feature policy; we assume link is up
+
+Plus the scope-specific items (VLAN, jumbo, IGMP/MLD,
+hardware offloads, multi-core dispatch) — these are real
+production-L2 features but their absence doesn't block L3
+boot-up or basic two-way traffic.
+
+**Critical-not-deferrable** for any real two-way traffic
+support: TX API, L3-callable receive surface, ARP initiator
++ cache.
+
+This document previously claimed L2 was "ready to be a stable
+foundation for L3." That claim was wrong — see D068. The work
+that LANDED is solid; the layer that REMAINS to build is
+substantial.
 
 ## Coverage map vs REQUIREMENTS.md §1 (Ethernet framing)
 
@@ -75,12 +86,12 @@ fail-path stub tests).
 
 ## Test inventory
 
-27 integration tests, ~14 s suite runtime on x86_64 laptop:
+28 integration tests, ~14 s suite runtime on x86_64 laptop:
 
 ```
 $ pytest tooling/tests/integration/ -q
-...........................                                              [100%]
-27 passed in 14.14s
+............................                                             [100%]
+28 passed in 14.06s
 ```
 
 Files (all under `tooling/tests/integration/`):
@@ -90,7 +101,7 @@ Files (all under `tooling/tests/integration/`):
 - `test_eth_pause_drop.py` — 1 case (ETH-018)
 - `test_eth_size_bounds.py` — 4 cases (ETH-003/004/010/011)
 - `test_eth_src_mac.py` — 2 cases (ETH-015 + positive companion)
-- `test_l2_fail_paths.py` — 3 cases (BAD_ID, NUM_BUFS, TX_BAD_ID; x86_64)
+- `test_l2_fail_paths.py` — 4 cases (BAD_ID, NUM_BUFS, HDR_FLAGS, TX_BAD_ID; x86_64)
 - `test_l2_gate_order.py` — 10 cases (PICT-style)
 - `test_rx_budget_reentrance.py` — 1 case (FSA-4)
 
@@ -103,6 +114,89 @@ Plus the Pi-side tracer scripts:
 
 Both run from `tooling/hooks/pre_push.sh` on every push (SKIP
 cleanly when the Pi isn't reachable).
+
+## What's deliberately deferred — RCA prior-knowledge record
+
+Per Ed's 2026-05-24 RCA-discipline directive ("if we hit any
+L2 issues while working on L3, I want a root-cause analysis
+why the issue was not discovered now"), this section
+exhaustively names every category of L2 issue that we KNOW
+we could be missing today. Future RCAs traceable to one of
+these categories should not surprise anyone — they were
+listed as known gaps at this milestone.
+
+### Categories of bug we are explicitly NOT testing for
+
+  - **Fuzz / random-bytes RX**: every integration test
+    sends a hand-crafted frame with controlled bytes. We
+    have not run sustained random / structured-fuzz input
+    against the dispatcher. A regression in input handling
+    that's not on our test enumeration would surface only
+    on real traffic.
+
+  - **Adversarial multi-frame interleaving**: tests inject
+    sequences of similar frames (e.g., 30-frame burst, or
+    different scenarios via fresh boots). We have not
+    tested interleaved bad + good + bad in a single burst.
+    A race or state-leak between consume-loop iterations
+    where the dispatcher's per-frame state isn't fully
+    isolated would surface only on mixed traffic.
+
+  - **Sustained traffic / soak**: tests boot, send a
+    handful of frames, exit. We have not run hours of
+    moderate-rate traffic to surface long-tail bugs
+    (counter wrap, log buffer fill, accumulator drift,
+    etc.). The 30-frame burst test in
+    `test_rx_budget_reentrance.py` is the closest we have.
+
+### Trust assumptions that could break
+
+  - **UART jam → silent failure**. `emit_bytes` returns
+    `CF=1` (x86) or never returns (aarch64 hang in
+    THRE-poll loop) on UART timeout. No caller checks the
+    return; no marker fires; no stats counter increments.
+    Firecracker's emulated 8250 doesn't jam under normal
+    conditions, so this trust assumption holds in our
+    deployment — but it's NOT a graceful degradation
+    story.
+
+  - **virtio device contract**. Beyond the defensive
+    checks the dispatcher does explicitly (id range,
+    num_buffers=1, hdr flags+gso_type=0, frame size in
+    [72, 1530]), we trust the device's data. A device
+    that wrote past the buffer boundary, set
+    flags/csum/hash fields we don't check, or violated
+    the AvailRing/UsedRing protocol would have undefined
+    behavior in our handling.
+
+  - **AAPCS64 callee-saved discipline**. The aarch64
+    dispatcher relies on `emit_bytes` / `emit_hex32`
+    preserving the documented register set. The Pi
+    bring-up of the failpath stub surfaced one case where
+    that contract was easy to violate (x0 = UART_BASE
+    clobbered by `mov w0, #1` in `.Lfail`); the
+    `emit_bytes` self-load fix (task #44) closes the
+    foot-gun for that one register, but the broader
+    "every caller must understand emit_*'s
+    preserve/clobber contract" is human-discipline.
+
+  - **Single-caller invariant**. `l2_dispatch` assumes
+    one caller at a time on one core. Multi-core wake
+    (post-D066-step-6+) without per-core dispatch
+    discipline would have undefined behavior.
+
+### Features rejected in feature negotiation we'd need to
+### re-open for full production
+
+`VIRTIO_NET_F_*` bits we explicitly reject today are listed
+in `arch/{x86_64,aarch64}/platform/firecracker/boot.S`'s
+feature-negotiation-policy comment block. If a future
+deployment needs any of them — CSUM, GSO, MQ, STATUS, MAC
+config-space read, CTRL_VQ, etc. — re-opening the policy
+means re-running the negotiation testing AND adding the
+corresponding consuming code. The current policy is
+correct for our scope; expanding it is a real
+architectural change.
 
 ## What's out of scope today
 
@@ -162,23 +256,46 @@ features that need them.
 
 ## What's next
 
-Per the 2026-05-24 working order, the queue from here is:
+Per the 2026-05-24 working order (after Ed's "most of the
+deferred work completed" directive), the queue is:
 
-1. **TX API implementation** when L3 is ready to consume.
-   `docs/l2/TX_API.md` is the design spec.
-2. **L3 (IPv4)** scope discussion + implementation. Will
-   consume the TX API; will revisit the ARP cache as a
-   real downstream consumer.
+1. ~~aarch64 emit_bytes self-load~~ ✅ done (task #44,
+   commit 460dc2f)
+2. ~~virtio_net_hdr defensive check~~ ✅ done (task #45,
+   commit add9df4 — adds RX:FAIL hdr_flags fail-path)
+3. ~~STATUS.md fuzz/UART notes + honest D068 reframe~~
+   ✅ done (this commit + DECISIONS.md D068)
+4. **TX API implementation** per `docs/l2/TX_API.md` —
+   biggest single item, unblocks everything after
+5. **L3-callable receive surface** — dispatcher hands
+   inbound frames + metadata to a registered consumer
+6. **ARP cache + initiator** — outbound ARP, enables
+   outbound IP traffic to non-cached peers
+7. **Statistics / counters** — per-class drop counts, RX/TX
+   bytes+frames, error categories
+8. **Link state monitoring** — accept `VIRTIO_NET_F_STATUS`,
+   read config-space link bit
+9. **Hardware offloads** — start with `VIRTIO_NET_F_GUEST_CSUM`
+   (RX checksum), then `F_CSUM` (TX). GSO/MQ are bigger
+   architectural lifts.
+10. **VLAN tagging** — protocol extension on RX + TX
+11. **Jumbo frames** — parameterize size bounds,
+    `VIRTIO_NET_F_MTU`
+12. **IGMP/MLD multicast subscription** — joined-group state
+13. **Multi-core dispatch + RSS** — biggest lift; intersects
+    with D058 actor model
 
-Things deliberately not next:
+Items 4-6 are the "make this a real L2 layer" chunk that
+turns the milestone claim from honest-30% to honest-substantively-
+complete.
 
-- More L2 RX hardening for its own sake. The coverage map
-  above is complete enough that additional rows would be
-  marginal vs. moving up a layer.
-- aarch64-specific dispatcher work without a forcing
-  function. The cross-arch parity is good enough that
-  feature work should land on both arches in one commit
-  going forward.
+Items 7-9 are core operational + correctness for production
+deployment.
+
+Items 10-12 are scope-specific (deployment-dependent).
+
+Item 13 is architectural and likely depends on the multi-
+core wake from D066 step 6+.
 
 ## See also
 

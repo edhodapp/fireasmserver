@@ -4453,6 +4453,19 @@ schema, so the data-model claims could no longer drift unnoticed.
 
 ### D067: L2 RX side substantively complete — close milestone, freeze contract for L3
 
+**DEPRECATED 2026-05-24 21:30 UTC — superseded by D068.** The
+title and bottom-line framing here overclaim: only L2's RX-side
+defensive validation is at production-bar; the layer as a
+whole is roughly 30% built. The deferred items below were
+correctly listed but framed as "out of scope today" niceties
+rather than core L2 functionality. TX API, L3-callable receive
+surface, and ARP cache/initiator are CRITICAL gaps, not
+deferrals. D068 reframes honestly without changing the
+underlying RX-side validation work this entry records. Body
+preserved below for traceability.
+
+---
+
 **Requirements:** N/A — this is a milestone-closure decision,
 not a requirements implementation. It RECORDS the state of
 REQUIREMENTS.md §1 (Ethernet framing) and §3 (ARP) row-by-row
@@ -4574,6 +4587,143 @@ implicitly forbade (e.g., a different RX gate ordering, a
 different fail-path response, a different marker shape),
 that's a superseding-D067 case. Don't silently revise;
 write a new DECISIONS entry that names what changed and why.
+
+### D068: L2 RX-side defensive validation complete; L2 layer is ~30% built — honest milestone framing
+
+**Supersedes:** D067 (deprecated 2026-05-24 21:30 UTC). D067
+titled the milestone "L2 RX side substantively complete" and
+its bottom-line in `docs/l2/STATUS.md` said L2 was "ready to
+be a stable foundation for L3" — both overclaim. The deferred
+items D067 listed were correctly enumerated but framed as
+"out of scope today" rather than what several of them
+actually are: critical missing pieces of a real L2 layer.
+D068 corrects the framing without changing the RX-side
+validation work D067 records.
+
+**Requirements:** N/A (milestone framing, same scope as D067).
+
+---
+
+**What's actually true.**
+
+The L2 dispatcher's **receive-side defensive validation** is
+hardened to production-bar quality. Size bounds, dst MAC
+filter, src MAC unicast check, PAUSE-frame silent discard,
+ARP request-to-our-IP responder, FSA-4 reentrance, dispatcher
+gate-order invariants, RX bad_id / num_bufs / TX bad_id
+fail-paths, virtio_net_hdr flags + gso_type defensive check
+— all explicit, all tested, all covered on both arches via
+either pytest+Firecracker (x86_64) or the Pi-side runner
+(aarch64).
+
+That's a real and useful achievement. It is NOT a complete
+L2 layer.
+
+---
+
+**What's MISSING and why it's critical-not-deferral.**
+
+  - **TX API**: there is no producer-facing send interface.
+    The dispatcher emits a hardcoded canary frame and ARP
+    replies; nothing else can be transmitted. An L2 layer
+    that can RECEIVE but not SEND is half a layer. Design
+    captured in `docs/l2/TX_API.md`; build pending.
+
+  - **L3-callable receive surface**: the dispatcher emits
+    serial markers for received frames but doesn't HAND
+    inbound frames + metadata (src MAC, ethertype, payload
+    pointer) to any registered upper-layer consumer. Even if
+    TX existed, there's no path for an L3 layer to learn
+    from the inbound packet what dst MAC to send a reply to.
+    Without this and the TX API, no two-way protocol can
+    operate over L2.
+
+  - **ARP initiator + cache state machine**: the dispatcher
+    REPLIES to ARP requests but doesn't SEND them. Any L3
+    outbound to a peer whose MAC isn't already known
+    requires ARP-request + reply-cache + retry-on-timeout —
+    none of which exists. ARP-005..008 from `REQUIREMENTS.md`
+    cover the cache; we have neither the requester nor the
+    cache.
+
+**What's MISSING and is genuinely scope-specific.**
+
+  - **Statistics / counters** (operational, not correctness)
+  - **Link state monitoring** (`VIRTIO_NET_F_STATUS`,
+    operational)
+  - **Hardware offloads** (TSO/GRO/CSUM/MQ; performance,
+    not correctness)
+  - **VLAN tagging** (no multi-tenant scope today)
+  - **Jumbo frames** (no large-MTU scope today)
+  - **IGMP/MLD joined-group filtering** (accept-all-
+    multicast works correctly, just wasteful)
+  - **Multi-core dispatch + RSS** (single-vCPU deployment)
+
+These are real production-L2 features for specific
+deployments. None of them block L3 boot-up or basic two-way
+traffic.
+
+---
+
+**Why this matters for accountability.**
+
+The framing in D067 + the initial `docs/l2/STATUS.md` would
+have let a future RCA correctly say: "the milestone
+documentation claimed RX side was complete and ready for L3;
+the actual completeness was 'RX validation done, no send
+path.' If a TX bug or an L3-integration bug surfaces during
+L3 work, the prior documentation set false expectations
+about what was solid."
+
+D068 + the STATUS.md update for this decision set the bar
+honestly. Future RCAs traceable to "we mis-scoped the
+milestone" stop here.
+
+---
+
+**What this decision does NOT undo.**
+
+The actual RX-side work that landed under D067 is still
+correct and still complete. The dispatcher code, the 28
+integration tests, the 4 fail-path scenarios, the PICT
+gate-order verification, the FSA-4 reentrance proof — all
+unchanged. D068 fixes the SHAPE of the milestone claim,
+not the WORK.
+
+---
+
+**Production-bar criteria explicitly NOT met today.**
+
+If "production L2" means "a network layer that can support
+a real HTTP server in a Firecracker microVM," we need at
+minimum:
+
+  1. TX API (per `docs/l2/TX_API.md`)
+  2. L3-callable receive surface
+  3. ARP initiator + cache
+  4. Statistics counters (for operational visibility)
+
+If "production L2" additionally means "stable foundation
+for arbitrary L3 + service deployment," add:
+
+  5. Link state monitoring
+  6. Hardware offloads (start with CSUM)
+  7. VLAN, jumbo, IGMP/MLD, multi-core — as scope demands
+
+The 2026-05-24 working order (recorded in the next
+sequence of commits) ranks items 1-7 in roughly that
+priority order.
+
+---
+
+**Forward-pointer for the next milestone-closure.**
+
+The "L2 substantively complete" claim becomes accurate
+when items 1-3 above are implemented + tested. Statistics
+(4) is the natural next operational layer. Items 5-7
+are stretch goals whose timing depends on what L3 and
+operational deployment actually need. A future DECISIONS
+entry will close that milestone when reached.
 
 ## Future decisions (not yet made)
 - virtio-net driver design
