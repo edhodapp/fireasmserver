@@ -11,23 +11,34 @@ Approach (chosen 2026-05-24): a "guest-side stub" — a
 separate guest binary built from
 `arch/x86_64/platform/failpath/boot.S` that links the
 production dispatcher.o unchanged, but skips real virtio init
-and instead writes a malformed used-ring entry directly into
-the VIRTQ memreq region BEFORE calling l2_dispatch. The
-dispatcher reads the malformed value, hits the fail path,
-emits the expected RX:FAIL marker, and returns nonzero. The
-stub catches the nonzero return and emits
-`FAILPATH:DONE rc=<hex>` before halting.
+and instead writes a malformed used-ring entry (or buffer
+header) directly into memreq-allocated memory BEFORE calling
+l2_dispatch. The dispatcher reads the malformed value, hits
+the fail path, emits the standard RX:FAIL / TX:FAIL marker,
+and returns nonzero. The stub catches the nonzero return and
+emits `FAILPATH:DONE rc=<hex>` before halting.
 
 Alternative considered and rejected: a Python `vhost-user-net`
 backend running under QEMU, which would have meant migrating
 the entire L2 harness off Firecracker. See task #40 + the
 2026-05-24 discussion for the cost/benefit analysis.
 
-Current coverage: scenario BAD_ID only (RX bad_id fail path).
-The stub source supports `%ifdef FAILPATH_SCENARIO_<NAME>`
-sentinels so adding num_bufs and tx_bad_id is mostly a matter
-of dropping in new memory-pre-population blocks and new test
-cases here.
+Coverage in this file (one test per scenario, all
+parametrised on the same fixture):
+
+  BAD_ID    — RX UsedRing.ring[0].id = 0x100, expect
+              `RX:FAIL bad_id=00000100`.
+  NUM_BUFS  — RX buffer's virtio_net_hdr.num_buffers = 2,
+              expect `RX:FAIL num_bufs=00000002`. Buffer dst
+              MAC = GUEST_MAC and src is unicast and
+              EtherType is non-PAUSE so the dispatcher
+              reaches the num_buffers check (it lives AFTER
+              the dst/src/PAUSE gates).
+  TX_BAD_ID — valid RX completes through the full RX:FRAME
+              path, then the pre-populated TX UsedRing's
+              ring[0].id = 0x100 trips the TX bad_id check.
+              Markers in order: RX:FRAME, RX:RETURNED,
+              TX:SUBMITTED, TX:FAIL bad_id=00000100.
 """
 
 from __future__ import annotations
@@ -35,6 +46,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from contextlib import ExitStack
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -54,36 +66,95 @@ FAILPATH_BUILD_DIR = (
 FAILPATH_ARCH_DIR = REPO_ROOT / "arch" / "x86_64"
 
 MARKER_TIMEOUT_SECONDS = 3.0
-"""Generous upper bound on how long the dispatcher takes from
-boot to its FAILPATH:DONE marker. The boot path is ~100-150 ms,
-init_memory_layout + queue-fill is sub-millisecond, and the
-fail-path emit chain is microseconds. 3 s absorbs any host
-load."""
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """One fail-path scenario.
+
+    scenario_name maps to the NASM `-DFAILPATH_SCENARIO_<NAME>=1`
+    selector in the stub. expected_fail_marker is the dispatcher's
+    fail-marker substring we assert on (the dispatcher emits hex
+    in upper-case 8-digit form via emit_hex32). The required and
+    forbidden lists let each scenario assert ordered intermediate
+    markers + negatives (e.g., TX_BAD_ID must see RX:FRAME first;
+    BAD_ID must NOT see RX:FRAME).
+    """
+
+    scenario_name: str
+    expected_fail_marker: str
+    required_markers: tuple[str, ...]
+    forbidden_markers: tuple[str, ...]
+
+
+SCENARIOS: tuple[Scenario, ...] = (
+    Scenario(
+        scenario_name="BAD_ID",
+        expected_fail_marker="RX:FAIL bad_id=00000100",
+        required_markers=("READY", "FAILPATH:BOOT",
+                          "RX:FAIL bad_id=00000100",
+                          "FAILPATH:DONE rc=00000001"),
+        # bad_id gate fires before per-frame processing, so the
+        # normal RX:FRAME emit (which lives after) must NOT have
+        # run.
+        forbidden_markers=("RX:FRAME", "TX:SUBMITTED"),
+    ),
+    Scenario(
+        scenario_name="NUM_BUFS",
+        expected_fail_marker="RX:FAIL num_bufs=00000002",
+        required_markers=("READY", "FAILPATH:BOOT",
+                          "RX:FAIL num_bufs=00000002",
+                          "FAILPATH:DONE rc=00000001"),
+        # num_bufs gate fires before RX:FRAME emit. Same as
+        # BAD_ID — no RX:FRAME, no TX phase.
+        forbidden_markers=("RX:FRAME", "TX:SUBMITTED"),
+    ),
+    Scenario(
+        scenario_name="TX_BAD_ID",
+        expected_fail_marker="TX:FAIL bad_id=00000100",
+        required_markers=("READY", "FAILPATH:BOOT",
+                          "RX:FRAME",            # valid RX must complete
+                          "RX:RETURNED",         # RX recycle ran
+                          "TX:SUBMITTED",        # TX submit ran
+                          "TX:FAIL bad_id=00000100",
+                          "FAILPATH:DONE rc=00000001"),
+        # TX bad_id is the LAST marker before the fail return —
+        # no specific forbidden marker beyond "no completed
+        # TX:RECLAIMED."
+        forbidden_markers=("TX:RECLAIMED",),
+    ),
+)
 
 
 @pytest.fixture(scope="session")
-def failpath_guest_elf() -> Path:
-    """Build (if needed) the x86_64 failpath stub guest.
+def failpath_artifact_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Shared root for per-scenario failpath build artifacts.
 
-    Session-scoped so the build runs once per pytest invocation
-    even if multiple fail-path scenarios get added. Each
-    scenario today produces the SAME binary (only BAD_ID is
-    implemented); when num_bufs / tx_bad_id scenarios land,
-    each will need its own build and this fixture will
-    parametrise on the scenario name.
+    Each scenario gets its own subdirectory so pytest's
+    auto-cleanup keeps them separate but our build itself
+    overwrites arch/x86_64/build/failpath/ — that's fine
+    because we sequence scenarios serially and copy each
+    built ELF out to the per-scenario subdir.
     """
-    if not has_firecracker_binary():
-        pytest.skip(
-            "firecracker binary not found on PATH — install per "
-            "tooling/tracer_bullet/run_local.sh expectations"
-        )
-    if not shutil.which("nasm"):
-        pytest.skip("nasm not installed; cannot build failpath stub")
-    # The Makefile rebuilds incrementally; just invoke it and
-    # surface its output on failure.
+    return tmp_path_factory.mktemp("failpath_builds")
+
+
+def _build_scenario(scenario_name: str,
+                    out_dir: Path) -> Path:
+    """Build the failpath stub for the named scenario, copy the
+    ELF into `out_dir`, and return the copied ELF path.
+
+    Cleans the build dir first so the previous scenario's
+    objects don't conflict — the source includes a single
+    %ifdef block per scenario, and a stale .o would still
+    contain a different scenario's code.
+    """
+    build_dir = FAILPATH_BUILD_DIR
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
     result = subprocess.run(
         ["make", "-C", str(FAILPATH_ARCH_DIR),
-         "PLATFORM=failpath", "SCENARIO=BAD_ID"],
+         "PLATFORM=failpath", f"SCENARIO={scenario_name}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         check=False,
@@ -91,41 +162,58 @@ def failpath_guest_elf() -> Path:
     )
     if result.returncode != 0:
         pytest.fail(
-            "failpath stub build failed:\n"
-            f"{result.stdout}"
+            f"failpath stub build (SCENARIO={scenario_name}) "
+            f"failed:\n{result.stdout}"
         )
-    elf = FAILPATH_BUILD_DIR / "guest.elf"
-    if not elf.exists():
+    src_elf = build_dir / "guest.elf"
+    if not src_elf.exists():
         pytest.fail(
-            f"failpath build returned 0 but {elf} doesn't exist"
+            f"failpath build for {scenario_name} returned 0 "
+            f"but {src_elf} doesn't exist"
         )
-    return elf
+    dst_elf = out_dir / f"guest_{scenario_name}.elf"
+    shutil.copy(src_elf, dst_elf)
+    return dst_elf
 
 
-def test_rx_bad_id_fail_path(
-    failpath_guest_elf: Path,    # pylint: disable=redefined-outer-name
+@pytest.fixture(scope="session")
+def scenario_elfs(
+    failpath_artifact_root: Path,    # pylint: disable=redefined-outer-name
+) -> dict[str, Path]:
+    """Build every scenario once per pytest invocation.
+
+    Session-scoped to amortise NASM + ld over the suite.
+    Returns a dict mapping scenario_name → ELF path for
+    test_fail_path to look up by case.
+    """
+    if not has_firecracker_binary():
+        pytest.skip("firecracker binary not found on PATH")
+    if not shutil.which("nasm"):
+        pytest.skip("nasm not installed; cannot build failpath stub")
+    elfs: dict[str, Path] = {}
+    for sc in SCENARIOS:
+        elfs[sc.scenario_name] = _build_scenario(
+            sc.scenario_name, failpath_artifact_root,
+        )
+    return elfs
+
+
+@pytest.mark.parametrize(
+    "scenario", SCENARIOS,
+    ids=lambda sc: sc.scenario_name.lower(),
+)
+def test_fail_path(
+    scenario: Scenario,
+    scenario_elfs: dict[str, Path],    # pylint: disable=redefined-outer-name
     artifact_dir: Path,
     tap_iface: str,    # pylint: disable=redefined-outer-name
 ) -> None:
-    """RX UsedRing entry with id >= VIRTQ_MAX_SIZE triggers
-    `.l2_rx_bad_id_fail`; dispatcher emits the bad_id marker
-    and returns rc=1.
-
-    Expected marker chain (in order):
-      1. READY               — PVH prologue executed
-      2. FAILPATH:BOOT       — kernel_main_64 reached, alloc + kstack ok
-      3. RX:FAIL bad_id=00000100 — dispatcher's bad_id check fired
-                                   (0x100 == 256, the malformed id
-                                   the stub wrote into ring[0].id)
-      4. FAILPATH:DONE rc=00000001 — dispatcher returned 1 (fail);
-                                     stub caught the return value
-
-    Negative assertion: no RX:FRAME marker — the bad_id check
-    fires BEFORE any RX:FRAME emit; if RX:FRAME also appears,
-    the dispatcher continued past the fail point (regression).
+    """Boot the per-scenario failpath stub and assert its marker
+    chain. The expected sequence is in `scenario.required_markers`;
+    the gate-skipping invariants are in `scenario.forbidden_markers`.
     """
     cfg = FirecrackerConfig(
-        kernel_image_path=failpath_guest_elf,
+        kernel_image_path=scenario_elfs[scenario.scenario_name],
         artifact_dir=artifact_dir,
         tap_iface=tap_iface,
     )
@@ -133,36 +221,31 @@ def test_rx_bad_id_fail_path(
         guest = stack.enter_context(launched_guest(cfg))
         serial_log = SerialLog(guest.serial_log_path)
 
-        # Wait for the terminal marker — covers the whole chain
-        # because FAILPATH:DONE only fires after every earlier
-        # step.
+        # Wait for the terminal marker — implies every earlier
+        # required marker is already in the log.
         serial_log.assert_marker_observed(
             "FAILPATH:DONE rc=00000001",
             timeout=MARKER_TIMEOUT_SECONDS,
         )
 
-        # Earlier markers should already be in the log by now.
         full = serial_log.text()
-        for marker in ("READY", "FAILPATH:BOOT",
-                       "RX:FAIL bad_id=00000100"):
+        for marker in scenario.required_markers:
             if marker not in full:
                 raise AssertionError(
-                    f"failpath BAD_ID: expected marker "
-                    f"{marker!r} missing from serial log\n"
+                    f"failpath {scenario.scenario_name}: required "
+                    f"marker {marker!r} missing from serial log\n"
                     f"--- serial log ({guest.serial_log_path}) ---\n"
                     f"{full}\n"
                     "--- end ---"
                 )
 
-        # Negative: dispatcher must NOT emit RX:FRAME — the
-        # bad_id gate fires before per-frame processing reaches
-        # RX:FRAME's emit chain. If RX:FRAME shows up, the
-        # gate didn't actually short-circuit.
-        if "RX:FRAME" in full:
+        leaked = [
+            f for f in scenario.forbidden_markers if f in full
+        ]
+        if leaked:
             raise AssertionError(
-                "failpath BAD_ID: dispatcher emitted RX:FRAME "
-                "despite the bad_id gate — gate didn't "
-                "short-circuit the consume body.\n"
+                f"failpath {scenario.scenario_name}: forbidden "
+                f"markers leaked through gate: {leaked!r}\n"
                 f"--- serial log ({guest.serial_log_path}) ---\n"
                 f"{full}\n"
                 "--- end ---"

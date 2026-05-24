@@ -42,14 +42,33 @@
 ; aarch64 mirror, etc.) the refactor becomes worth doing —
 ; track at that point.
 ;
-; Currently supported scenarios (selected at assemble time via
-; -DFAILPATH_SCENARIO_<NAME>=1; one and only one must be set):
-;   BAD_ID — RX used-ring entry has id >= VIRTQ_MAX_SIZE.
-;            Expected marker: "RX:FAIL bad_id=00000100".
+; Supported scenarios (selected at assemble time via
+; -DFAILPATH_SCENARIO_<NAME>=1; exactly one must be set):
+;   BAD_ID    — RX used-ring entry has id >= VIRTQ_MAX_SIZE.
+;               Expected marker: "RX:FAIL bad_id=00000100".
+;   NUM_BUFS  — RX frame's virtio_net_hdr.num_buffers != 1.
+;               Expected marker: "RX:FAIL num_bufs=00000002".
+;   TX_BAD_ID — valid RX completes, then TX UsedRing entry
+;               has id >= VIRTQ_MAX_SIZE.
+;               Expected marker: "TX:FAIL bad_id=00000100"
+;               (after the dispatcher's RX:FRAME + TX:SUBMITTED
+;               markers for the valid RX side).
 
 ; --- Sanity: exactly one scenario must be defined ---
-%ifndef FAILPATH_SCENARIO_BAD_ID
-%error "FAILPATH_SCENARIO_BAD_ID is the only scenario currently implemented; assemble with -DFAILPATH_SCENARIO_BAD_ID=1"
+; NASM's %assign supports incrementing on a self-reference; the
+; %ifdef chain below bumps the counter once per defined scenario.
+%assign FAILPATH_SCENARIO_COUNT 0
+%ifdef FAILPATH_SCENARIO_BAD_ID
+%assign FAILPATH_SCENARIO_COUNT FAILPATH_SCENARIO_COUNT + 1
+%endif
+%ifdef FAILPATH_SCENARIO_NUM_BUFS
+%assign FAILPATH_SCENARIO_COUNT FAILPATH_SCENARIO_COUNT + 1
+%endif
+%ifdef FAILPATH_SCENARIO_TX_BAD_ID
+%assign FAILPATH_SCENARIO_COUNT FAILPATH_SCENARIO_COUNT + 1
+%endif
+%if FAILPATH_SCENARIO_COUNT != 1
+%error "Exactly one of FAILPATH_SCENARIO_{BAD_ID,NUM_BUFS,TX_BAD_ID} must be defined via -D"
 %endif
 
 ; ----- Constants (duplicated from production firecracker boot.S) -----
@@ -67,15 +86,36 @@ VIRTQ_OFF_DESC           equ 0x0000
 VIRTQ_OFF_AVAIL          equ 0x1000
 VIRTQ_OFF_USED           equ 0x2000
 VIRTQ_MAX_SIZE           equ 0x100
+TX_QUEUE_OFF             equ 1 * VIRTQ_STRIDE
 
-; The malformed value the scenario injects (id = 0x100 == 256,
-; one past the valid range). Chosen as an even round number that
-; reads cleanly in the marker hex.
+; The malformed value the BAD_ID + TX_BAD_ID scenarios inject
+; (id = 0x100 == 256, one past the valid range). Even round
+; number that reads cleanly in the marker hex.
 SCENARIO_BAD_ID_VALUE    equ 0x100
+
+; The malformed value NUM_BUFS injects into virtio_net_hdr at
+; buffer offset 10. Anything != 1 fails the dispatcher's check.
+SCENARIO_NUM_BUFS_VALUE  equ 2
+
+; GUEST_MAC bytes — duplicated from arch/x86_64/l2/dispatcher.S.
+; Used by NUM_BUFS and TX_BAD_ID scenarios to construct a buffer
+; whose dst MAC passes the MAC filter so the dispatcher reaches
+; the per-frame header read (num_bufs) or proceeds to the TX
+; phase. Stays in sync with dispatcher.S by code review — this
+; is test-stub code and the values are stable (project ETH-016
+; convention).
+FP_GUEST_MAC_BYTE_0      equ 0x02
+FP_GUEST_MAC_BYTE_1      equ 0x00
+FP_GUEST_MAC_BYTE_2      equ 0x00
+FP_GUEST_MAC_BYTE_3      equ 0x00
+FP_GUEST_MAC_BYTE_4      equ 0x00
+FP_GUEST_MAC_BYTE_5      equ 0x01
 
 extern mode_switch_to_long_mode
 extern init_memory_layout
 extern l2_dispatch
+; __memreq_addr__rx_buffer comes from memreq_records.inc (included
+; below) — local to this object, not an extern.
 
 ; ----- PVH ELF note -----
 
@@ -188,6 +228,95 @@ kernel_main_64:
     mov word  [r15 + VIRTQ_OFF_USED + 2], 1
     mov dword [r15 + VIRTQ_OFF_USED + 4], SCENARIO_BAD_ID_VALUE
     mov dword [r15 + VIRTQ_OFF_USED + 8], 100
+%endif
+
+%ifdef FAILPATH_SCENARIO_NUM_BUFS
+    ; Same RX UsedRing setup as BAD_ID but with a VALID id, then
+    ; populate the buffer at id=0 such that the dispatcher's
+    ; num_buffers check fails.
+    ;
+    ; Order of gates the dispatcher applies before reaching the
+    ; num_bufs check (see arch/x86_64/l2/dispatcher.S):
+    ;   1. size bounds  (72 ≤ used_len ≤ 1530)         — len=100 ✓
+    ;   2. dst MAC filter (= GUEST_MAC or multicast)   — dst=GUEST_MAC
+    ;   3. src MAC unicast (byte 0 bit 0 = 0)          — src=02:..:42
+    ;   4. PAUSE EtherType (≠ 0x8808)                  — type=0x88B5
+    ;   5. num_buffers != 1 → .l2_rx_num_bufs_fail
+    ;
+    ; Buffer layout (offsets into rx_buffer[0]):
+    ;   +0  : virtio_net_hdr (12 B zero except num_buffers at +10)
+    ;   +12 : Ethernet header (dst MAC, src MAC, EtherType)
+    mov word  [r15 + VIRTQ_OFF_USED + 2], 1
+    mov dword [r15 + VIRTQ_OFF_USED + 4], 0            ; id = 0
+    mov dword [r15 + VIRTQ_OFF_USED + 8], 100          ; len = 100
+
+    mov rax, [rel __memreq_addr__rx_buffer]
+    ; Zero clear the first 32 bytes of the buffer for cleanliness.
+    mov qword [rax +  0], 0
+    mov qword [rax +  8], 0
+    mov qword [rax + 16], 0
+    mov qword [rax + 24], 0
+    ; virtio_net_hdr.num_buffers (u16 at offset 10) — the
+    ; malformed value the dispatcher's check fires on.
+    mov word  [rax + 10], SCENARIO_NUM_BUFS_VALUE
+    ; Ethernet dst MAC = GUEST_MAC (passes the dispatcher's MAC
+    ; filter via direct match).
+    mov byte  [rax + 12], FP_GUEST_MAC_BYTE_0
+    mov byte  [rax + 13], FP_GUEST_MAC_BYTE_1
+    mov byte  [rax + 14], FP_GUEST_MAC_BYTE_2
+    mov byte  [rax + 15], FP_GUEST_MAC_BYTE_3
+    mov byte  [rax + 16], FP_GUEST_MAC_BYTE_4
+    mov byte  [rax + 17], FP_GUEST_MAC_BYTE_5
+    ; Ethernet src MAC = 02:00:00:00:00:42 (unicast — passes
+    ; ETH-015's bit-0 check).
+    mov dword [rax + 18], 0x00000002                   ; bytes 0-3 LE
+    mov word  [rax + 22], 0x4200                       ; bytes 4-5 LE
+    ; EtherType 0x88B5 BE (local-experimental — bypasses PAUSE
+    ; and ARP gates, lands in the "generic frame" path that
+    ; ultimately reaches the num_bufs check).
+    mov byte  [rax + 24], 0x88
+    mov byte  [rax + 25], 0xB5
+%endif
+
+%ifdef FAILPATH_SCENARIO_TX_BAD_ID
+    ; The dispatcher's TX phase only runs after a successful RX
+    ; consume — RX:TIMEOUT skips TX entirely. So we need a valid
+    ; RX setup (frame passes every gate, exits via the normal
+    ; RX:FRAME path) PLUS a pre-populated TX UsedRing whose
+    ; ring[0].id is out of range. Setup is the union of the
+    ; valid-RX-frame from NUM_BUFS (with num_buffers=1 instead
+    ; of 2) and a TX UsedRing matching BAD_ID's shape on the
+    ; TX queue (at r15 + TX_QUEUE_OFF).
+
+    ; Valid RX completion in slot 0.
+    mov word  [r15 + VIRTQ_OFF_USED + 2], 1
+    mov dword [r15 + VIRTQ_OFF_USED + 4], 0            ; id = 0
+    mov dword [r15 + VIRTQ_OFF_USED + 8], 100          ; len = 100
+
+    mov rax, [rel __memreq_addr__rx_buffer]
+    mov qword [rax +  0], 0
+    mov qword [rax +  8], 0
+    mov qword [rax + 16], 0
+    mov qword [rax + 24], 0
+    mov word  [rax + 10], 1                            ; num_buffers = 1 ✓
+    mov byte  [rax + 12], FP_GUEST_MAC_BYTE_0
+    mov byte  [rax + 13], FP_GUEST_MAC_BYTE_1
+    mov byte  [rax + 14], FP_GUEST_MAC_BYTE_2
+    mov byte  [rax + 15], FP_GUEST_MAC_BYTE_3
+    mov byte  [rax + 16], FP_GUEST_MAC_BYTE_4
+    mov byte  [rax + 17], FP_GUEST_MAC_BYTE_5
+    mov dword [rax + 18], 0x00000002
+    mov word  [rax + 22], 0x4200
+    mov byte  [rax + 24], 0x88
+    mov byte  [rax + 25], 0xB5
+
+    ; TX UsedRing pre-populated with a malformed id. The
+    ; dispatcher's TX wait loop polls TX UsedRing.idx; once
+    ; it sees idx != tx_used_shadow (= 0 from l2_state's zero
+    ; init), it enters the reclaim body and reads ring[0].id.
+    mov word  [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 2], 1
+    mov dword [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 4], SCENARIO_BAD_ID_VALUE
+    mov dword [r15 + TX_QUEUE_OFF + VIRTQ_OFF_USED + 8], 72
 %endif
 
     mfence
