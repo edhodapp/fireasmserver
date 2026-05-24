@@ -23,6 +23,24 @@ HOST_DEFAULT_IP = "192.168.42.1"
 GUEST_DEFAULT_MAC = "02:00:00:00:00:01"
 GUEST_DEFAULT_IP = "192.168.42.2"
 
+VIRTIO_NET_HDR_LEN = 12
+"""Size of the per-frame virtio_net_hdr prepended on the RX side.
+
+Virtio 1.2 §5.1.6.1: the device places a fixed 12-byte
+virtio_net_hdr in front of each frame written into a driver
+buffer (when VIRTIO_NET_F_MRG_RXBUF is NOT negotiated — see
+the feature negotiation policy in arch/<arch>/platform/
+firecracker/boot.S). So the dispatcher's `used_len` field is
+always `wire_bytes + 12` for the inbound frame, and the
+RX:FRAME / RX:DROP markers' `used_len=<hex>` suffix uses this
+sum. Tests that assert on those markers compute the expected
+value as `len(frame) + VIRTIO_NET_HDR_LEN`.
+
+If we ever negotiate VIRTIO_NET_F_MRG_RXBUF (= num_buffers may
+exceed 1, header grows by 2 bytes), this constant changes
+along with the dispatcher's bound checks (cmp 72 / cmp 1530).
+"""
+
 ETH_MIN_FRAME_LEN = 60
 """Minimum Ethernet frame size on the wire (excluding FCS).
 

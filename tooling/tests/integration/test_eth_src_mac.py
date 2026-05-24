@@ -25,12 +25,20 @@ from scapy.packet import Packet
 from l2_harness import frames
 from l2_harness.capture import FrameSender, capturing
 from l2_harness.firecracker import FirecrackerGuest
-from l2_harness.frames import parse_arp_reply, raw_eth_frame
+from l2_harness.frames import (
+    VIRTIO_NET_HDR_LEN,
+    parse_arp_reply,
+    raw_eth_frame,
+)
 from l2_harness.serial import SerialLog
 
 
-CAPTURE_WINDOW_SECONDS = 1.5
+MARKER_TIMEOUT_SECONDS = 1.5
 POST_MARKER_QUIESCE_SECONDS = 0.3
+# Capture timeout MUST outlast (marker wait + quiescence) so a
+# late guest TX in that gap can't slip past the sniffer. See
+# test_eth_size_bounds.py for the longer rationale.
+CAPTURE_TIMEOUT_SECONDS = MARKER_TIMEOUT_SECONDS + POST_MARKER_QUIESCE_SECONDS
 
 MULTICAST_SRC_MAC = "03:00:00:00:00:42"
 """Multicast source MAC for the negative test.
@@ -88,19 +96,19 @@ def test_multicast_source_mac_dropped(
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
         serial_log.assert_marker_observed(
-            "RX:DROP src", timeout=CAPTURE_WINDOW_SECONDS,
+            "RX:DROP src", timeout=MARKER_TIMEOUT_SECONDS,
         )
         # The source-MAC check runs AFTER the dst MAC filter
         # (which passed: dst was GUEST_MAC) but BEFORE ARP
         # recognition — assert no ARP marker fired even though
         # the EtherType could in principle be ARP.
         serial_log.assert_marker_absent(
-            "ARP:REQUEST", window=0.0,
+            "ARP:REQUEST", window=POST_MARKER_QUIESCE_SECONDS,
         )
 
     _no_arp_reply_assert(
@@ -127,18 +135,18 @@ def test_unicast_source_mac_accepted(
         ethertype=0x88B5,
         payload=payload,
     )
-    expected_used_len = f"used_len={(len(frame) + 12):08X}"
+    expected_used_len = f"used_len={(len(frame) + VIRTIO_NET_HDR_LEN):08X}"
 
     captured_pcap = artifact_dir / "captured-eth015-ok.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
         serial_log.assert_marker_observed(
-            expected_used_len, timeout=CAPTURE_WINDOW_SECONDS,
+            expected_used_len, timeout=MARKER_TIMEOUT_SECONDS,
         )
         serial_log.assert_marker_absent(
             "RX:DROP src", window=POST_MARKER_QUIESCE_SECONDS,

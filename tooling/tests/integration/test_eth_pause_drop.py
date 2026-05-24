@@ -41,12 +41,22 @@ from scapy.packet import Packet
 from l2_harness import frames
 from l2_harness.capture import FrameSender, capturing
 from l2_harness.firecracker import FirecrackerGuest
-from l2_harness.frames import parse_arp_reply, raw_eth_frame
+from l2_harness.frames import (
+    VIRTIO_NET_HDR_LEN,
+    parse_arp_reply,
+    raw_eth_frame,
+)
 from l2_harness.serial import SerialLog
 
 
-CAPTURE_WINDOW_SECONDS = 1.5
+MARKER_TIMEOUT_SECONDS = 1.5
 POST_MARKER_QUIESCE_SECONDS = 0.3
+# Capture timeout MUST outlast (marker wait + quiescence) so a
+# late guest TX in that gap can't slip past the sniffer. See
+# test_eth_size_bounds.py for the longer rationale; AsyncSniffer
+# (task #34) means __exit__ no longer waits this out — the
+# constant only bounds the coverage window, not test runtime.
+CAPTURE_TIMEOUT_SECONDS = MARKER_TIMEOUT_SECONDS + POST_MARKER_QUIESCE_SECONDS
 
 MAC_CONTROL_DST_MAC = "01:80:c2:00:00:01"
 """IEEE 802.3 MAC Control multicast destination address.
@@ -107,26 +117,32 @@ def test_pause_frame_dropped(
     )
 
     captured_pcap = artifact_dir / "captured-eth018.pcap"
+    expected_used_len = (
+        f"used_len={(len(frame) + VIRTIO_NET_HDR_LEN):08X}"
+    )
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
         serial_log.assert_marker_observed(
-            "RX:DROP pause", timeout=CAPTURE_WINDOW_SECONDS,
+            "RX:DROP pause", timeout=MARKER_TIMEOUT_SECONDS,
         )
         # PAUSE drop runs BEFORE ARP recognition, so even if a
         # future bug somehow let a PAUSE frame through the
         # EtherType gate, ARP:REQUEST wouldn't fire (wrong
         # EtherType anyway). Belt-and-braces.
-        serial_log.assert_marker_absent("ARP:REQUEST", window=0.0)
-        # And the per-frame RX:FRAME emit must NOT happen — the
-        # virtio used_len for this frame is 60 + 12 = 72 = 0x48.
-        # If a future bug fell through to the RX:FRAME path,
-        # this assertion would catch the regression.
-        serial_log.assert_marker_absent("used_len=00000048", window=0.0)
+        serial_log.assert_marker_absent(
+            "ARP:REQUEST", window=POST_MARKER_QUIESCE_SECONDS,
+        )
+        # And the per-frame RX:FRAME emit must NOT happen — if a
+        # future bug fell through to the RX:FRAME path, the
+        # frame-specific used_len would show up in the log.
+        serial_log.assert_marker_absent(
+            expected_used_len, window=POST_MARKER_QUIESCE_SECONDS,
+        )
 
     _no_arp_reply_assert(
         list(cap.packets), captured_pcap, serial_log.text(), "ETH-018",

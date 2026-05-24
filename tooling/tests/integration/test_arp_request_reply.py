@@ -161,5 +161,7 @@ def test_arp_request_for_wrong_ip_gets_no_reply(
         )
     # Snapshot check on ARP:REPLY for completeness; the absence
     # check above already covered the same window via the
-    # window= parameter.
-    serial_log.assert_marker_absent("ARP:REPLY", window=0.0)
+    # window= parameter. Small non-zero quiescence catches any
+    # marker that lands in the serial-buffer gap between the
+    # prior absent-check return and this one.
+    serial_log.assert_marker_absent("ARP:REPLY", window=0.1)

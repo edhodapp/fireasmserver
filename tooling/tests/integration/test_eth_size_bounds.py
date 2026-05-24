@@ -32,7 +32,11 @@ from scapy.packet import Packet
 from l2_harness import frames
 from l2_harness.capture import FrameSender, capturing
 from l2_harness.firecracker import FirecrackerGuest
-from l2_harness.frames import parse_arp_reply, raw_eth_frame
+from l2_harness.frames import (
+    VIRTIO_NET_HDR_LEN,
+    parse_arp_reply,
+    raw_eth_frame,
+)
 from l2_harness.serial import SerialLog
 from l2_harness.tap0 import host_mtu_of
 
@@ -49,6 +53,15 @@ MARKER_TIMEOUT_SECONDS = 1.5
 # additional window catches a delayed second emit — e.g. if a
 # bogus duplicate landed and we want to know about it.
 POST_MARKER_QUIESCE_SECONDS = 0.3
+
+# Capture timeout MUST outlast (marker wait + quiescence) — if the
+# sniffer stops while the test body is still waiting for the
+# serial marker, any late guest TX in that gap (the case the
+# _no_arp_reply_assert helper guards against) lands after the
+# sniffer is gone and is silently missed. AsyncSniffer makes
+# __exit__ return as soon as we call .stop() so this is no longer
+# a runtime-cost issue, just a coverage one.
+CAPTURE_TIMEOUT_SECONDS = MARKER_TIMEOUT_SECONDS + POST_MARKER_QUIESCE_SECONDS
 
 MAX_FRAME_REQUIRED_MTU = 1700
 """Minimum tap0 MTU for ETH-004 / ETH-011 to actually send their frames.
@@ -73,7 +86,7 @@ def _virtio_used_len_hex(wire_bytes: int) -> str:
     representation of the virtio used_len, which is wire bytes
     plus the 12-byte virtio_net_hdr prepended by the device.
     """
-    return f"used_len={(wire_bytes + 12):08X}"
+    return f"used_len={(wire_bytes + VIRTIO_NET_HDR_LEN):08X}"
 
 
 def _no_arp_reply_assert(cap_packets: list[Packet],
@@ -130,7 +143,7 @@ def test_min_size_frame_accepted(
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
@@ -190,7 +203,7 @@ def test_max_size_frame_accepted(
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(frame)
@@ -231,14 +244,14 @@ def test_oversize_frame_dropped(
         payload=payload,
     )
     expected_drop = (
-        f"RX:DROP used_len={(len(oversize) + 12):08X}"
+        f"RX:DROP used_len={(len(oversize) + VIRTIO_NET_HDR_LEN):08X}"
     )
 
     captured_pcap = artifact_dir / "captured-eth011.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(oversize)
@@ -283,14 +296,14 @@ def test_runt_frame_dropped(
         payload=payload,
     )
     expected_drop = (
-        f"RX:DROP used_len={(len(runt) + 12):08X}"
+        f"RX:DROP used_len={(len(runt) + VIRTIO_NET_HDR_LEN):08X}"
     )
 
     captured_pcap = artifact_dir / "captured-eth010.pcap"
     with capturing(
         iface="tap0",
         bpf_filter="arp",
-        timeout=POST_MARKER_QUIESCE_SECONDS,
+        timeout=CAPTURE_TIMEOUT_SECONDS,
         pcap_path=captured_pcap,
     ) as cap:
         frame_sender.send(runt)

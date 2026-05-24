@@ -34,7 +34,11 @@ from scapy.packet import Packet
 from l2_harness import frames
 from l2_harness.capture import FrameSender, capturing
 from l2_harness.firecracker import FirecrackerGuest
-from l2_harness.frames import parse_arp_reply, raw_eth_frame
+from l2_harness.frames import (
+    VIRTIO_NET_HDR_LEN,
+    parse_arp_reply,
+    raw_eth_frame,
+)
 from l2_harness.serial import SerialLog
 
 
@@ -178,7 +182,7 @@ def test_unicast_to_wrong_mac_dropped(
         # here, but assert ARP:REQUEST absent as a belt-and-
         # braces check that the drop happened early.
         serial_log.assert_marker_absent(
-            "ARP:REQUEST", window=0.0,
+            "ARP:REQUEST", window=POST_MARKER_QUIESCE_SECONDS,
         )
 
     _no_arp_reply_assert(
@@ -217,7 +221,7 @@ def test_multicast_destination_accepted(
     assert len(frame) == 60, (
         f"ETH-007 test frame must be 60 wire bytes, got {len(frame)}"
     )
-    expected_used_len = f"used_len={(len(frame) + 12):08X}"
+    expected_used_len = f"used_len={(len(frame) + VIRTIO_NET_HDR_LEN):08X}"
 
     captured_pcap = artifact_dir / "captured-eth007.pcap"
     # Capture timeout MUST outlast the serial wait window — if

@@ -35,7 +35,7 @@ from pathlib import Path
 from l2_harness import frames
 from l2_harness.capture import FrameSender
 from l2_harness.firecracker import FirecrackerGuest
-from l2_harness.frames import raw_eth_frame
+from l2_harness.frames import VIRTIO_NET_HDR_LEN, raw_eth_frame
 from l2_harness.serial import SerialLog
 
 
@@ -59,7 +59,7 @@ traffic.
 """
 
 TEST_FRAME_USED_LEN_HEX = (
-    f"used_len={(TEST_FRAME_WIRE_LEN + 12):08X}"   # = "used_len=00000048"
+    f"used_len={(TEST_FRAME_WIRE_LEN + VIRTIO_NET_HDR_LEN):08X}"
 )
 
 BOOT_READY_TIMEOUT_SECONDS = 3.0
