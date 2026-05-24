@@ -1237,6 +1237,27 @@ newline_msg:
     .ascii  "\n"
 newline_msg_end:
 
+// tx_test_pkt's src MAC must stay in sync with the GUEST_MAC
+// constants in arch/aarch64/l2/dispatcher.S (which the MAC
+// filter compares incoming dst MACs against, and which
+// arp_reply_template uses for outgoing ARP src+SHA). Each
+// file asserts ETH-016 locally; cross-file consistency is
+// human discipline.
+.equ GUEST_MAC_BYTE_0,          0x02
+.equ GUEST_MAC_BYTE_1,          0x00
+.equ GUEST_MAC_BYTE_2,          0x00
+.equ GUEST_MAC_BYTE_3,          0x00
+.equ GUEST_MAC_BYTE_4,          0x00
+.equ GUEST_MAC_BYTE_5,          0x01
+
+// ETH-016 (IEEE 802.3 §4.1.2.1): outgoing source MAC MUST
+// have the unicast bit clear. tx_test_pkt's src MAC is the
+// only outgoing src this file places; the dispatcher's
+// arp_reply_template handles its own. Build-time check.
+.if GUEST_MAC_BYTE_0 & 1
+.error "ETH-016: GUEST_MAC_BYTE_0 has multicast bit set"
+.endif
+
 // Canary Ethernet frame submitted on TX for VIO-T MVP. Layout:
 //   12 B virtio_net_hdr (all zero — no GSO/CSUM features negotiated)
 //   14 B Ethernet header (broadcast dst, local-admin src, EtherType
@@ -1247,7 +1268,7 @@ newline_msg_end:
 tx_test_pkt:
     .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0          // virtio_net_hdr
     .byte   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF          // dst MAC broadcast
-    .byte   0x02, 0x00, 0x00, 0x00, 0x00, 0x01          // src MAC local-admin
+    .byte   GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  // src MAC = GUEST_MAC
     .byte   0x88, 0xB5                                  // EtherType 0x88B5
     .fill   46, 1, 0xAB                                 // 46-byte canary
 

@@ -147,6 +147,37 @@ L2_STATE_RX_USED_SHADOW     equ 2
 L2_STATE_TX_NEXT_AVAIL      equ 4
 L2_STATE_TX_USED_SHADOW     equ 6
 
+; GUEST_MAC — the locally-administered unicast address this
+; guest answers to. Must stay in sync with the same constants in
+; arch/x86_64/platform/firecracker/boot.S (used for the
+; tx_test_pkt canary's src MAC). Cross-file consistency is human
+; discipline; each file asserts its own ETH-016 invariant.
+GUEST_MAC_BYTE_0  equ 0x02
+GUEST_MAC_BYTE_1  equ 0x00
+GUEST_MAC_BYTE_2  equ 0x00
+GUEST_MAC_BYTE_3  equ 0x00
+GUEST_MAC_BYTE_4  equ 0x00
+GUEST_MAC_BYTE_5  equ 0x01
+
+; ETH-016 (IEEE 802.3 §4.1.2.1): outgoing source MAC MUST have
+; the unicast bit clear (bit 0 of byte 0 = 0). This dispatcher
+; uses GUEST_MAC as the source MAC for every outgoing frame it
+; builds (ARP replies via arp_reply_template — and, when the
+; TX API lands per docs/l2/TX_API.md, every queued L3 TX too).
+; The build-time check catches a malformed-MAC edit before it
+; ships.
+%if GUEST_MAC_BYTE_0 & 1
+%error "ETH-016: GUEST_MAC_BYTE_0 has multicast bit set"
+%endif
+
+; Derived LE encodings for the MAC filter's halfword/word
+; compares. NASM evaluates the bitwise OR over equ symbols
+; fine; aarch64 GNU as can't (CLAUDE.md gotcha) — the aarch64
+; dispatcher hardcodes the equivalent values with a sync
+; comment.
+GUEST_MAC_LE_LO32 equ (GUEST_MAC_BYTE_0 | (GUEST_MAC_BYTE_1 << 8) | (GUEST_MAC_BYTE_2 << 16) | (GUEST_MAC_BYTE_3 << 24))
+GUEST_MAC_LE_HI16 equ (GUEST_MAC_BYTE_4 | (GUEST_MAC_BYTE_5 << 8))
+
 global l2_dispatch
 
 [bits 64]
@@ -342,10 +373,10 @@ l2_dispatch:
     mov r10d, [rax + 12]                             ; dst MAC bytes 0-3 (LE u32)
     test r10d, 1                                     ; multicast/broadcast?
     jnz .l2_mac_accept
-    cmp r10d, 2                                      ; GUEST_MAC bytes 0-3 LE
+    cmp r10d, GUEST_MAC_LE_LO32                      ; GUEST_MAC bytes 0-3 LE
     jne .l2_rx_drop_mac
     movzx r10d, word [rax + 16]                      ; dst MAC bytes 4-5
-    cmp r10d, 0x100                                  ; GUEST_MAC bytes 4-5 LE
+    cmp r10d, GUEST_MAC_LE_HI16                      ; GUEST_MAC bytes 4-5 LE
     jne .l2_rx_drop_mac
 .l2_mac_accept:
 
@@ -1020,7 +1051,8 @@ arp_reply_template:
     times 12 db 0
     ; Ethernet header
     times 6  db 0                                    ; dst MAC (patched)
-    db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; src MAC = GUEST_MAC
+    db GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, \
+       GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  ; src MAC = GUEST_MAC
     db 0x08, 0x06                                    ; EtherType = ARP (BE)
     ; ARP payload (28 bytes)
     db 0x00, 0x01                                    ; HTYPE = Ethernet (BE)
@@ -1028,7 +1060,8 @@ arp_reply_template:
     db 0x06                                          ; HLEN
     db 0x04                                          ; PLEN
     db 0x00, 0x02                                    ; OPER = reply (BE)
-    db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; SHA = GUEST_MAC
+    db GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, \
+       GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  ; SHA = GUEST_MAC
     db 0xC0, 0xA8, 0x2A, 0x02                        ; SPA = GUEST_IP
     times 6  db 0                                    ; THA (patched)
     times 4  db 0                                    ; TPA (patched)

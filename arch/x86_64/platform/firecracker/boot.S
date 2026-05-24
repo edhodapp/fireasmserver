@@ -1124,10 +1124,33 @@ rx_populated_msg:      db 'RX:POPULATED', 10
 rx_populated_len       equ $ - rx_populated_msg
 
 
+; tx_test_pkt's src MAC must stay in sync with the GUEST_MAC
+; constants in arch/x86_64/l2/dispatcher.S (which the MAC
+; filter compares incoming dst MACs against, and which
+; arp_reply_template uses for outgoing ARP src+SHA). Each
+; file asserts ETH-016 locally; cross-file consistency is
+; human discipline.
+GUEST_MAC_BYTE_0  equ 0x02
+GUEST_MAC_BYTE_1  equ 0x00
+GUEST_MAC_BYTE_2  equ 0x00
+GUEST_MAC_BYTE_3  equ 0x00
+GUEST_MAC_BYTE_4  equ 0x00
+GUEST_MAC_BYTE_5  equ 0x01
+
+; ETH-016 (IEEE 802.3 §4.1.2.1): outgoing source MAC MUST
+; have the unicast bit clear. tx_test_pkt's src MAC is the
+; only outgoing src this file places — the dispatcher's
+; arp_reply_template handles its own. Build-time check
+; covers it before ship.
+%if GUEST_MAC_BYTE_0 & 1
+%error "ETH-016: GUEST_MAC_BYTE_0 has multicast bit set"
+%endif
+
 tx_test_pkt:
     times 12 db 0                                    ; virtio_net_hdr zero
     db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF            ; dst MAC broadcast
-    db 0x02, 0x00, 0x00, 0x00, 0x00, 0x01            ; src MAC local-admin
+    db GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, \
+       GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  ; src MAC = GUEST_MAC
     db 0x88, 0xB5                                    ; EtherType 0x88B5
     times 46 db 0xAB                                 ; 46-byte canary payload
 
