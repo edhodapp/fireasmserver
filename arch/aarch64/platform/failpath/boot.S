@@ -300,19 +300,16 @@ _entry:
 
     // --- Emit return code and halt ---
     //
-    // l2_dispatch returns 1 on the fail paths via `mov w0, #1;
-    // b .Lepilogue`. That `mov w0` clobbers x0 (the dispatcher's
-    // upper 32 bits get zeroed by the `mov w0`, so x0 = 1 now,
-    // not UART_BASE). Our emit_bytes uses x0 as the UART base
-    // address — so we MUST re-establish it before the next
-    // emit. x86_64 doesn't have this gotcha because its
-    // emit_bytes self-loads COM1_PORT internally per task #26;
-    // aarch64's emit_bytes still trusts a caller-supplied
-    // pointer (refactoring it to self-load UART_BASE is a
-    // separate cleanup).
+    // l2_dispatch returns 1 on the fail paths via
+    // `mov w0, #1; b .Lepilogue`. Stash w0 across the emit
+    // chain so the FAILPATH:DONE rc=<hex> marker carries the
+    // actual return value.
+    //
+    // emit_bytes self-loads UART_BASE per task #44 (the
+    // sibling of task #26 — that mov w0 in .Lfail used to
+    // clobber the caller's UART pointer; emit_bytes no longer
+    // depends on x0 from the caller).
     mov     w20, w0
-    movz    x0, #0x4000, lsl #16
-    movk    x0, #0x2000              // x0 = UART_BASE
     adr     x1, failpath_done_msg
     mov     w2, #(failpath_done_msg_end - failpath_done_msg)
     bl      emit_bytes
@@ -337,6 +334,9 @@ _entry:
 .global tx_test_pkt
 
 emit_bytes:
+    // Self-load UART_BASE (mirror of production firecracker
+    // boot.S — see emit_bytes header there for the rationale).
+    ldr     x0, =UART_BASE
     cbz     w2, .Lfp_emit_done
 .Lfp_emit_loop:
     yield

@@ -1078,13 +1078,28 @@ _entry:
 .global newline_msg
 .global tx_test_pkt
 
-// emit_bytes: write w2 bytes from [x1] via UART at x0.
-//   In:      x0 = UART base (preserved)
-//            x1 = source pointer (advances by w2)
+// emit_bytes: write w2 bytes from [x1] via UART.
+//   In:      x1 = source pointer (advances by w2)
 //            w2 = byte count (decremented to 0)
-//   Clobbers w3, w4, w2, x1.
-//   Preserves x0, x5, x6, x7, x8, x30.
+//   Clobbers w3, w4, w2, x1, x0 (rewritten to UART_BASE at
+//            entry; preserved on exit since the function uses
+//            it throughout, but callers should NOT depend on
+//            x0 carrying any specific value across this call).
+//   Preserves x5, x6, x7, x8, x30.
+//
+// History (2026-05-24): emit_bytes used to REQUIRE x0 =
+// UART_BASE on entry AND was documented as preserving x0
+// across the call. That turned x0 into a project-wide "do
+// not clobber across emit_bytes" register and produced a
+// real bug in the failpath stub — the aarch64 dispatcher's
+// .Lfail path does `mov w0, #1` which zero-extends to x0 and
+// clobbered UART_BASE for the post-dispatch emit chain.
+// Symmetric with task #26's x86 COM1_PORT-into-emit fix.
+// emit_bytes now derives UART_BASE from the assemble-time
+// constant on every entry; callers no longer need to set or
+// preserve x0.
 emit_bytes:
+    ldr     x0, =UART_BASE
     cbz     w2, .Lemit_done
 .Lemit_loop:
     yield                                // see header comment block
