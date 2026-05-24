@@ -66,6 +66,19 @@ run_pi_cell() {
     ./tooling/tracer_bullet/pi_aarch64_firecracker.sh
 }
 
+run_pi_failpath_cell() {
+    echo
+    echo "=== pre-push: aarch64/failpath fail-path tests (Pi) ==="
+    if ! pi_reachable; then
+        echo "SKIP: $PI_USER@$PI_HOST not reachable within 2s."
+        echo "      (aarch64 fail-path scenarios cannot be tested"
+        echo "       in CI either; x86_64 fail-path tests still"
+        echo "       run via the L2 integration suite.)"
+        return 0
+    fi
+    ./tooling/tracer_bullet/pi_aarch64_failpath.sh
+}
+
 run_memlayout_diff() {
     echo
     echo "=== pre-push: memlayout bytecode-VM differential ==="
@@ -236,6 +249,10 @@ run_local_cell x86_64  firecracker   || fail=1
 # tests that exercise every branch.
 run_local_cell aarch64 qemu        1 || fail=1
 run_pi_cell                          || fail=1
+# aarch64 fail-path scenarios — runs after the Pi smoke cell so
+# the pi_reachable cache is warm. SKIP-when-Pi-down semantics
+# match the production Pi cell.
+run_pi_failpath_cell                 || fail=1
 # L2 integration tests come right after the boot-smoke cells:
 # tracer-bullet proved the guest boots; this gate proves the L2
 # protocol behavior on top of that boot.

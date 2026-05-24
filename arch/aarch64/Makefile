@@ -8,6 +8,11 @@
 # Firecracker aarch64 loads directly as a kernel.
 
 PLATFORM ?= firecracker
+# Fail-path stub scenario — set when PLATFORM=failpath. The
+# stub at arch/aarch64/platform/failpath/boot.S uses .ifdef
+# to pick which malformed virtqueue state to inject before
+# calling l2_dispatch.
+SCENARIO ?= BAD_ID
 
 AS      := aarch64-linux-gnu-as
 LD      := aarch64-linux-gnu-ld
@@ -23,6 +28,12 @@ OBJCOPY := aarch64-linux-gnu-objcopy
 ASFLAGS := -I ../../tooling/memlayout_diffharness \
            -I build/$(PLATFORM)
 LDFLAGS :=
+
+# Pass scenario flag through to GNU as via --defsym for the
+# failpath build. Mirrors x86_64's -DFAILPATH_SCENARIO_<NAME>=1.
+ifeq ($(PLATFORM),failpath)
+ASFLAGS += --defsym FAILPATH_SCENARIO_$(SCENARIO)=1
+endif
 
 SRC_DIR       := platform/$(PLATFORM)
 BUILD_DIR     := build/$(PLATFORM)
@@ -45,11 +56,11 @@ PLAT_OBJECTS  := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(PLAT_SOURCES))
 MEM_SOURCES   := $(sort $(wildcard memory/*.S))
 MEM_OBJECTS   := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(MEM_SOURCES))
 # L2 dispatcher pulls in virtio-MMIO + emit_hex32 + the canary TX
-# frame; only the firecracker platform wires those today. The qemu
-# platform's boot.S is a minimal PL011-on-virt stub without virtio.
+# frame; firecracker AND failpath both link it. The qemu platform's
+# boot.S is a minimal PL011-on-virt stub without virtio.
 # Conditional inclusion avoids unresolved external refs at link
 # time on the qemu target. Mirrors arch/x86_64/Makefile's gate.
-ifeq ($(PLATFORM),firecracker)
+ifneq ($(filter $(PLATFORM),firecracker failpath),)
 L2_SOURCES    := $(sort $(wildcard l2/*.S))
 L2_OBJECTS    := $(patsubst l2/%.S,$(BUILD_DIR)/l2/%.o,$(L2_SOURCES))
 else

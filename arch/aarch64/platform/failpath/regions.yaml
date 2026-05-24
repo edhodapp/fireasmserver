@@ -1,0 +1,131 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Memreq regions for aarch64/firecracker (D066 step 5 — aarch64
+# replication of the x86_64 path, deferred per D066 task #29 until
+# x86_64 stabilized).
+#
+# Source-of-truth for the regions placed in the `.memreq` ELF
+# section. The codegen at `tooling/src/memreq_codegen/` reads this
+# file and emits two .inc files under `arch/aarch64/build/firecracker/`:
+#
+#   memreq_records.inc — 48-byte records (one per region) in
+#                        the .memreq section, consumed by the
+#                        init-time bump allocator.
+#   memreq_pin_hot.inc — register pins for hot-tier regions
+#                        (per D066 Q-B aarch64 pool: x19-x25),
+#                        included at kernel entry post-init.
+#
+# Mirrors arch/x86_64/platform/firecracker/regions.yaml. Same
+# logical regions, same sizes, same lifetimes.
+
+regions:
+  - name: smoke_test
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 4096
+    align: 4096
+    doc: >
+      Trivial test region (D066 step 5a equivalent on aarch64).
+      Allocated by init_memory_layout but never consumed by boot.S.
+      Validates codegen → .memreq section → bytecode VM execution
+      → bump allocator → assigned_addr/assigned_size written in
+      place on the aarch64 side.
+
+  - name: rx_buffer
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 524288   # 256 buffers × 2048 bytes (0x80000)
+    align: 4096
+    doc: >
+      RX buffer pool for virtio-net — 256 × 2048-byte slots.
+      Replaces the hardcoded RX_BUFFER_BASE constant. Cold-tier
+      because the RX fill loop runs once at boot and the RX
+      completion path's per-frame lookup is acceptable cost.
+
+  - name: virtq
+    tier: hot
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 24576    # 2 queues × 0x3000 (VIRTQ_STRIDE) = 0x6000
+    align: 4096
+    doc: >
+      Virtqueue memory for the virtio-net device — RX queue at
+      [base + 0], TX queue at [base + VIRTQ_STRIDE]. x19 (first
+      slot of the AAPCS64 hot-tier pool) is pinned to assigned_addr
+      at kernel entry by memreq_pin_hot.inc; subsequent RX/TX
+      queue accesses use [x19 + offset] or [x19 + VIRTQ_STRIDE +
+      offset] instead of the hardcoded VIRTQ_BASE constant.
+
+  - name: kstack_boot
+    tier: cold
+    lifetime: stack
+    owner: 0
+    writable: true
+    size: 16384    # 16 KiB — matches x86_64 sibling
+    align: 16      # AAPCS64: SP 16-byte aligned at function entry
+    doc: >
+      Per-core kernel stack for the boot core. D066 step 5d:
+      first lifetime=stack region on aarch64, exercising the
+      allocator's reverse-bump path from __ram_top per AL-002.
+      _entry switches SP from the linker-script bootstrap stack
+      to this region's top (assigned_addr + assigned_size, since
+      aarch64 grows down) immediately after init_memory_layout
+      returns and before any further `bl`. The bootstrap stack is
+      only needed for init_memory_layout itself per MR-003; the
+      kernel-proper stack lives here.
+
+  - name: tx_arp_buf
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 128        # 12 B virtio_net_hdr + 60 B Ethernet min (14 hdr + 28 ARP + 18 pad) + slack
+    align: 16
+    doc: >
+      Writable TX scratch buffer for FSA-4(A) — the ARP responder
+      writes its reply Ethernet frame here when an inbound ARP
+      request for our IP arrives. boot.S submits TX descriptor 0
+      pointing at this region (when arp_match is set during a
+      dispatch); otherwise descriptor 0 points at the rodata
+      canary frame (tx_test_pkt) as before.
+
+      The region is intentionally generous (128 B vs the strict 72
+      bytes a single-frame ARP reply needs) so future TX-side
+      additions — ICMP, gratuitous ARP, link-layer probes — have
+      room to share the buffer without a second region. FSA-5 will
+      introduce a free-list and multiple writable TX buffers when
+      reentrant multi-frame TX becomes load-bearing.
+
+  - name: l2_state
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 16          # 4 × u16 shadows + 8 B padding for FSA-5+ growth
+    align: 8          # natural u64 boundary; all current accesses are u16 (strh / ldrh) but the alignment leaves room to widen to batched u32/u64 loads later without realignment
+    doc: >
+      Persistent shadow storage for l2_dispatch (FSA-4). Four u16
+      counters at fixed offsets:
+        +0 : rx_next_avail   — producer counter for RX AvailRing
+        +2 : rx_used_shadow  — consumer counter for RX UsedRing
+        +4 : tx_next_avail   — producer counter for TX AvailRing
+        +6 : tx_used_shadow  — consumer counter for TX UsedRing
+        +8 : reserved (zero-init via allocator)
+
+      All four wrap modulo 65536 to match Virtio u16 idx fields.
+      boot.S initialises rx_next_avail = VIRTQ_MAX_SIZE (256)
+      after RX:POPULATED publishes that count of buffers; the
+      other three are zero on first call (zero-init by the
+      allocator) and advance from there.
+
+      The dispatcher reads all four shadows at entry, uses them
+      across the RX/TX phases, and writes them back at exit so
+      subsequent invocations see the advanced state. Cold-tier
+      because the load+store is two MMIO-free memory ops per
+      dispatch — well below the threshold where a pinned hot-tier
+      register would pay off.
