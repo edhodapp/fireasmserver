@@ -10,11 +10,30 @@ Per `docs/l2/HARNESS.md` §3.5.
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 
 
 WAIT_POLL_INTERVAL_SECONDS = 0.05
+
+# Firecracker writes its own startup log lines to the same file
+# Python opens for the guest's serial output. When the guest's
+# emit_bytes is in flight at the same moment Firecracker writes
+# (e.g., its "Successfully started microvm" line), the two
+# streams interleave mid-line — the guest's "RX:FAIL num_bufs=
+# 00000002\n" becomes "RX:FAIL num_bufs=000<firecracker log
+# line>00002\n", and a literal substring `RX:FAIL num_bufs=
+# 00000002` fails to match. The fix: strip every Firecracker
+# log line out of the captured text before substring checks.
+# Pattern matches "2026-05-24T16:37:37.929247818 [l2-harness:
+# <thread>] <rest of line>" anywhere in the buffer — the
+# date/time prefix is sufficiently unique that no legitimate
+# guest emit will collide.
+_FIRECRACKER_LOG_LINE_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+ "
+    r"\[l2-harness:[^\]]+\] [^\n]*",
+)
 
 MAX_ASSERT_LOG_LINES = 40
 """Cap on the line count of the serial log embedded in
@@ -80,10 +99,14 @@ class SerialLog:
         Decoded as utf-8 with errors=replace so any partial-byte
         boundary on a midstream read doesn't raise; the harness
         cares about marker substrings, not byte-exact integrity.
+        Firecracker startup log lines are stripped to avoid the
+        mid-line interleave failure mode described in the module
+        docstring's `_FIRECRACKER_LOG_LINE_RE` comment.
         """
         if not self._path.exists():
             return ""
-        return self._path.read_bytes().decode("utf-8", errors="replace")
+        raw = self._path.read_bytes().decode("utf-8", errors="replace")
+        return _FIRECRACKER_LOG_LINE_RE.sub("", raw)
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:
         """Block until `marker` appears in the log or timeout.
