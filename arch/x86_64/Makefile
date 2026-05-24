@@ -8,14 +8,19 @@
 # Assembler: NASM per D048. Linker stays at binutils' ld.
 
 PLATFORM ?= qemu
+# Fail-path stub scenario — set when PLATFORM=failpath. The stub
+# at arch/x86_64/platform/failpath/boot.S uses %ifdef to pick
+# which malformed virtqueue state to inject before calling
+# l2_dispatch. Currently only BAD_ID is implemented.
+SCENARIO ?= BAD_ID
 
 AS := nasm
 LD := x86_64-linux-gnu-ld
 
 # qemu boots via Multiboot1 on -machine pc, which requires a 32-bit
-# ELF. firecracker boots via PVH, which requires a 64-bit ELF wrapping
-# the same `[bits 32]` entry stub. ELF class is a function of (arch,
-# platform).
+# ELF. firecracker AND failpath boot via PVH, which requires a
+# 64-bit ELF wrapping the same `[bits 32]` entry stub. ELF class
+# is a function of (arch, platform).
 # -i paths for NASM `%include`s:
 #   - tooling/memlayout_diffharness/ : `bcvm_errors.nasm.inc` from
 #     arch/x86_64/memory/bytecode_vm.S — shared contract with the
@@ -27,12 +32,19 @@ LD := x86_64-linux-gnu-ld
 NASM_INCLUDE := -i ../../tooling/memlayout_diffharness/ \
                 -i build/$(PLATFORM)/
 
-ifeq ($(PLATFORM),firecracker)
+ifneq ($(filter $(PLATFORM),firecracker failpath),)
 ASFLAGS := -f elf64 $(NASM_INCLUDE)
 LDFLAGS :=
 else
 ASFLAGS := -f elf32 $(NASM_INCLUDE)
 LDFLAGS := -m elf_i386
+endif
+
+# The failpath stub picks its scenario at assemble time via
+# -DFAILPATH_SCENARIO_<NAME>=1. Pass through SCENARIO=X to
+# select; default BAD_ID (the only one implemented today).
+ifeq ($(PLATFORM),failpath)
+ASFLAGS += -DFAILPATH_SCENARIO_$(SCENARIO)=1
 endif
 
 SRC_DIR := platform/$(PLATFORM)
@@ -59,11 +71,11 @@ PLAT_OBJECTS := $(patsubst $(SRC_DIR)/%.S,$(BUILD_DIR)/%.o,$(PLAT_SOURCES))
 MEM_SOURCES  := $(sort $(wildcard memory/*.S))
 MEM_OBJECTS  := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(MEM_SOURCES))
 # L2 dispatcher pulls in virtio-MMIO + emit_bytes/emit_hex32 + the
-# canary TX frame; only the firecracker platform wires those today.
+# canary TX frame; firecracker and failpath both link it.
 # The qemu platform's boot.S is a minimal Multiboot1 stub without
 # virtio. Conditional inclusion avoids unresolved external refs at
 # link time on the qemu target.
-ifeq ($(PLATFORM),firecracker)
+ifneq ($(filter $(PLATFORM),firecracker failpath),)
 L2_SOURCES   := $(sort $(wildcard l2/*.S))
 L2_OBJECTS   := $(patsubst l2/%.S,$(BUILD_DIR)/l2/%.o,$(L2_SOURCES))
 else
