@@ -13,17 +13,27 @@ invariants, fail-path defensive checks (bad_id, num_bufs,
 hdr_flags, TX bad_id), virtio feature negotiation policy —
 all explicit, all tested.
 
-**L2 as a complete layer is roughly 30% built.** The RX-side
-validation above is the part that's done. The send side, the
-upper-layer interface, and operational visibility are missing:
+**TX API end-to-end proven (phase b of D068 working
+order).** Producer (Vyukov MPSC enqueue), pool (generation
+counter ring), consumer (dispatcher TX phase drain + frame
+builder), Vyukov slot release after TX:RECLAIMED, pool free
+— all wired on both arches. End-to-end e2e test wired on
+x86 (`test_l2_tx_api`); aarch64 has the build infrastructure
+but no Pi-side runner yet. Caught one producer bug in the
+e2e (release-store clobber); fixed.
 
-  - **TX API** — no producer-facing send interface
-    (`docs/l2/TX_API.md` has the design; not yet built)
+**L2 as a complete layer is roughly 40% built.** The RX-side
+validation + the TX API are the parts that are done. The
+upper-layer interface and operational visibility are missing:
+
   - **L3-callable receive surface** — dispatcher emits
     serial markers but doesn't hand inbound frames to a
     registered upper-layer consumer
   - **ARP initiator + cache** — we REPLY to ARP requests
-    but can't SEND them; no cache state machine
+    but can't SEND them; no cache state machine. The ARP
+    responder still uses the legacy inline `tx_arp_buf`
+    path; migrating it to the queue through-path is
+    phase (c) of the D068 working order.
   - **Statistics counters** — qualitative markers only; no
     RX/TX bytes/frames/drops/errors for ops visibility
   - **Link state monitoring** — `VIRTIO_NET_F_STATUS`
@@ -58,8 +68,8 @@ substantial.
 | ETH-009 | Bad FCS discard | ⊘ N/A | virtio-net offloads FCS verification; the device won't deliver bad-FCS frames to us |
 | ETH-010 | Runt discard | ✅ test | `test_eth_size_bounds.test_runt_frame_dropped` |
 | ETH-011 | Oversize discard | ✅ test | `test_eth_size_bounds.test_oversize_frame_dropped` |
-| ETH-012 | TX-side padding to 64 | ❌ deferred | needs TX API; see `docs/l2/TX_API.md` |
-| ETH-013 | TX padding zero-fill | ❌ deferred | same |
+| ETH-012 | TX-side padding to 64 | ⚙️ wired, no test | dispatcher TX phase pads runt frames in the consumer's frame builder; phase (d) adds the regression test |
+| ETH-013 | TX padding zero-fill | ⚙️ wired, no test | same — `xor eax, eax; rep stosb` (x86) / `strb wzr` loop (aarch64) writes zeros, not arbitrary bytes |
 | ETH-014 | Inter-frame gap | ⊘ N/A | virtio abstracts PHY |
 | ETH-015 | RX source MAC unicast-bit check | ✅ test | `test_eth_src_mac.test_multicast_source_mac_dropped` |
 | ETH-016 | TX source MAC unicast sanity | ✅ build-time | `.if GUEST_MAC_BYTE_0 & 1 / .error ...` in both arch dispatcher.S + boot.S; fires the build, not at runtime |
@@ -265,8 +275,12 @@ deferred work completed" directive), the queue is:
    commit add9df4 — adds RX:FAIL hdr_flags fail-path)
 3. ~~STATUS.md fuzz/UART notes + honest D068 reframe~~
    ✅ done (this commit + DECISIONS.md D068)
-4. **TX API implementation** per `docs/l2/TX_API.md` —
-   biggest single item, unblocks everything after
+4. ~~TX API implementation~~ per `docs/l2/TX_API.md`
+   ✅ done (task #48; phases b.1–b.4 across commits a8bea34
+   through 5b0f359). End-to-end e2e test passing on x86_64.
+   aarch64 has build infrastructure; Pi-side runner deferred.
+   Phases remaining: (c) ARP responder migration to queue,
+   (d) ETH-012/013 regression tests against the new TX path.
 5. **L3-callable receive surface** — dispatcher hands
    inbound frames + metadata to a registered consumer
 6. **ARP cache + initiator** — outbound ARP, enables
