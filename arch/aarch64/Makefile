@@ -35,8 +35,37 @@ ifeq ($(PLATFORM),failpath)
 ASFLAGS += --defsym FAILPATH_SCENARIO_$(SCENARIO)=1
 endif
 
+# TX API end-to-end test pre-bake (phase b.4 aarch64 mirror).
+# When TXAPI_PREBAKE=1, the firecracker boot.S enqueues one TX
+# API request before entering the dispatch loop. Mirrors
+# arch/x86_64/Makefile's flag exactly — separate BUILD_DIR so
+# the production binary at build/firecracker/ isn't overwritten.
+# OFF by default — Pi deploys + the L2 integration tests via
+# the production binary unchanged.
+TXAPI_PREBAKE ?= 0
+ifeq ($(TXAPI_PREBAKE),1)
+ifneq ($(PLATFORM),firecracker)
+$(error TXAPI_PREBAKE=1 only meaningful with PLATFORM=firecracker)
+endif
+ASFLAGS += --defsym TXAPI_PREBAKE=1
+BUILD_SUFFIX := _txapi
+else
+BUILD_SUFFIX :=
+endif
+
 SRC_DIR       := platform/$(PLATFORM)
-BUILD_DIR     := build/$(PLATFORM)
+BUILD_DIR     := build/$(PLATFORM)$(BUILD_SUFFIX)
+
+# Re-point ASFLAGS include path to the suffixed BUILD_DIR so
+# memreq incs are found in the right dir (initial ASFLAGS pinned
+# the non-suffixed path).
+ASFLAGS := -I ../../tooling/memlayout_diffharness -I $(BUILD_DIR)
+ifeq ($(PLATFORM),failpath)
+ASFLAGS += --defsym FAILPATH_SCENARIO_$(SCENARIO)=1
+endif
+ifeq ($(TXAPI_PREBAKE),1)
+ASFLAGS += --defsym TXAPI_PREBAKE=1
+endif
 
 # Codegen for `.memreq` records and hot-tier register pins
 # (D066 step 5 — aarch64 replication of the x86_64 path).

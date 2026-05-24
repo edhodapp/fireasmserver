@@ -41,6 +41,11 @@
 // Constants — match the x86_64 boot.S naming for cross-arch cognitive
 // continuity. Lower-case `virt` is the virtio-MMIO magic word.
 .equ UART_BASE,         0x40002000
+// TX API end-to-end test pre-bake — pool buffer payload start
+// offset (12 B virtio_net_hdr + 14 B Eth header). Only used when
+// TXAPI_PREBAKE is defined (see the pre-bake block before
+// .Ldispatch_loop).
+.equ L2_TX_PAYLOAD_OFFSET, 26
 .equ VIRTIO_MMIO_BASE,  0x40003000
 .equ VIRTIO_MAGIC_LO,   0x6976          // "vi" little-endian
 .equ VIRTIO_MAGIC_HI,   0x7472          // "tr" little-endian
@@ -887,6 +892,57 @@ _entry:
     // x20 holds the counter across `bl l2_dispatch` because
     // AAPCS64 callee-saved set covers it and the dispatcher
     // saves/restores x20 in its prologue/epilogue.
+.ifdef TXAPI_PREBAKE
+    // --- TX API end-to-end test pre-bake (phase b.4) ---
+    //
+    // Build-flag-gated: --defsym TXAPI_PREBAKE=1 turns this on.
+    // OFF for production builds (Pi deploys, normal CD). ON for
+    // the tooling/tests/integration/test_l2_tx_api.py aarch64
+    // sibling test which sniffs the Pi's tap interface for the
+    // resulting wire frame.
+    //
+    // Allocates one pool buffer, writes the ASCII payload
+    // "TXAPI-TEST" at +PAYLOAD_OFFSET, enqueues one request
+    // targeting broadcast MAC with the Local Experimental
+    // ethertype 0x88B5. Dispatcher's TX phase drains it on the
+    // first .Ldispatch_loop iteration and submits the wire
+    // frame to virtio-net.
+    //
+    // x19 (VIRTQ_BASE pin), x6 (VIRTIO_MMIO base pin), and
+    // x0 (UART base pin) must survive across the calls below.
+    // Per AAPCS64, those are caller-saved EXCEPT x19 which is
+    // callee-saved — the TX API functions don't reuse it, so
+    // it's preserved automatically. x0/x6 are caller-saved and
+    // ARE clobbered; re-derive after the calls.
+    adr     x1, txapi_prebake_msg
+    mov     w2, #(txapi_prebake_msg_end - txapi_prebake_msg)
+    bl      emit_bytes
+    bl      l2_tx_buffer_pool_alloc          // w0 = pool_idx
+    // Save idx + restore UART base for later emit calls.
+    mov     w21, w0                           // x21 = pool_idx (callee-saved)
+    bl      l2_tx_buffer_addr                 // x0 = pool buffer base
+    add     x0, x0, #L2_TX_PAYLOAD_OFFSET    // x0 = producer payload slot
+    // ASCII bytes "TXAPI-TEST" — 10 bytes.
+    // As LE 64-bit at +0: bytes 0..7 = T X A P I - T E
+    //   = 0x4554_2D49_5041_5854
+    ldr     x1, =0x45542D4950415854
+    str     x1, [x0]
+    mov     w1, #0x5453                       // bytes 8-9 = 'S' 'T'
+    strh    w1, [x0, #8]
+    // Re-derive UART base (x0 was clobbered above).
+    movz    x0, #0x4000, lsl #16
+    movk    x0, #0x2000              // x0 = UART_BASE
+    // Enqueue: dst_mac_ptr, ethertype, pool_idx, payload_len.
+    adr     x0, txapi_prebake_dst_mac         // tx_api uses x0 for dst ptr
+    mov     w1, #0xB588                       // BE wire 0x88B5 (LE stored)
+    mov     w2, w21                           // pool_idx
+    mov     w3, #10                           // payload_len
+    bl      l2_tx_enqueue
+    // Re-derive UART base for the dispatch loop's emit chains
+    // (dispatcher caller-contract: x0 = UART base).
+    movz    x0, #0x4000, lsl #16
+    movk    x0, #0x2000              // x0 = UART_BASE
+.endif
     mov     x20, #100
 .Ldispatch_loop:
     bl      l2_dispatch
@@ -1298,6 +1354,17 @@ tx_test_pkt:
     .byte   GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  // src MAC = GUEST_MAC
     .byte   0x88, 0xB5                                  // EtherType 0x88B5
     .fill   46, 1, 0xAB                                 // 46-byte canary
+
+.ifdef TXAPI_PREBAKE
+// TX API end-to-end test pre-bake rodata. dst MAC pointer for
+// l2_tx_enqueue's first arg; marker string for the emit before
+// the alloc/enqueue calls so the test can verify pre-bake ran.
+txapi_prebake_dst_mac:
+    .byte   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+txapi_prebake_msg:
+    .ascii  "TXAPI:PREBAKE\n"
+txapi_prebake_msg_end:
+.endif
 
 // _image_end is defined in the linker script (placed after both .text
 // and .rodata) so the Image header's image_size covers the entire file.
