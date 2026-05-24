@@ -130,12 +130,27 @@
 .equ GUEST_MAC_LE_LO32,         0x00000002
 .equ GUEST_MAC_LE_HI16,         0x00000100
 
+// TX API (phase b.3) — mirrors arch/aarch64/l2/tx_api.S and
+// regions.yaml. Keep in sync.
+.equ L2_TX_RING_MASK,           15
+.equ L2_TX_RING_SIZE,           16
+.equ L2_TX_HEADER_BYTES,        64
+.equ L2_TX_SLOT_BYTES,          24
+.equ L2_TX_SLOT_SEQ,            0
+.equ L2_TX_SLOT_DST_MAC,        8
+.equ L2_TX_SLOT_ETHERTYPE,      14
+.equ L2_TX_SLOT_POOL_IDX,       16
+.equ L2_TX_SLOT_PAYLOAD_LEN,    20
+.equ L2_TX_PENDING_TAIL,        8
+.equ L2_TX_POOL_NEXT_FREE,      8
+.equ L2_TX_PAYLOAD_OFFSET,      26
+
 .text
 .global l2_dispatch
 l2_dispatch:
     // AAPCS64 prologue + FSA-4 local frame.
     //
-    // 128-byte frame layout (16-aligned per AAPCS64 §6.2.2):
+    // 144-byte frame layout (16-aligned per AAPCS64 §6.2.2):
     //   [sp +   0..7] : x29 (fp)
     //   [sp +   8..15]: x30 (lr)
     //   [sp +  16..79]: x20-x27 callee-saved pairs
@@ -147,7 +162,14 @@ l2_dispatch:
     //   [sp + 104..107]: arp_match flag (u32; FSA-4(A))
     //   [sp + 108..111]: sender_ip stash (u32; FSA-4(A))
     //   [sp + 112..117]: sender_mac stash (6 bytes; FSA-4(A))
-    //   [sp + 118..127]: padding for 16-alignment
+    //   [sp + 118..127]: padding
+    //   [sp + 128..131]: TX API use_queue flag (b.3; 0/1)
+    //   [sp + 132..135]: TX API pool_idx stash (b.3)
+    //   [sp + 136..139]: TX desc.len stash (b.3; varies per request
+    //                    when use_queue=1; canary + ARP-reply paths
+    //                    set TX_TEST_PKT_LEN so the shared desc-write
+    //                    site reads one slot)
+    //   [sp + 140..143]: padding for 16-alignment
     //
     // The per-dispatch counter, tx_next_avail stash, and ARP
     // recognition stash all live on the stack rather than in
@@ -164,7 +186,7 @@ l2_dispatch:
     // and 3 instructions × 4 sites = ~12 cycles of overhead per
     // dispatch is well under the cost of any single emit_bytes
     // call already on the path.
-    sub     sp, sp, #128
+    sub     sp, sp, #144
     stp     x29, x30, [sp]
     stp     x20, x21, [sp, #16]
     stp     x22, x23, [sp, #32]
@@ -190,6 +212,9 @@ l2_dispatch:
     str     wzr, [sp, #88]                   // per-dispatch counter = 0
     str     wzr, [sp, #96]                   // tx_next_avail stash = 0 (TX phase fills)
     str     wzr, [sp, #104]                  // arp_match flag = 0 (set by ARP recognition)
+    str     wzr, [sp, #128]                  // b.3: use_queue = 0
+    mov     w11, #TX_TEST_PKT_LEN
+    str     w11, [sp, #136]                  // b.3: desc_len default
 
     // --- VIO-R-003/004: poll RX Used Ring for first completion ---
     //
@@ -629,6 +654,95 @@ l2_dispatch:
     ldrh    w15, [x10, #L2_STATE_TX_NEXT_AVAIL]   // tx_next_avail (FSA-4: persistent)
     mov     w16, #0                               // desc_idx (FSA-5: from free-list)
 
+    // --- TX API (b.3): peek + drain l2_tx_pending queue ---
+    //
+    // Vyukov MPSC consumer. Peek slot at consumer-only tail;
+    // read seq with LDAR (acquire). If seq == tail + 1, drain
+    // the entry: read fields, build wire frame in front of the
+    // producer's payload in the pool buffer (consumer fills
+    // virtio_net_hdr + Eth header at bytes 0..25), set x10 to
+    // the pool buffer addr and [sp + 136] to the desc_len, then
+    // jump to the shared TX submit. Vyukov seq release + pool
+    // free run after TX:RECLAIMED in .Ltx_writeback.
+    //
+    // If seq != tail + 1, queue is empty for this round → fall
+    // through to the existing arp_match / canary path unchanged.
+    adrp    x10, __memreq_addr__l2_tx_pending
+    add     x10, x10, :lo12:__memreq_addr__l2_tx_pending
+    ldr     x10, [x10]                            // x10 = pending region base
+    ldr     w11, [x10, #L2_TX_PENDING_TAIL]      // w11 = tail (consumer-owned)
+    and     w12, w11, #L2_TX_RING_MASK           // w12 = slot
+    mov     w13, #L2_TX_SLOT_BYTES
+    umaddl  x13, w12, w13, xzr                   // x13 = slot * 24
+    add     x14, x10, #L2_TX_HEADER_BYTES        // x14 = ring base
+    add     x14, x14, x13                        // x14 = &ring[slot] (seq @ +0)
+    ldar    w13, [x14]                            // w13 = published seq (acquire)
+    add     w12, w11, #1                          // w12 = tail + 1
+    cmp     w13, w12
+    b.ne    .Ltx_queue_empty
+
+    // Queue has request. Read entry fields BEFORE releasing the
+    // slot — producer can overwrite once we bump seq for the
+    // next round.
+    mov     w13, #1
+    str     w13, [sp, #128]                       // use_queue = 1
+    ldr     w13, [x14, #L2_TX_SLOT_POOL_IDX]
+    str     w13, [sp, #132]                       // pool_idx stash
+
+    // desc_len = 12 + max(60, 14 + payload_len)
+    ldrh    w12, [x14, #L2_TX_SLOT_PAYLOAD_LEN]
+    add     w12, w12, #14                         // wire len without pad
+    cmp     w12, #60
+    b.hs    .Ltx_wire_ok
+    mov     w12, #60
+.Ltx_wire_ok:
+    add     w12, w12, #12                         // +12 virtio_net_hdr
+    str     w12, [sp, #136]                       // desc_len
+
+    // Pool buffer addr: x10 = pool_base + HEADER + pool_idx * 2048.
+    adrp    x10, __memreq_addr__l2_tx_buffer_pool
+    add     x10, x10, :lo12:__memreq_addr__l2_tx_buffer_pool
+    ldr     x10, [x10]
+    add     x10, x10, #L2_TX_HEADER_BYTES
+    ldr     w13, [sp, #132]                       // pool_idx
+    add     x10, x10, x13, lsl #11                // x10 = pool buffer
+
+    // Build wire frame headers in front of producer's payload.
+    //   +0..11  virtio_net_hdr = zeros. stp zero pair fills 16
+    //   bytes; only the first 12 carry meaning (the next 4 are
+    //   the dst MAC's first word, immediately overwritten below).
+    stp     xzr, xzr, [x10, #0]
+    //   +12..17 dst MAC from entry
+    ldr     w13, [x14, #L2_TX_SLOT_DST_MAC]      // bytes 0-3
+    str     w13, [x10, #12]
+    ldrh    w13, [x14, #(L2_TX_SLOT_DST_MAC + 4)] // bytes 4-5
+    strh    w13, [x10, #16]
+    //   +18..23 src MAC = GUEST_MAC
+    mov     w13, #GUEST_MAC_LE_LO32
+    str     w13, [x10, #18]
+    mov     w13, #GUEST_MAC_LE_HI16
+    strh    w13, [x10, #22]
+    //   +24..25 ethertype
+    ldrh    w13, [x14, #L2_TX_SLOT_ETHERTYPE]
+    strh    w13, [x10, #24]
+
+    // Runt-frame zero pad: if (14 + payload_len) < 60, zero the
+    // gap [26 + payload_len .. 11 + desc_len].
+    ldrh    w13, [x14, #L2_TX_SLOT_PAYLOAD_LEN]
+    add     w13, w13, #L2_TX_PAYLOAD_OFFSET      // pad start offset
+    ldr     w12, [sp, #136]                       // desc_len = pad end offset (exclusive)
+    cmp     w13, w12
+    b.hs    .Ltx_no_pad
+.Ltx_pad_loop:
+    strb    wzr, [x10, x13]
+    add     w13, w13, #1
+    cmp     w13, w12
+    b.lo    .Ltx_pad_loop
+.Ltx_no_pad:
+
+    b       .Larp_have_tx_addr
+
+.Ltx_queue_empty:
     // --- FSA-4(A): pick TX buffer based on arp_match ---
     //
     // If an ARP request matched during RX consume, build a reply
@@ -710,7 +824,7 @@ l2_dispatch:
     add     x11, x19, #TX_QUEUE_OFF               // x11 = TX desc[0] base
     add     x11, x11, x16, lsl #4                 // x11 = TX desc[desc_idx] base (16 B/desc)
     str     x10, [x11, #0]                        // desc.addr (u64)
-    mov     w12, #TX_TEST_PKT_LEN                 // = 72; identical for canary + ARP reply
+    ldr     w12, [sp, #136]                       // b.3: desc_len stash (varies for queue path)
     str     w12, [x11, #8]                        // desc.len
     strh    wzr, [x11, #12]                       // desc.flags = 0
     strh    wzr, [x11, #14]                       // desc.next  = 0
@@ -818,6 +932,41 @@ l2_dispatch:
     // else: queue drained, fall through
 
 .Ltx_writeback:
+    // --- TX API (b.3): pool free + Vyukov slot release ---
+    //
+    // If a queue request was drained this dispatch
+    // ([sp + 128] = 1), the frame has now landed in
+    // TX:RECLAIMED. Free the pool buffer (consumer-only inc on
+    // next_free) and release the Vyukov slot by writing
+    // seq[slot] = tail + 1 + RING_SIZE (release-store via STLR;
+    // the next producer for that slot uses LDAR to see it).
+    // Then bump tail.
+    ldr     w11, [sp, #128]
+    cbz     w11, .Ltx_no_pool_free
+    // Pool free.
+    adrp    x10, __memreq_addr__l2_tx_buffer_pool
+    add     x10, x10, :lo12:__memreq_addr__l2_tx_buffer_pool
+    ldr     x10, [x10]
+    ldr     w11, [x10, #L2_TX_POOL_NEXT_FREE]
+    add     w11, w11, #1
+    str     w11, [x10, #L2_TX_POOL_NEXT_FREE]
+    // Vyukov slot release.
+    adrp    x10, __memreq_addr__l2_tx_pending
+    add     x10, x10, :lo12:__memreq_addr__l2_tx_pending
+    ldr     x10, [x10]
+    ldr     w11, [x10, #L2_TX_PENDING_TAIL]     // w11 = tail
+    and     w12, w11, #L2_TX_RING_MASK          // w12 = slot
+    mov     w13, #L2_TX_SLOT_BYTES
+    umaddl  x13, w12, w13, xzr                  // x13 = slot * 24
+    add     x14, x10, #L2_TX_HEADER_BYTES       // x14 = ring base
+    add     x14, x14, x13                       // x14 = &ring[slot] (seq @ +0)
+    add     w12, w11, #(1 + L2_TX_RING_SIZE)    // w12 = tail + 1 + N
+    stlr    w12, [x14]                           // release-store seq
+    // Bump tail (consumer-only).
+    add     w11, w11, #1
+    str     w11, [x10, #L2_TX_PENDING_TAIL]
+.Ltx_no_pool_free:
+
     // --- FSA-4: write back TX shadows to l2_state ---
     adrp    x10, __memreq_addr__l2_state
     add     x10, x10, :lo12:__memreq_addr__l2_state
@@ -1007,7 +1156,7 @@ l2_dispatch:
     ldp     x22, x23, [sp, #32]
     ldp     x20, x21, [sp, #16]
     ldp     x29, x30, [sp]
-    add     sp, sp, #128                          // FSA-4/FSA-4(A): 128-byte frame
+    add     sp, sp, #144                          // b.3: 128 → 144 for TX API stash
     ret
 
 // --- Strings used by l2_dispatch (file-local .rodata) ---
