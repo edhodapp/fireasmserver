@@ -45,8 +45,13 @@ def test_text_strips_firecracker_log_lines(tmp_path: Path) -> None:
     """Firecracker startup lines are stripped from `text()`.
 
     Mid-line interleave is the production failure mode — emit
-    one guest line that has an FC log line spliced into it and
-    verify the marker is recoverable after the strip.
+    one guest line that has an FC log line spliced into it
+    (broken across two physical lines on disk) and verify the
+    guest marker is reconstituted whole after the strip. This
+    is the exact scenario the SerialLog cleanup was built to
+    handle (Gemini LOW Debug-Leftover, post-cursor-overhaul:
+    the prior test only asserted the FC prefix was absent,
+    not that the guest line was reassembled).
     """
     log = tmp_path / "serial.log"
     log.write_text(
@@ -56,15 +61,13 @@ def test_text_strips_firecracker_log_lines(tmp_path: Path) -> None:
         "00002\n"
     )
     serial = SerialLog(log)
-    # The strip regex consumes only the timestamped-prefix
-    # portion of the broken line, leaving "RX:FAIL num_bufs="
-    # plus the trailing "000\n" plus the next line's "00002".
-    # The recoverable substring depends on how the regex
-    # matches; minimum invariant is that we no longer see the
-    # Firecracker prefix in the output.
     text = serial.text()
     assert "[l2-harness:" not in text
     assert "2026-05-24T16:37:37" not in text
+    # The reconstituted guest line: bytes before the FC
+    # injection ("RX:FAIL num_bufs=000") + bytes after the FC
+    # line's terminator ("00002") = "RX:FAIL num_bufs=00000002".
+    assert "RX:FAIL num_bufs=00000002" in text
 
 
 def _delayed_write(log: Path, payload: str,
@@ -122,18 +125,41 @@ def test_checkpoint_hides_pre_existing_marker(tmp_path: Path) -> None:
     assert serial.wait_for("READY", timeout=_SHORT_WINDOW)
 
 
-def test_assert_marker_absent_is_window_only(tmp_path: Path) -> None:
-    """LOW Gemini finding: `assert_marker_absent` checks only the
-    window, not the full history.
+def test_assert_marker_absent_checks_from_cursor(
+    tmp_path: Path,
+) -> None:
+    """`assert_marker_absent` covers history-since-cursor +
+    window, not just the window.
 
-    A marker that landed BEFORE the call must not trip the
-    assertion; only emissions DURING the window do.
+    The existing test pattern (frame send → wait for positive
+    marker → assert negative absent) needs the forbidden marker
+    flagged even when it lands BEFORE the call but after the
+    stimulus. Default cursor=0 → check from boot. Tests that
+    want narrower coverage call `checkpoint()` first.
     """
     log = tmp_path / "serial.log"
     log.write_text("RX:DROP earlier\n")
     serial = SerialLog(log)
-    # Old behavior would have raised because "RX:DROP" is in
-    # the file. New semantics: only the window matters.
+    # Default cursor=0: the prior RX:DROP must trip the
+    # assertion (regression of test_eth_mac_filter pattern).
+    with pytest.raises(AssertionError) as exc:
+        serial.assert_marker_absent("RX:DROP", window=_SHORT_WINDOW)
+    assert "RX:DROP" in str(exc.value)
+
+
+def test_assert_marker_absent_respects_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """After `checkpoint()`, prior occurrences are ignored.
+
+    Lets a test that calls `checkpoint()` right before its
+    stimulus assert "no forbidden marker since the stimulus"
+    without false positives from earlier in the log.
+    """
+    log = tmp_path / "serial.log"
+    log.write_text("RX:DROP earlier\n")
+    serial = SerialLog(log)
+    serial.checkpoint()
     serial.assert_marker_absent("RX:DROP", window=_SHORT_WINDOW)
 
 
@@ -149,6 +175,30 @@ def test_assert_marker_absent_fires_on_in_window_emit(
     with pytest.raises(AssertionError) as exc:
         serial.assert_marker_absent("RX:DROP", window=_SHORT_WINDOW)
     assert "RX:DROP" in str(exc.value)
+
+
+def test_assert_marker_absent_fails_fast(tmp_path: Path) -> None:
+    """`assert_marker_absent` polls and fails as soon as the
+    forbidden marker lands, not after the full window.
+
+    Validates the Gemini LOW efficiency finding: a forbidden
+    marker that fires 50 ms into a 5 s window should fail in
+    ~100 ms, not 5 s.
+    """
+    log = tmp_path / "serial.log"
+    log.write_text("READY\n")
+    serial = SerialLog(log)
+    _delayed_write(log, "RX:DROP early\n", delay=0.05)
+    start = time.monotonic()
+    with pytest.raises(AssertionError):
+        serial.assert_marker_absent("RX:DROP", window=5.0)
+    elapsed = time.monotonic() - start
+    # Generous bound (3× the expected ~0.05+poll=0.1s); fails
+    # only on the pathological "waited the full window" bug.
+    assert elapsed < 1.0, (
+        f"assert_marker_absent took {elapsed:.2f}s on early "
+        "fail; should poll + bail fast"
+    )
 
 
 def test_assert_marker_observed_raises_with_context_on_miss(

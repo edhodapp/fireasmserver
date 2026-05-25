@@ -42,16 +42,19 @@ WAIT_POLL_INTERVAL_SECONDS = 0.05
 # (e.g., its "Successfully started microvm" line), the two
 # streams interleave mid-line — the guest's "RX:FAIL num_bufs=
 # 00000002\n" becomes "RX:FAIL num_bufs=000<firecracker log
-# line>00002\n", and a literal substring `RX:FAIL num_bufs=
+# line>\n00002\n", and a literal substring `RX:FAIL num_bufs=
 # 00000002` fails to match. The fix: strip every Firecracker
 # log line out of the captured text before substring checks.
 # Pattern matches "2026-05-24T16:37:37.929247818 [l2-harness:
-# <thread>] <rest of line>" anywhere in the buffer — the
+# <thread>] <rest of line>\n" anywhere in the buffer — the
 # date/time prefix is sufficiently unique that no legitimate
-# guest emit will collide.
+# guest emit will collide. The trailing `\n?` consumes the FC
+# line's terminator so an injected line splices out cleanly
+# and the broken guest line is re-joined as a single line
+# (Gemini MED, post-cursor-overhaul review).
 _FIRECRACKER_LOG_LINE_RE = re.compile(
     r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+ "
-    r"\[l2-harness:[^\]]+\] [^\n]*",
+    r"\[l2-harness:[^\]]+\] [^\n]*\n?",
 )
 
 MAX_ASSERT_LOG_LINES = 40
@@ -181,19 +184,41 @@ class SerialLog:
     def checkpoint(self) -> None:
         """Mark current end-of-log as the cursor.
 
-        Subsequent `wait_for` / `assert_marker_observed` only
-        consider content appended after this point. Use to
-        verify repeated events (e.g., second READY after a
-        reboot, or a second TX:RECLAIMED after stimulating
-        another frame).
+        Subsequent `wait_for` / `assert_marker_observed` /
+        `assert_marker_absent` only consider content appended
+        after this point. Use to verify repeated events
+        (e.g., second READY after a reboot, or a second
+        TX:RECLAIMED after stimulating another frame).
+
+        Cursor is recorded as the length of `_cleaned_buf`
+        ONLY — not `_full_cleaned()` — because cleaned_buf is
+        strictly monotonic (lines only land in it after the
+        Firecracker-strip regex has had a chance to remove
+        any FC log lines in them). Including `_raw_partial`'s
+        best-effort-stripped length would let the recorded
+        cursor index a position that later shrinks once the
+        partial line completes and the FC strip runs for
+        real (Gemini HIGH, post-cursor-overhaul review).
         """
         self._refresh()
-        self._cursor = len(self._full_cleaned())
+        self._cursor = len(self._cleaned_buf)
 
     def _text_since_cursor(self) -> str:
-        """Cleaned content appended after the last checkpoint."""
+        """Cleaned content appended after the last checkpoint.
+
+        `_cleaned_buf[cursor:]` is the monotonic part; the
+        best-effort-stripped `_raw_partial` is appended for
+        the in-progress tail line. The latter may shrink on
+        the next refresh once a partial FC log completes,
+        but that only ever REMOVES characters that don't
+        belong to guest output, so a substring match here is
+        either valid now or stays valid after refresh.
+        """
         self._refresh()
-        return self._full_cleaned()[self._cursor:]
+        return (
+            self._cleaned_buf[self._cursor:]
+            + _FIRECRACKER_LOG_LINE_RE.sub("", self._raw_partial)
+        )
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:
         """Block until `marker` appears AFTER the last checkpoint.
@@ -228,33 +253,33 @@ class SerialLog:
 
     def assert_marker_absent(self, marker: str,
                              window: float = 1.0) -> None:
-        """Sleep `window` seconds; raise if `marker` appears DURING the
-        window.
+        """Wait `window` seconds; raise if `marker` appears between
+        the cursor and the end of the window.
 
-        Window-only semantics: captures the log length at entry,
-        sleeps `window` seconds, then checks the delta. A marker
-        that was already present before the call does NOT trigger
-        the assertion — only NEW emissions during the window do.
+        Cursor-based, NOT window-only: covers the existing
+        test pattern of `send frame → wait for positive →
+        assert negative absent`, where a forbidden marker
+        that fires between the stimulus and the positive-wait
+        should still trip the absence assertion. Tests that
+        truly want window-only semantics (ignore prior
+        emissions) call `checkpoint()` before this call.
 
-        This matches the documented intent of the existing
-        callers (see e.g.
-        `test_arp_request_reply.py:155-162`), which use it to
-        verify "no marker fired during the capture window after
-        sending a stimulus." Pre-cursor semantics ("marker
-        nowhere in the log") would have produced false positives
-        on any test that ran after another test in the same
-        guest lifecycle, which is currently masked by the
-        per-test guest fixture but would break the moment a test
-        wanted to verify a sequence of stimuli.
+        Polls every `WAIT_POLL_INTERVAL_SECONDS` so a
+        forbidden marker that lands early in the window
+        fails the test immediately rather than after the
+        full sleep — saves a few hundred ms per failed
+        assertion at unbounded scale (Gemini LOW, post-
+        cursor-overhaul review).
         """
-        self._refresh()
-        window_start = len(self._full_cleaned())
-        time.sleep(window)
-        self._refresh()
-        appended = self._full_cleaned()[window_start:]
-        if marker in appended:
-            raise AssertionError(
-                f"marker {marker!r} unexpectedly observed in "
-                f"{window}s window\n"
-                f"{_tail_for_assert(self.text(), self._path)}"
-            )
+        deadline = time.monotonic() + window
+        while True:
+            since = self._text_since_cursor()
+            if marker in since:
+                raise AssertionError(
+                    f"marker {marker!r} unexpectedly observed "
+                    f"within {window}s\n"
+                    f"{_tail_for_assert(self.text(), self._path)}"
+                )
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(WAIT_POLL_INTERVAL_SECONDS)
