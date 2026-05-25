@@ -125,6 +125,45 @@ def test_checkpoint_hides_pre_existing_marker(tmp_path: Path) -> None:
     assert serial.wait_for("READY", timeout=_SHORT_WINDOW)
 
 
+def test_checkpoint_during_partial_fc_line_no_leak(
+    tmp_path: Path,
+) -> None:
+    """`checkpoint()` taken while a Firecracker log line is
+    mid-write must NOT leak the line's tail into the
+    checkpoint-relative view.
+
+    Codex P2 + Gemini MED from the post-byte-offset review:
+    if the cursor was a byte offset that landed inside a
+    partial FC line, a subsequent re-read would start in the
+    middle of the line, the strip regex (anchored to the
+    timestamp prefix) wouldn't match, and the tail would
+    appear in `_text_since_cursor` output. Snapshot-based
+    cursor sidesteps the leak by recognizing that the
+    snapshot is no longer a prefix of current cleaned text
+    after the FC line completes and falling back to the
+    full cleaned view (which has the FC line correctly
+    stripped).
+    """
+    log = tmp_path / "serial.log"
+    log.write_text(
+        "READY\n"
+        "2026-05-24T16:37:37.929247818 [l2-harness:main] Success"
+    )
+    serial = SerialLog(log)
+    _ = serial.text()
+    serial.checkpoint()
+    # Complete the FC line + append a guest line we will look for.
+    with log.open("a") as fh:
+        fh.write("fully started microvm\nRX:FRAME id=1\n")
+    # wait_for the FC tail string MUST NOT match — FC content
+    # has no business showing up as a "real" event.
+    assert not serial.wait_for(
+        "started microvm", timeout=_SHORT_WINDOW,
+    ), "FC log tail leaked through cursor-relative view"
+    # And the genuine guest event IS visible.
+    assert serial.wait_for("RX:FRAME", timeout=_SHORT_WINDOW)
+
+
 def test_checkpoint_hides_mid_emit_partial(tmp_path: Path) -> None:
     """`checkpoint()` taken while a line is still mid-emit (no
     trailing \\n yet) must hide that line from subsequent

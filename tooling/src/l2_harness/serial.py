@@ -125,15 +125,22 @@ class SerialLog:
         self._cleaned_buf: str = ""
         self._raw_partial: str = ""
         self._bytes_consumed: int = 0
-        # Cursor is the on-disk BYTE OFFSET at which the next
-        # checkpoint-aware read should start. Stored in file-
-        # offset units (not cleaned-buf units) so a marker that
-        # was mid-emit at checkpoint time — sitting in the
-        # `_raw_partial` buffer with no trailing \n yet — is
-        # correctly hidden from a later `wait_for` once its
-        # newline arrives and it migrates into `_cleaned_buf`
-        # (Gemini MED, post-overhaul-fixes review).
-        self._cursor_bytes: int = 0
+        # Cursor is a SNAPSHOT of the cleaned text at checkpoint
+        # time — the literal "what wait_for would see at this
+        # moment" string. Subsequent `_text_since_cursor` calls
+        # compute the current cleaned text and return the suffix
+        # after the snapshot. This handles all edge cases:
+        #   - mid-emit guest line (snapshot includes partial;
+        #     when partial completes, snapshot is still a prefix
+        #     of current → delta is correct)
+        #   - mid-emit FC line (snapshot includes partial-FC
+        #     content that hasn't been stripped yet; when FC
+        #     line completes and gets stripped, snapshot is NO
+        #     LONGER a prefix → we fall back to current and
+        #     correctly hide nothing rather than leak the FC
+        #     tail an offset-based approach would expose)
+        # Codex P2 + Gemini MED, post-byte-offset review.
+        self._cursor_snapshot: str = ""
 
     @property
     def path(self) -> Path:
@@ -166,19 +173,6 @@ class SerialLog:
         self._raw_partial = self._raw_partial[last_nl + 1:]
         self._cleaned_buf += _FIRECRACKER_LOG_LINE_RE.sub("", consumable)
 
-    def _full_cleaned(self) -> str:
-        """Cleaned text of full log so far, including the unfinished
-        tail line (best-effort strip on partial).
-
-        The partial-strip is best-effort because a Firecracker
-        log line currently mid-write may match incompletely; on
-        the next refresh, once the line completes and lands in
-        `_cleaned_buf`, it gets stripped properly.
-        """
-        return self._cleaned_buf + _FIRECRACKER_LOG_LINE_RE.sub(
-            "", self._raw_partial,
-        )
-
     def text(self) -> str:
         """Snapshot the FULL cleaned log as a text string.
 
@@ -187,7 +181,7 @@ class SerialLog:
         the complete history.
         """
         self._refresh()
-        return self._full_cleaned()
+        return self._compute_full_cleaned()
 
     def checkpoint(self) -> None:
         """Mark current end-of-log as the cursor.
@@ -198,45 +192,54 @@ class SerialLog:
         (e.g., second READY after a reboot, or a second
         TX:RECLAIMED after stimulating another frame).
 
-        Cursor is the on-disk byte offset at refresh time, so
-        a marker that was mid-emit (in `_raw_partial`, no \n
-        yet) at checkpoint stays hidden from later `wait_for`
-        once it completes and migrates into `_cleaned_buf` —
-        neither buffer's length is a stable reference point
-        across the partial-to-complete transition, but the
-        file's byte count is.
+        Snapshots the cleaned text — see `_cursor_snapshot`'s
+        comment in `__init__` for why this handles both the
+        mid-emit-guest-line and mid-emit-FC-line edge cases
+        without the byte-offset approach's FC-tail leak.
         """
         self._refresh()
-        self._cursor_bytes = self._bytes_consumed
+        self._cursor_snapshot = self._compute_full_cleaned()
+
+    def _compute_full_cleaned(self) -> str:
+        """Cleaned text view of accumulated content (no cursor).
+
+        `_cleaned_buf` holds lines through the last seen \\n,
+        already FC-stripped. `_raw_partial` is best-effort
+        FC-stripped at query time; a partial FC line that
+        hasn't completed yet won't match the regex (because of
+        the trailing `\\n?` anchor's preference for a complete
+        line; partials still flow through to the result).
+        """
+        return self._cleaned_buf + _FIRECRACKER_LOG_LINE_RE.sub(
+            "", self._raw_partial,
+        )
 
     def _text_since_cursor(self) -> str:
-        """Cleaned content of bytes after the byte-offset cursor.
+        """Cleaned content appended after the last checkpoint.
 
-        Fast path when cursor is at 0 (default after
-        construction): return the in-memory accumulated
-        buffers. Otherwise re-read the file from the cursor
-        offset and strip — adds an open+read per poll but the
-        delta is bounded by test duration (KB at most for
-        sub-second tests), and the alternative
-        (parallel byte-offset bookkeeping per character) would
-        balloon complexity for no measured win.
+        Returns the suffix of the current cleaned text after
+        the snapshot taken at checkpoint. Two cases:
+
+          1. Current text starts with snapshot → return the
+             suffix (the normal case: snapshot stays a stable
+             prefix as new content is appended).
+
+          2. Snapshot is NO LONGER a prefix → the partial
+             content captured in snapshot has since been
+             stripped (e.g., a partial FC line that completed).
+             Fall back to returning current full cleaned text
+             — we lose the discrimination from this checkpoint
+             but it's still correct: every fully-cleaned
+             character in current is genuine guest output, no
+             FC tail leak.
         """
         self._refresh()
-        if self._cursor_bytes == 0:
-            return (
-                self._cleaned_buf
-                + _FIRECRACKER_LOG_LINE_RE.sub(
-                    "", self._raw_partial,
-                )
-            )
-        if not self._path.exists():
-            return ""
-        with self._path.open("rb") as fh:
-            fh.seek(self._cursor_bytes)
-            after = fh.read()
-        return _FIRECRACKER_LOG_LINE_RE.sub(
-            "", after.decode("utf-8", errors="replace"),
-        )
+        current = self._compute_full_cleaned()
+        if self._cursor_snapshot and current.startswith(
+            self._cursor_snapshot,
+        ):
+            return current[len(self._cursor_snapshot):]
+        return current
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:
         """Block until `marker` appears AFTER the last checkpoint.
