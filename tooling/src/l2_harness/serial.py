@@ -125,7 +125,15 @@ class SerialLog:
         self._cleaned_buf: str = ""
         self._raw_partial: str = ""
         self._bytes_consumed: int = 0
-        self._cursor: int = 0
+        # Cursor is the on-disk BYTE OFFSET at which the next
+        # checkpoint-aware read should start. Stored in file-
+        # offset units (not cleaned-buf units) so a marker that
+        # was mid-emit at checkpoint time — sitting in the
+        # `_raw_partial` buffer with no trailing \n yet — is
+        # correctly hidden from a later `wait_for` once its
+        # newline arrives and it migrates into `_cleaned_buf`
+        # (Gemini MED, post-overhaul-fixes review).
+        self._cursor_bytes: int = 0
 
     @property
     def path(self) -> Path:
@@ -190,34 +198,44 @@ class SerialLog:
         (e.g., second READY after a reboot, or a second
         TX:RECLAIMED after stimulating another frame).
 
-        Cursor is recorded as the length of `_cleaned_buf`
-        ONLY — not `_full_cleaned()` — because cleaned_buf is
-        strictly monotonic (lines only land in it after the
-        Firecracker-strip regex has had a chance to remove
-        any FC log lines in them). Including `_raw_partial`'s
-        best-effort-stripped length would let the recorded
-        cursor index a position that later shrinks once the
-        partial line completes and the FC strip runs for
-        real (Gemini HIGH, post-cursor-overhaul review).
+        Cursor is the on-disk byte offset at refresh time, so
+        a marker that was mid-emit (in `_raw_partial`, no \n
+        yet) at checkpoint stays hidden from later `wait_for`
+        once it completes and migrates into `_cleaned_buf` —
+        neither buffer's length is a stable reference point
+        across the partial-to-complete transition, but the
+        file's byte count is.
         """
         self._refresh()
-        self._cursor = len(self._cleaned_buf)
+        self._cursor_bytes = self._bytes_consumed
 
     def _text_since_cursor(self) -> str:
-        """Cleaned content appended after the last checkpoint.
+        """Cleaned content of bytes after the byte-offset cursor.
 
-        `_cleaned_buf[cursor:]` is the monotonic part; the
-        best-effort-stripped `_raw_partial` is appended for
-        the in-progress tail line. The latter may shrink on
-        the next refresh once a partial FC log completes,
-        but that only ever REMOVES characters that don't
-        belong to guest output, so a substring match here is
-        either valid now or stays valid after refresh.
+        Fast path when cursor is at 0 (default after
+        construction): return the in-memory accumulated
+        buffers. Otherwise re-read the file from the cursor
+        offset and strip — adds an open+read per poll but the
+        delta is bounded by test duration (KB at most for
+        sub-second tests), and the alternative
+        (parallel byte-offset bookkeeping per character) would
+        balloon complexity for no measured win.
         """
         self._refresh()
-        return (
-            self._cleaned_buf[self._cursor:]
-            + _FIRECRACKER_LOG_LINE_RE.sub("", self._raw_partial)
+        if self._cursor_bytes == 0:
+            return (
+                self._cleaned_buf
+                + _FIRECRACKER_LOG_LINE_RE.sub(
+                    "", self._raw_partial,
+                )
+            )
+        if not self._path.exists():
+            return ""
+        with self._path.open("rb") as fh:
+            fh.seek(self._cursor_bytes)
+            after = fh.read()
+        return _FIRECRACKER_LOG_LINE_RE.sub(
+            "", after.decode("utf-8", errors="replace"),
         )
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:

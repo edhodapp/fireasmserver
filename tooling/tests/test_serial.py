@@ -125,6 +125,33 @@ def test_checkpoint_hides_pre_existing_marker(tmp_path: Path) -> None:
     assert serial.wait_for("READY", timeout=_SHORT_WINDOW)
 
 
+def test_checkpoint_hides_mid_emit_partial(tmp_path: Path) -> None:
+    """`checkpoint()` taken while a line is still mid-emit (no
+    trailing \\n yet) must hide that line from subsequent
+    wait_for calls once it completes.
+
+    Gemini MED finding from the post-overhaul-fixes review:
+    if cursor only counted the cleaned buffer, a marker that
+    later migrates from `_raw_partial` to `_cleaned_buf`
+    (when its newline arrives) would slip past the cursor and
+    falsely match wait_for. Byte-offset cursor fixes that.
+    """
+    log = tmp_path / "serial.log"
+    log.write_text("READY")  # no \n yet — sits in raw_partial
+    serial = SerialLog(log)
+    # Force a refresh so the buffer state reflects the file.
+    _ = serial.text()
+    serial.checkpoint()
+    # Complete the line. Now "READY" lives in _cleaned_buf;
+    # the byte-offset cursor must still hide it.
+    with log.open("a") as fh:
+        fh.write("\n")
+    assert not serial.wait_for("READY", timeout=_SHORT_WINDOW), (
+        "checkpoint must hide a marker that was mid-emit at "
+        "checkpoint time even after it completes"
+    )
+
+
 def test_assert_marker_absent_checks_from_cursor(
     tmp_path: Path,
 ) -> None:
