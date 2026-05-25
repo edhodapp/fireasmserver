@@ -965,6 +965,15 @@ _entry:
     bl      arp_resolve                     // expect OK
     add     sp, sp, #16
 
+    // --- Phase 6.e.2: INCOMPLETE entry that nobody replies to. ---
+    // 192.168.42.100 (wire LE 0x642AA8C0). tap0's host won't
+    // reply; tick eventually transitions INCOMPLETE → FAILED.
+    sub     sp, sp, #16
+    ldr     w0, =0x642AA8C0
+    mov     x1, sp
+    bl      arp_resolve                     // expect PENDING
+    add     sp, sp, #16
+
     // Re-derive UART base for the dispatch loop's emit chains
     // (dispatcher caller-contract: x0 = UART base).
     movz    x0, #0x4000, lsl #16

@@ -34,7 +34,8 @@
 // 3=STALE, 4=PROBE, 5=FAILED — phase 6.e wires the transitions
 
 .equ ARP_STATE_STALE,           3
-// 4=PROBE, 5=FAILED — phase 6.e follow-ons
+.equ ARP_STATE_PROBE,           4
+.equ ARP_STATE_FAILED,          5
 
 .equ ARP_RESOLVE_OK,            0
 .equ ARP_RESOLVE_PENDING,       1
@@ -369,10 +370,11 @@ arp_resolve_failed_msg_end:
 // Emits ARP:STATE_CHANGE ip=XXXXXXXX old=N new=N on each
 // transition. Uses x19/x20/x21 callee-saved internally.
 arp_cache_tick:
-    stp     x29, x30, [sp, #-48]!
+    stp     x29, x30, [sp, #-64]!
     mov     x29, sp
     stp     x19, x20, [sp, #16]
-    str     x21, [sp, #32]
+    stp     x21, x22, [sp, #32]
+    str     x23, [sp, #48]
 
     mrs     x19, cntvct_el0                  // x19 = now
     adrp    x20, __memreq_addr__arp_cache
@@ -383,37 +385,62 @@ arp_cache_tick:
 .Ltick_scan:
     ldrb    w10, [x21, #ARP_ENTRY_STATE]
     cmp     w10, #ARP_STATE_REACHABLE
-    b.ne    .Ltick_next
+    b.eq    .Ltick_reachable
+    cmp     w10, #ARP_STATE_INCOMPLETE
+    b.eq    .Ltick_incomplete
+    b       .Ltick_next
+
+.Ltick_reachable:
     ldr     x11, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
-    sub     x11, x19, x11                    // x11 = age cycles
-    // ARP_AGING_CYCLES = 5_400_000 = 0x0052_4980. Construct
-    // in w12 via movz+movk to avoid the literal-pool alignment
-    // hazard that ldr =CONST hit on the assembler's first
-    // placement attempt. Zero-extension of w12 → x12 is
-    // automatic on the mov forms.
+    sub     x11, x19, x11
+    // ARP_AGING_CYCLES = 5_400_000 = 0x0052_4980. movz+movk
+    // to avoid the literal-pool alignment hazard.
     movz    w12, #0x4980
     movk    w12, #0x0052, lsl #16
     cmp     x11, x12
     b.lo    .Ltick_next
-    // REACHABLE → STALE.
     mov     w10, #ARP_STATE_STALE
     strb    w10, [x21, #ARP_ENTRY_STATE]
-    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]   // restart age clock
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    mov     w22, #ARP_STATE_REACHABLE       // old state for marker
+    mov     w23, #ARP_STATE_STALE           // new state for marker
+    b       .Ltick_emit_state_change
 
+.Ltick_incomplete:
+    // INCOMPLETE entry — arp_resolve issued the request, no
+    // reply arrived. 6.e.2 minimum: after AGING_CYCLES,
+    // transition to FAILED. Retry logic + PROBE arrive in
+    // 6.e.3/6.e.4.
+    ldr     x11, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    sub     x11, x19, x11
+    movz    w12, #0x4980
+    movk    w12, #0x0052, lsl #16
+    cmp     x11, x12
+    b.lo    .Ltick_next
+    mov     w10, #ARP_STATE_FAILED
+    strb    w10, [x21, #ARP_ENTRY_STATE]
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    mov     w22, #ARP_STATE_INCOMPLETE
+    mov     w23, #ARP_STATE_FAILED
+    // fall through
+
+.Ltick_emit_state_change:
+    // w22 = old state, w23 = new state. x21 + x20 + x19
+    // are callee-saved across emit calls.
     adr     x1, arp_state_change_prefix_msg
     mov     w2, #(arp_state_change_prefix_end - arp_state_change_prefix_msg)
     bl      emit_bytes
-    ldr     w5, [x21]                        // ip
+    ldr     w5, [x21]
     bl      emit_hex32
     adr     x1, arp_state_change_old_msg
     mov     w2, #(arp_state_change_old_end - arp_state_change_old_msg)
     bl      emit_bytes
-    mov     w5, #ARP_STATE_REACHABLE
+    mov     w5, w22
     bl      emit_hex32
     adr     x1, arp_state_change_new_msg
     mov     w2, #(arp_state_change_new_end - arp_state_change_new_msg)
     bl      emit_bytes
-    mov     w5, #ARP_STATE_STALE
+    mov     w5, w23
     bl      emit_hex32
     adr     x1, arp_send_newline
     mov     w2, #1
@@ -424,9 +451,10 @@ arp_cache_tick:
     cmp     w9, #ARP_CACHE_ENTRIES
     b.lo    .Ltick_scan
 
-    ldr     x21, [sp, #32]
+    ldr     x23, [sp, #48]
+    ldp     x21, x22, [sp, #32]
     ldp     x19, x20, [sp, #16]
-    ldp     x29, x30, [sp], #48
+    ldp     x29, x30, [sp], #64
     ret
 
 .section .rodata

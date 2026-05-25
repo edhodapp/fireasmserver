@@ -64,7 +64,8 @@ ARP_STATE_REACHABLE       equ 2
 ; 3=STALE, 4=PROBE, 5=FAILED — phase 6.e wires the transitions
 
 ARP_STATE_STALE           equ 3
-; 4=PROBE, 5=FAILED — phase 6.e follow-ons
+ARP_STATE_PROBE           equ 4
+ARP_STATE_FAILED          equ 5
 
 ARP_RESOLVE_OK            equ 0
 ARP_RESOLVE_PENDING       equ 1
@@ -453,18 +454,48 @@ arp_cache_tick:
     xor ecx, ecx                                       ; ecx = slot index
 .tick_scan:
     movzx eax, byte [r10 + ARP_ENTRY_STATE]
+    ; Branch on state — only REACHABLE and INCOMPLETE drive
+    ; transitions today. STALE/PROBE/FAILED entries are leaf
+    ; states for this commit; 6.e.3 + 6.e.4 wire their tick
+    ; behavior.
     cmp al, ARP_STATE_REACHABLE
-    jne .tick_next
+    je  .tick_reachable
+    cmp al, ARP_STATE_INCOMPLETE
+    je  .tick_incomplete
+    jmp .tick_next
+
+.tick_reachable:
     mov rdx, rbx
-    sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]       ; rdx = age in cycles
+    sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]
     cmp rdx, ARP_AGING_CYCLES
     jb  .tick_next
-    ; Aging threshold exceeded — transition REACHABLE → STALE.
     mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_STALE
-    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx       ; restart age clock
-    ; Emit ARP:STATE_CHANGE ip=XXXXXXXX old=02 new=03
-    push rcx                                           ; preserve scan index
-    push r10                                           ; preserve walker
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
+    mov edi, ARP_STATE_REACHABLE
+    mov esi, ARP_STATE_STALE
+    jmp .tick_emit_state_change
+
+.tick_incomplete:
+    ; INCOMPLETE entry — arp_resolve issued the request, no
+    ; reply arrived. Phase 6.e.2 minimum: after AGING_CYCLES
+    ; elapse, transition to FAILED. Retry logic (6.e.3) and
+    ; PROBE state (6.e.4) layer on top.
+    mov rdx, rbx
+    sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]
+    cmp rdx, ARP_AGING_CYCLES
+    jb  .tick_next
+    mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_FAILED
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
+    mov edi, ARP_STATE_INCOMPLETE
+    mov esi, ARP_STATE_FAILED
+    ; fall through to emit
+
+.tick_emit_state_change:
+    ; edi = old state, esi = new state.
+    push rcx
+    push r10
+    push rdi                                           ; preserve old-state arg
+    push rsi                                           ; preserve new-state arg
     lea rsi, [rel arp_state_change_prefix_msg]
     mov ecx, arp_state_change_prefix_len
     call emit_bytes
@@ -473,16 +504,18 @@ arp_cache_tick:
     lea rsi, [rel arp_state_change_old_msg]
     mov ecx, arp_state_change_old_len
     call emit_bytes
-    mov eax, ARP_STATE_REACHABLE
+    mov eax, [rsp + 8]                                 ; old state
     call emit_hex32
     lea rsi, [rel arp_state_change_new_msg]
     mov ecx, arp_state_change_new_len
     call emit_bytes
-    mov eax, ARP_STATE_STALE
+    mov eax, [rsp + 0]                                 ; new state
     call emit_hex32
     lea rsi, [rel arp_send_newline]
     mov ecx, 1
     call emit_bytes
+    pop rsi
+    pop rdi
     pop r10
     pop rcx
 .tick_next:

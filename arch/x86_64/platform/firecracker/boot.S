@@ -925,6 +925,19 @@ kernel_main_64:
     mov rsi, rsp
     call arp_resolve                                 ; expect OK
     add rsp, 16
+
+    ; --- Phase 6.e.2: INCOMPLETE entry that nobody replies to. ---
+    ; 192.168.42.100 (wire LE 0x642AA8C0) isn't in tap0's host
+    ; kernel routing → Linux won't reply. The arp_resolve
+    ; below inserts an INCOMPLETE entry and sends one request;
+    ; tick fires after ARP_AGING_CYCLES and transitions to
+    ; FAILED. Test asserts ARP:STATE_CHANGE ip=642AA8C0
+    ; old=00000001 new=00000005.
+    sub rsp, 16                                      ; scratch for resolve out-buf
+    mov edi, 0x642AA8C0
+    mov rsi, rsp
+    call arp_resolve                                 ; expect PENDING (cache miss)
+    add rsp, 16
 %endif
     mov ebx, 100
 .dispatch_loop:

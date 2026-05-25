@@ -94,3 +94,37 @@ def test_reachable_entry_ages_to_stale(
             timeout=MARKER_TIMEOUT_SECONDS,
         )
         time.sleep(0.1)
+
+
+# pylint: disable=unused-argument,invalid-name
+def test_incomplete_entry_ages_to_failed(
+    _ensure_txapi_built_for_state: None,
+    artifact_dir: Path,
+) -> None:
+    """An INCOMPLETE entry that never gets a reply transitions
+    to FAILED after ARP_AGING_CYCLES elapse.
+
+    The 6.e.2 pre-bake calls arp_resolve(192.168.42.100), an
+    IP nobody on tap0 routes for; the request goes out, no
+    reply arrives, the entry stays INCOMPLETE until the tick
+    ages it. 6.e.3 will add retry behavior (currently the
+    entry just times out and gives up after one request).
+    """
+    cfg = FirecrackerConfig(
+        kernel_image_path=TXAPI_GUEST_ELF,
+        artifact_dir=artifact_dir,
+    )
+    with launched_guest(cfg) as guest:
+        serial = SerialLog(guest.serial_log_path)
+        # The miss path emits ARP:RESOLVE_PENDING and inserts
+        # INCOMPLETE. Wait for that as the precondition.
+        serial.assert_marker_observed(
+            "ARP:RESOLVE_PENDING ip=642AA8C0",
+            timeout=MARKER_TIMEOUT_SECONDS,
+        )
+        # Then wait for tick to drive the timeout transition.
+        serial.assert_marker_observed(
+            "ARP:STATE_CHANGE ip=642AA8C0 old=00000001 new=00000005",
+            timeout=MARKER_TIMEOUT_SECONDS,
+        )
+        time.sleep(0.1)
