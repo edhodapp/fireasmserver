@@ -185,12 +185,34 @@ arp_send_request:
     mov     w2, #3
     bl      emit_bytes
 
+    // BREADCRUMB G1A: about to bl l2_tx_buffer_pool_alloc
+    adr     x1, gb_g1a
+    mov     w2, #4
+    bl      emit_bytes
+
     bl      l2_tx_buffer_pool_alloc             // w0 = pool_idx
+
+    // BREADCRUMB G1B: alloc returned
+    mov     w19, w19                            // (keep w19 = target_ip)
+    stp     x0, x1, [sp, #-16]!                 // save alloc result
+    adr     x1, gb_g1b
+    mov     w2, #4
+    bl      emit_bytes
+    ldp     x0, x1, [sp], #16
+
     cmn     w0, #1                              // == 0xFFFFFFFF?
     b.eq    .Larp_send_full
     mov     w20, w0
 
     bl      l2_tx_buffer_addr                   // x0 = pool buffer base
+
+    // BREADCRUMB G1C: addr returned
+    stp     x0, x1, [sp, #-16]!
+    adr     x1, gb_g1c
+    mov     w2, #4
+    bl      emit_bytes
+    ldp     x0, x1, [sp], #16
+
     add     x9, x0, #L2_TX_PAYLOAD_OFFSET       // x9 = payload start
 
     mov     w10, #0x0100
@@ -544,6 +566,9 @@ arp_state_change_new_msg:
     .ascii  " new="
 arp_state_change_new_end:
 // 6.f Pi-hang diagnosis breadcrumbs. Remove once isolated.
-gb_g1: .ascii "G1\n"
-gb_g2: .ascii "G2\n"
-gb_g3: .ascii "G3\n"
+gb_g1:  .ascii "G1\n"
+gb_g1a: .ascii "G1A\n"
+gb_g1b: .ascii "G1B\n"
+gb_g1c: .ascii "G1C\n"
+gb_g2:  .ascii "G2\n"
+gb_g3:  .ascii "G3\n"
