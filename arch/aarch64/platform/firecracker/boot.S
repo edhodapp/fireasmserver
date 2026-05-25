@@ -1322,10 +1322,10 @@ newline_msg_end:
 
 // tx_test_pkt's src MAC must stay in sync with the GUEST_MAC
 // constants in arch/aarch64/l2/dispatcher.S (which the MAC
-// filter compares incoming dst MACs against, and which
-// arp_reply_template uses for outgoing ARP src+SHA). Each
-// file asserts ETH-016 locally; cross-file consistency is
-// human discipline.
+// filter compares incoming dst MACs against, and which the
+// dispatcher writes as SHA into ARP reply payloads enqueued
+// via the TX API). Each file asserts ETH-016 locally;
+// cross-file consistency is human discipline.
 .equ GUEST_MAC_BYTE_0,          0x02
 .equ GUEST_MAC_BYTE_1,          0x00
 .equ GUEST_MAC_BYTE_2,          0x00
@@ -1336,7 +1336,7 @@ newline_msg_end:
 // ETH-016 (IEEE 802.3 §4.1.2.1): outgoing source MAC MUST
 // have the unicast bit clear. tx_test_pkt's src MAC is the
 // only outgoing src this file places; the dispatcher's
-// arp_reply_template handles its own. Build-time check.
+// ARP reply builder writes its own (asserted there too).
 .if GUEST_MAC_BYTE_0 & 1
 .error "ETH-016: GUEST_MAC_BYTE_0 has multicast bit set"
 .endif

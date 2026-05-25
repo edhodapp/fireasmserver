@@ -172,9 +172,14 @@ l2_dispatch:
     //   [sp +  92..95]: padding
     //   [sp +  96..99]: tx_next_avail stash (u32; FSA-4)
     //   [sp + 100..103]: padding
-    //   [sp + 104..107]: arp_match flag (u32; FSA-4(A))
-    //   [sp + 108..111]: sender_ip stash (u32; FSA-4(A))
-    //   [sp + 112..117]: sender_mac stash (6 bytes; FSA-4(A))
+    //   [sp + 104..107]: unused (formerly arp_match flag,
+    //                    removed in phase c.3 when the ARP
+    //                    responder migrated to the TX API
+    //                    queue path)
+    //   [sp + 108..111]: sender_ip stash (FSA-4(A); the ARP
+    //                    enqueue copies TPA from here)
+    //   [sp + 112..117]: sender_mac stash (6 bytes; THA + dst
+    //                    MAC for the ARP enqueue)
     //   [sp + 118..127]: padding
     //   [sp + 128..131]: TX API use_queue flag (b.3; 0/1)
     //   [sp + 132..135]: TX API pool_idx stash (b.3)
@@ -224,7 +229,6 @@ l2_dispatch:
     ldrh    w28, [x10, #L2_STATE_RX_USED_SHADOW]
     str     wzr, [sp, #88]                   // per-dispatch counter = 0
     str     wzr, [sp, #96]                   // tx_next_avail stash = 0 (TX phase fills)
-    str     wzr, [sp, #104]                  // arp_match flag = 0 (set by ARP recognition)
     str     wzr, [sp, #128]                  // b.3: use_queue = 0
     mov     w11, #TX_TEST_PKT_LEN
     str     w11, [sp, #136]                  // b.3: desc_len default
@@ -532,8 +536,6 @@ l2_dispatch:
     strh    w14, [sp, #116]
     ldr     w14, [x9, #40]                        // SPA (offset 40 is 8-aligned)
     str     w14, [sp, #108]
-    mov     w14, #1
-    str     w14, [sp, #104]                       // arp_match = 1
 
     adr     x1, arp_request_msg
     mov     w2, #(arp_request_msg_end - arp_request_msg)
@@ -1281,33 +1283,3 @@ arp_reply_msg:
     .ascii  "ARP:REPLY\n"
 arp_reply_msg_end:
 
-// FSA-4(A) ARP reply template — 72 bytes, copied verbatim into
-// tx_arp_buf then patched with dst MAC / THA / TPA from the
-// stashed request info. Pre-baked fields: src MAC (GUEST_MAC),
-// EtherType (ARP), HTYPE / PTYPE / HLEN / PLEN, OPER (reply),
-// SHA (GUEST_MAC), SPA (GUEST_IP = 192.168.42.2).
-//
-// GUEST_MAC = 02:00:00:00:00:01 (locally-administered, matches
-// the tx_test_pkt canary's src MAC for ARP-table consistency).
-.align 4
-arp_reply_template:
-    // virtio_net_hdr (12 bytes zero)
-    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-    // Ethernet header
-    .byte   0, 0, 0, 0, 0, 0                              // dst MAC (patched)
-    .byte   GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  // src MAC = GUEST_MAC
-    .byte   0x08, 0x06                                   // EtherType = ARP (BE)
-    // ARP payload (28 bytes)
-    .byte   0x00, 0x01                                   // HTYPE = Ethernet (BE)
-    .byte   0x08, 0x00                                   // PTYPE = IPv4 (BE)
-    .byte   0x06                                         // HLEN  = 6
-    .byte   0x04                                         // PLEN  = 4
-    .byte   0x00, 0x02                                   // OPER  = reply (BE)
-    .byte   GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  // SHA = GUEST_MAC
-    .byte   0xC0, 0xA8, 0x2A, 0x02                       // SPA   = GUEST_IP (192.168.42.2)
-    .byte   0, 0, 0, 0, 0, 0                              // THA   (patched)
-    .byte   0, 0, 0, 0                                    // TPA   (patched)
-    // Ethernet padding to 60-byte minimum frame (12+14+28 = 54;
-    // need 12+60 = 72 total → 18 bytes of zero pad below).
-    .byte   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-arp_reply_template_end:

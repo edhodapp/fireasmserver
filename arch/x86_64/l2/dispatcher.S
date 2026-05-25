@@ -131,9 +131,6 @@ extern __memreq_addr__rx_buffer
 ; FSA-4: persistent shadow storage (4 × u16, see regions.yaml l2_state).
 extern __memreq_addr__l2_state
 
-; FSA-4(A): writable TX buffer for ARP replies (see regions.yaml tx_arp_buf).
-extern __memreq_addr__tx_arp_buf
-
 ; TX API (phase b.3): producer queue + payload buffer pool.
 ; Consumer side lives in this dispatcher's TX phase — drains
 ; the queue, builds a frame in the chosen pool buffer, submits.
@@ -234,11 +231,13 @@ l2_dispatch:
     ;                   optional ARP:REQUEST marker emit since
     ;                   emit_bytes clobbers edi as its LSR-poll
     ;                   counter = UART_POLL_TIMEOUT)
-    ;   [rsp + 16..19]: arp_match flag (FSA-4(A); zeroed at entry,
-    ;                   set in the ARP recognition path)
-    ;   [rsp + 20..23]: sender_ip stash (FSA-4(A); ARP reply
-    ;                   patches THA/TPA from here)
-    ;   [rsp + 24..29]: sender_mac stash (6 bytes for ARP reply)
+    ;   [rsp + 16..19]: unused (formerly arp_match flag, removed
+    ;                   in phase c.3 when the ARP responder
+    ;                   migrated to the TX API queue path)
+    ;   [rsp + 20..23]: sender_ip stash (FSA-4(A); the TX API
+    ;                   ARP enqueue copies TPA from here)
+    ;   [rsp + 24..29]: sender_mac stash (6 bytes; THA + dst MAC
+    ;                   for the ARP reply enqueue)
     ;   [rsp + 30..31]: padding
     ;   [rsp + 32..35]: TX API use_queue flag (b.3; 0 = no request
     ;                   drained, 1 = request drained → cleanup at
@@ -274,7 +273,6 @@ l2_dispatch:
     movzx ebp,  word [rax + L2_STATE_RX_USED_SHADOW]
     mov dword [rsp + 0], 0                           ; per-dispatch RX frame counter
     mov dword [rsp + 8], 0                           ; tx_next_avail stash (TX phase will fill)
-    mov dword [rsp + 16], 0                          ; FSA-4(A): arp_match flag
     mov dword [rsp + 32], 0                          ; b.3: use_queue = 0
     mov dword [rsp + 40], TX_TEST_PKT_LEN            ; b.3: desc_len default
 
@@ -547,7 +545,6 @@ l2_dispatch:
     mov [rsp + 28], r10w
     mov r10d, [rax + 40]                             ; SPA
     mov [rsp + 20], r10d
-    mov dword [rsp + 16], 1                          ; arp_match = 1
 
     lea rsi, [rel arp_request_msg]
     mov ecx, arp_request_len
@@ -1254,44 +1251,14 @@ tx_used_len_len          equ $ - tx_used_len_msg
 tx_bad_id_msg:           db 'TX:FAIL bad_id='
 tx_bad_id_len            equ $ - tx_bad_id_msg
 
-; FSA-4(A) ARP responder markers.
+; FSA-4(A) ARP responder markers. The reply now flows through
+; the TX API queue (phase c); these markers fire at the
+; recognition site, ARP:REPLY right after a successful
+; l2_tx_enqueue.
 arp_request_msg:         db 'ARP:REQUEST', 10
 arp_request_len          equ $ - arp_request_msg
 arp_reply_msg:           db 'ARP:REPLY', 10
 arp_reply_len            equ $ - arp_reply_msg
-
-; FSA-4(A) ARP reply template — 72 bytes, copied verbatim into
-; tx_arp_buf then patched with dst MAC / THA / TPA from the
-; stashed request info. Pre-baked fields: src MAC (GUEST_MAC),
-; EtherType (ARP), HTYPE / PTYPE / HLEN / PLEN, OPER (reply),
-; SHA (GUEST_MAC), SPA (GUEST_IP = 192.168.42.2).
-;
-; GUEST_MAC = 02:00:00:00:00:01 matches the tx_test_pkt canary's
-; src MAC for ARP-table consistency.
-align 16
-arp_reply_template:
-    ; virtio_net_hdr (12 zero bytes)
-    times 12 db 0
-    ; Ethernet header
-    times 6  db 0                                    ; dst MAC (patched)
-    db GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, \
-       GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  ; src MAC = GUEST_MAC
-    db 0x08, 0x06                                    ; EtherType = ARP (BE)
-    ; ARP payload (28 bytes)
-    db 0x00, 0x01                                    ; HTYPE = Ethernet (BE)
-    db 0x08, 0x00                                    ; PTYPE = IPv4 (BE)
-    db 0x06                                          ; HLEN
-    db 0x04                                          ; PLEN
-    db 0x00, 0x02                                    ; OPER = reply (BE)
-    db GUEST_MAC_BYTE_0, GUEST_MAC_BYTE_1, GUEST_MAC_BYTE_2, \
-       GUEST_MAC_BYTE_3, GUEST_MAC_BYTE_4, GUEST_MAC_BYTE_5  ; SHA = GUEST_MAC
-    db 0xC0, 0xA8, 0x2A, 0x02                        ; SPA = GUEST_IP
-    times 6  db 0                                    ; THA (patched)
-    times 4  db 0                                    ; TPA (patched)
-    ; Ethernet padding to 60-byte minimum frame.
-    times 18 db 0
-arp_reply_template_end:
-
 ; Mark the stack as non-executable. Without this section the linker
 ; assumes RWX stack and warns; the other NASM-emitted units in this
 ; build (arch/x86_64/memory/*.S) do the same.

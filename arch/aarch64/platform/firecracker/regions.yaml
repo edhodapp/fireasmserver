@@ -89,21 +89,6 @@ regions:
       lives here and grows to one region per core when multi-core
       wake lands.
 
-  - name: tx_arp_buf
-    tier: cold
-    lifetime: steady_state
-    owner: 0
-    writable: true
-    size: 128        # 12 B virtio_net_hdr + 60 B Ethernet min (14 hdr + 28 ARP + 18 pad) + slack
-    align: 16
-    doc: >
-      Writable TX scratch buffer for FSA-4(A) — the ARP responder
-      writes its reply Ethernet frame here when an inbound ARP
-      request for our IP arrives. l2_dispatch submits TX descriptor
-      0 pointing at this region (when arp_match is set during a
-      dispatch); otherwise descriptor 0 points at the rodata
-      canary frame (tx_test_pkt) as before. Mirrors aarch64.
-
   - name: l2_state
     tier: cold
     lifetime: steady_state
