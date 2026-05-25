@@ -177,6 +177,7 @@ extern mode_switch_to_long_mode
 extern init_memory_layout
 extern l2_dispatch          ; arch/x86_64/l2/dispatcher.S (FSA-1)
 extern l2_tx_pending_init   ; arch/x86_64/l2/tx_api.S — Vyukov ring seq[] pre-init
+extern arp_cache_tick       ; arch/x86_64/l2/arp_cache.S — D068 item 6.e timer ticks
 %ifdef TXAPI_PREBAKE
 ; arch/x86_64/l2/tx_api.S — producer-side functions for the TX
 ; API end-to-end test pre-bake. Build-flag-gated so production
@@ -930,6 +931,12 @@ kernel_main_64:
     call l2_dispatch
     test eax, eax
     jnz .set_failed
+    ; D068 item 6.e: drive ARP cache timer-based transitions
+    ; (REACHABLE → STALE; further transitions in follow-on
+    ; commits). One tick per dispatcher iteration. Tick uses
+    ; only caller-saved regs + its own stack frame; r12/r13/r15
+    ; pinned state survives automatically (callee-saved).
+    call arp_cache_tick
     dec ebx
     jnz .dispatch_loop
     jmp .halt

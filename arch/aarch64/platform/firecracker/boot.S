@@ -974,6 +974,13 @@ _entry:
 .Ldispatch_loop:
     bl      l2_dispatch
     cbnz    w0, .Lset_failed
+    // D068 item 6.e: drive ARP cache timer transitions.
+    // Once per dispatcher iteration. Tick uses its own
+    // stack frame + AAPCS64-callee-saved regs internally
+    // (x19/x20/x21); the boot loop's x20 counter is
+    // preserved across the call because tick's prologue
+    // saves it.
+    bl      arp_cache_tick
     subs    x20, x20, #1
     b.ne    .Ldispatch_loop
     b       .Lflush

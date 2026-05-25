@@ -63,9 +63,24 @@ ARP_STATE_INCOMPLETE      equ 1
 ARP_STATE_REACHABLE       equ 2
 ; 3=STALE, 4=PROBE, 5=FAILED — phase 6.e wires the transitions
 
+ARP_STATE_STALE           equ 3
+; 4=PROBE, 5=FAILED — phase 6.e follow-ons
+
 ARP_RESOLVE_OK            equ 0
 ARP_RESOLVE_PENDING       equ 1
 ARP_RESOLVE_FAILED        equ 2
+
+ARP_ENTRY_LAST_EVENT_CYCLES   equ 16          ; u64
+; ARP_ENTRY_NEXT_ACTION_CYCLES equ 24 — phase 6.e follow-on
+
+; Aging threshold in CPU cycles. ~100 ms at 3 GHz on x86 — long
+; enough that normal traffic doesn't spuriously age entries
+; between dispatcher iterations (microsecond scale), short
+; enough that tests observe REACHABLE → STALE within a few
+; seconds of boot. Production tuning lands when the dispatcher
+; gains CNTFRQ-based calibration; for the MVP this is a flat
+; assumption.
+ARP_AGING_CYCLES          equ 300000000
 
 extern __memreq_addr__arp_cache
 
@@ -97,6 +112,7 @@ global arp_cache_lookup
 global arp_cache_insert
 global arp_send_request
 global arp_resolve
+global arp_cache_tick
 
 [bits 64]
 section .text
@@ -198,6 +214,16 @@ arp_cache_insert:
     inc eax
     mov [r8 + ARP_CACHE_HDR_GEN], eax
     mov [rdx + ARP_ENTRY_LRU_GEN], eax
+    ; Stamp last_event_time (phase 6.e). RDTSC gives a 64-bit
+    ; cycle count; aging is measured as `now - last_event`
+    ; per arp_cache_tick. Save rdx (entry pointer) across the
+    ; RDTSC clobber.
+    push rdx
+    rdtsc                                              ; eax = lo, edx = hi
+    shl rdx, 32
+    or rax, rdx
+    pop rdx
+    mov [rdx + ARP_ENTRY_LAST_EVENT_CYCLES], rax
     pop rbx
     ret
 
@@ -398,6 +424,76 @@ arp_resolve:
     pop rbx
     ret
 
+; ================================================================
+; arp_cache_tick — drive timer-based state transitions
+; ================================================================
+; Caller: dispatcher loop, once per iteration. Walks all 16
+; entries; for each non-FREE entry, compares (now -
+; last_event_time) against ARP_AGING_CYCLES and applies the
+; appropriate transition.
+;
+; Today: only REACHABLE → STALE is implemented. The remaining
+; transitions (INCOMPLETE retry → FAILED, STALE → PROBE,
+; PROBE → REACHABLE/FAILED) land in 6.e follow-on commits.
+;
+; Each transition emits ARP:STATE_CHANGE ip=XXXXXXXX old=N
+; new=N so tests + ops can observe the cache's state evolution.
+;
+; Clobbers: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11, flags.
+; Preserves callee-saved set (uses rbx + r12 internally).
+arp_cache_tick:
+    push rbx
+    push r12
+    rdtsc                                              ; now in edx:eax
+    shl rdx, 32
+    or  rax, rdx
+    mov rbx, rax                                       ; rbx = now (callee-saved scratch)
+    mov r12, [rel __memreq_addr__arp_cache]
+    lea r10, [r12 + ARP_CACHE_HEADER_BYTES]            ; r10 = entries[0]
+    xor ecx, ecx                                       ; ecx = slot index
+.tick_scan:
+    movzx eax, byte [r10 + ARP_ENTRY_STATE]
+    cmp al, ARP_STATE_REACHABLE
+    jne .tick_next
+    mov rdx, rbx
+    sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]       ; rdx = age in cycles
+    cmp rdx, ARP_AGING_CYCLES
+    jb  .tick_next
+    ; Aging threshold exceeded — transition REACHABLE → STALE.
+    mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_STALE
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx       ; restart age clock
+    ; Emit ARP:STATE_CHANGE ip=XXXXXXXX old=02 new=03
+    push rcx                                           ; preserve scan index
+    push r10                                           ; preserve walker
+    lea rsi, [rel arp_state_change_prefix_msg]
+    mov ecx, arp_state_change_prefix_len
+    call emit_bytes
+    mov rax, [r10]                                     ; ip_be (low 32 of entry)
+    call emit_hex32
+    lea rsi, [rel arp_state_change_old_msg]
+    mov ecx, arp_state_change_old_len
+    call emit_bytes
+    mov eax, ARP_STATE_REACHABLE
+    call emit_hex32
+    lea rsi, [rel arp_state_change_new_msg]
+    mov ecx, arp_state_change_new_len
+    call emit_bytes
+    mov eax, ARP_STATE_STALE
+    call emit_hex32
+    lea rsi, [rel arp_send_newline]
+    mov ecx, 1
+    call emit_bytes
+    pop r10
+    pop rcx
+.tick_next:
+    add r10, ARP_CACHE_ENTRY_BYTES
+    inc ecx
+    cmp ecx, ARP_CACHE_ENTRIES
+    jb  .tick_scan
+    pop r12
+    pop rbx
+    ret
+
 section .rodata
 arp_broadcast_mac:
     db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -413,6 +509,12 @@ arp_resolve_pending_msg: db 'ARP:RESOLVE_PENDING ip='
 arp_resolve_pending_msg_len equ $ - arp_resolve_pending_msg
 arp_resolve_failed_msg:  db 'ARP:RESOLVE_FAILED ip='
 arp_resolve_failed_msg_len equ $ - arp_resolve_failed_msg
+arp_state_change_prefix_msg: db 'ARP:STATE_CHANGE ip='
+arp_state_change_prefix_len  equ $ - arp_state_change_prefix_msg
+arp_state_change_old_msg:    db ' old='
+arp_state_change_old_len     equ $ - arp_state_change_old_msg
+arp_state_change_new_msg:    db ' new='
+arp_state_change_new_len     equ $ - arp_state_change_new_msg
 arp_send_newline:        db 10
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -33,9 +33,21 @@
 .equ ARP_STATE_REACHABLE,       2
 // 3=STALE, 4=PROBE, 5=FAILED — phase 6.e wires the transitions
 
+.equ ARP_STATE_STALE,           3
+// 4=PROBE, 5=FAILED — phase 6.e follow-ons
+
 .equ ARP_RESOLVE_OK,            0
 .equ ARP_RESOLVE_PENDING,       1
 .equ ARP_RESOLVE_FAILED,        2
+
+.equ ARP_ENTRY_LAST_EVENT_CYCLES, 16    // u64
+// ARP_ENTRY_NEXT_ACTION_CYCLES, 24 — phase 6.e follow-on
+
+// Aging threshold: ~100 ms @ Pi 5's 54 MHz CNTVCT_EL0
+// (5.4M cycles). Tuned for test-observability + low spurious
+// triggers in production. CNTFRQ-based calibration is a
+// future refinement.
+.equ ARP_AGING_CYCLES,          5400000
 
 // TX API + emit symbols for arp_send_request below.
 .equ L2_TX_POOL_IDX_FULL,       0xFFFFFFFF
@@ -48,6 +60,7 @@
 .global arp_cache_insert
 .global arp_send_request
 .global arp_resolve
+.global arp_cache_tick
 
 // ================================================================
 // arp_cache_lookup
@@ -144,6 +157,11 @@ arp_cache_insert:
     add     w12, w12, #1
     str     w12, [x9, #ARP_CACHE_HDR_GEN]
     str     w12, [x13, #ARP_ENTRY_LRU_GEN]
+    // Stamp last_event_time (phase 6.e). CNTVCT_EL0 gives a
+    // 64-bit cycle count; aging is measured as `now -
+    // last_event` per arp_cache_tick.
+    mrs     x12, cntvct_el0
+    str     x12, [x13, #ARP_ENTRY_LAST_EVENT_CYCLES]
     ret
 
 // ================================================================
@@ -336,3 +354,88 @@ arp_resolve_pending_msg_end:
 arp_resolve_failed_msg:
     .ascii  "ARP:RESOLVE_FAILED ip="
 arp_resolve_failed_msg_end:
+
+// ================================================================
+// arp_cache_tick — drive timer-based state transitions
+// ================================================================
+// Caller: dispatcher loop, once per iteration. Walks all 16
+// entries; for each non-FREE entry, compares (now -
+// last_event_time) against ARP_AGING_CYCLES and applies the
+// appropriate transition.
+//
+// Today: only REACHABLE → STALE is implemented. Follow-on
+// commits add INCOMPLETE retry, PROBE, FAILED transitions.
+//
+// Emits ARP:STATE_CHANGE ip=XXXXXXXX old=N new=N on each
+// transition. Uses x19/x20/x21 callee-saved internally.
+arp_cache_tick:
+    stp     x29, x30, [sp, #-48]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    str     x21, [sp, #32]
+
+    mrs     x19, cntvct_el0                  // x19 = now
+    adrp    x20, __memreq_addr__arp_cache
+    add     x20, x20, :lo12:__memreq_addr__arp_cache
+    ldr     x20, [x20]                       // x20 = cache base
+    add     x21, x20, #ARP_CACHE_HEADER_BYTES // x21 = walker (entries[0])
+    mov     w9, #0                           // w9 = slot index
+.Ltick_scan:
+    ldrb    w10, [x21, #ARP_ENTRY_STATE]
+    cmp     w10, #ARP_STATE_REACHABLE
+    b.ne    .Ltick_next
+    ldr     x11, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    sub     x11, x19, x11                    // x11 = age cycles
+    // ARP_AGING_CYCLES = 5_400_000 = 0x0052_4980. Construct
+    // in w12 via movz+movk to avoid the literal-pool alignment
+    // hazard that ldr =CONST hit on the assembler's first
+    // placement attempt. Zero-extension of w12 → x12 is
+    // automatic on the mov forms.
+    movz    w12, #0x4980
+    movk    w12, #0x0052, lsl #16
+    cmp     x11, x12
+    b.lo    .Ltick_next
+    // REACHABLE → STALE.
+    mov     w10, #ARP_STATE_STALE
+    strb    w10, [x21, #ARP_ENTRY_STATE]
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]   // restart age clock
+
+    adr     x1, arp_state_change_prefix_msg
+    mov     w2, #(arp_state_change_prefix_end - arp_state_change_prefix_msg)
+    bl      emit_bytes
+    ldr     w5, [x21]                        // ip
+    bl      emit_hex32
+    adr     x1, arp_state_change_old_msg
+    mov     w2, #(arp_state_change_old_end - arp_state_change_old_msg)
+    bl      emit_bytes
+    mov     w5, #ARP_STATE_REACHABLE
+    bl      emit_hex32
+    adr     x1, arp_state_change_new_msg
+    mov     w2, #(arp_state_change_new_end - arp_state_change_new_msg)
+    bl      emit_bytes
+    mov     w5, #ARP_STATE_STALE
+    bl      emit_hex32
+    adr     x1, arp_send_newline
+    mov     w2, #1
+    bl      emit_bytes
+.Ltick_next:
+    add     x21, x21, #ARP_CACHE_ENTRY_BYTES
+    add     w9, w9, #1
+    cmp     w9, #ARP_CACHE_ENTRIES
+    b.lo    .Ltick_scan
+
+    ldr     x21, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #48
+    ret
+
+.section .rodata
+arp_state_change_prefix_msg:
+    .ascii  "ARP:STATE_CHANGE ip="
+arp_state_change_prefix_end:
+arp_state_change_old_msg:
+    .ascii  " old="
+arp_state_change_old_end:
+arp_state_change_new_msg:
+    .ascii  " new="
+arp_state_change_new_end:

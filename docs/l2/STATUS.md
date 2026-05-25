@@ -311,8 +311,16 @@ deferred work completed" directive), the queue is:
      send failure → FAILED. Tested via TXAPI_PREBAKE
      extension exercising both MISS and HIT paths. Test:
      `test_arp_resolve.test_arp_resolve_miss_then_hit`.
-   - 6.e timer + state machine (REACHABLE → STALE →
-     PROBE → REACHABLE/FAILED).
+   - 6.e ⚙️ timer + state machine — **first slice landed**.
+     `arp_cache_insert` stamps `last_event_time_cycles` (RDTSC
+     / CNTVCT_EL0); `arp_cache_tick` runs from boot.S's
+     dispatch loop and transitions REACHABLE → STALE when
+     age exceeds `ARP_AGING_CYCLES` (~100 ms equivalent on
+     both arches). Emits `ARP:STATE_CHANGE ip=XXXXXXXX
+     old=N new=N`. Test:
+     `test_arp_state_machine.test_reachable_entry_ages_to_stale`.
+     Follow-on sub-commits add INCOMPLETE retry → FAILED,
+     STALE → PROBE, PROBE → REACHABLE/FAILED.
    - 6.f gratuitous ARP at boot.
 6. **ARP cache + initiator** — outbound ARP, enables
    outbound IP traffic to non-cached peers
