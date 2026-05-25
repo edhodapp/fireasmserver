@@ -178,3 +178,36 @@ def test_txapi_pre_baked_frame_arrives_on_tap0(
         f"{src_in_frame.hex(':')}; expected "
         f"{EXPECTED_SRC_MAC.hex(':')}"
     )
+
+    # --- ETH-012: TX-side padding to 60-wire minimum ---
+    #
+    # The pre-bake's payload is 10 bytes ("TXAPI-TEST"), well
+    # below the 46-byte payload threshold that would make the
+    # wire frame meet the 60-byte minimum without padding. The
+    # dispatcher's TX consumer's frame builder must pad the
+    # rest. Asserting the on-wire length is exactly 60 bytes
+    # rejects both under-pad (frame < 60) and over-pad
+    # (anything > 60 in a runt payload case implies the desc
+    # length math drifted).
+    assert len(frame) == 60, (
+        f"ETH-012: runt frame must be padded to exactly "
+        f"60 wire bytes; observed {len(frame)} bytes. Pcap: "
+        f"{capture_pcap}"
+    )
+
+    # --- ETH-013: TX padding is zero-filled ---
+    #
+    # The pad bytes (from end-of-payload through byte 59)
+    # must be all 0x00 — IEEE 802.3 §4.1.2.1 doesn't strictly
+    # require zeros (any value is spec-legal) but zero pad is
+    # the universal convention and the only behavior that
+    # doesn't leak adjacent buffer contents on the wire. A
+    # nonzero pad here would indicate the frame builder
+    # accidentally wrote stale buffer bytes through.
+    payload_end = 14 + len(EXPECTED_PAYLOAD)        # Eth header + payload
+    pad = frame[payload_end:]
+    assert pad == b"\x00" * len(pad), (
+        f"ETH-013: pad bytes after payload must be zero; "
+        f"observed {pad.hex()} ({len(pad)} bytes). Pcap: "
+        f"{capture_pcap}"
+    )

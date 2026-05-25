@@ -68,8 +68,8 @@ substantial.
 | ETH-009 | Bad FCS discard | ⊘ N/A | virtio-net offloads FCS verification; the device won't deliver bad-FCS frames to us |
 | ETH-010 | Runt discard | ✅ test | `test_eth_size_bounds.test_runt_frame_dropped` |
 | ETH-011 | Oversize discard | ✅ test | `test_eth_size_bounds.test_oversize_frame_dropped` |
-| ETH-012 | TX-side padding to 64 | ⚙️ wired, no test | dispatcher TX phase pads runt frames in the consumer's frame builder; phase (d) adds the regression test |
-| ETH-013 | TX padding zero-fill | ⚙️ wired, no test | same — `xor eax, eax; rep stosb` (x86) / `strb wzr` loop (aarch64) writes zeros, not arbitrary bytes |
+| ETH-012 | TX-side padding to 64 | ✅ test | `test_l2_tx_api.test_txapi_pre_baked_frame_arrives_on_tap0` — pre-bake submits a 10-byte payload, asserts the on-wire frame is exactly 60 bytes |
+| ETH-013 | TX padding zero-fill | ✅ test | same — asserts pad bytes after payload are all 0x00 |
 | ETH-014 | Inter-frame gap | ⊘ N/A | virtio abstracts PHY |
 | ETH-015 | RX source MAC unicast-bit check | ✅ test | `test_eth_src_mac.test_multicast_source_mac_dropped` |
 | ETH-016 | TX source MAC unicast sanity | ✅ build-time | `.if GUEST_MAC_BYTE_0 & 1 / .error ...` in both arch dispatcher.S + boot.S; fires the build, not at runtime |
