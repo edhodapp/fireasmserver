@@ -103,23 +103,28 @@ l2_tx_buffer_pool_alloc:
     adrp    x1, __memreq_addr__l2_tx_buffer_pool
     add     x1, x1, :lo12:__memreq_addr__l2_tx_buffer_pool
     ldr     x1, [x1]                              // x1 = pool base
-    // LDAXR / STLXR only accept `[Xn]` addressing (no
-    // immediate offset). next_alloc is at offset 0 of the
-    // pool base, so x1 already points where the exclusive
-    // ops need. next_free at offset 8 uses the regular ldr.
-.Lalloc_retry:
-    ldaxr   w0, [x1]                              // w0 = current next_alloc (@ +0)
+    // NO exclusive monitor: bare-metal aarch64 without MMU
+    // treats memory as Device-nGnRnE by default, where
+    // LDAXR/STLXR are UNPREDICTABLE per ARM ARM B2.10.3 —
+    // on Cortex-A76 (Pi 5) the monitor never succeeds and
+    // the CAS loop spins forever. Single-producer MVP
+    // doesn't need the CAS: only the boot path or
+    // arp_send_request (called sequentially) allocates from
+    // this pool, and only the consumer-side dispatcher TX
+    // phase bumps next_free — no contention on next_alloc.
+    // Multi-producer support waits for either MMU + Normal-
+    // cacheable mapping or LSE atomics (CAS instruction,
+    // ARMv8.1) when the use case arises.
+    ldr     w0, [x1]                              // w0 = current next_alloc
     ldr     w2, [x1, #L2_TX_POOL_NEXT_FREE]      // w2 = current next_free
     sub     w3, w0, w2                            // w3 = in-flight
     cmp     w3, #L2_TX_POOL_SIZE
     b.hs    .Lalloc_full
     add     w4, w0, #1                            // w4 = next_alloc + 1
-    stlxr   w3, w4, [x1]
-    cbnz    w3, .Lalloc_retry                     // STLXR failed → retry
+    str     w4, [x1]
     and     w0, w0, #L2_TX_POOL_MASK              // return idx
     ret
 .Lalloc_full:
-    clrex                                         // clear monitor; no STLXR pending
     mov     w0, #-1                               // L2_TX_POOL_IDX_FULL
     ret
 
@@ -171,22 +176,26 @@ l2_tx_enqueue:
     ldr     x9, [x9]                              // x9 = pending region base
                                                   // (head is at offset 0)
     add     x10, x9, #L2_TX_HEADER_BYTES          // x10 = ring base
+    // NO exclusive monitor (see arp_cache_insert /
+    // l2_tx_buffer_pool_alloc note above): bare-metal
+    // aarch64 without MMU runs Device-nGnRnE memory where
+    // LDAXR/STLXR are UNPREDICTABLE. Single-producer MVP →
+    // plain load/store on head is sufficient. The retry
+    // loop's other condition (seq != head) still uses
+    // LDAR (acquire load — works on Device memory) so the
+    // consumer-side discipline against the matching STLR
+    // is preserved.
 .Lenq_retry:
-    ldaxr   w11, [x9]                             // w11 = current head (@ +0)
+    ldr     w11, [x9]                             // w11 = current head
     and     w12, w11, #L2_TX_RING_MASK            // w12 = slot
-    // Compute &ring[slot] = ring + slot * 24. AArch64 has no
-    // *24 addressing mode; use mov + umaddl multiply-add.
     mov     w13, #L2_TX_SLOT_BYTES
     umaddl  x13, w12, w13, x10                    // x13 = ring + slot*24
-                                                  // (seq is at offset 0 of slot)
-    // Read slot's current seq with acquire (LDAR needs `[Xn]`).
-    ldar    w14, [x13]
+    ldar    w14, [x13]                            // load-acquire seq
     sub     w15, w14, w11                         // w15 = seq - head
     cbnz    w15, .Lenq_seq_mismatch
     // seq == head — claim head → head+1.
     add     w14, w11, #1
-    stlxr   w15, w14, [x9]
-    cbnz    w15, .Lenq_retry                      // STLXR failed → retry
+    str     w14, [x9]                             // plain store (single producer)
     // Successfully claimed. Write entry fields.
     // dst_mac: 6 bytes from [x0].
     ldr     w15, [x0]                             // bytes 0-3
@@ -206,13 +215,11 @@ l2_tx_enqueue:
     ret
 
 .Lenq_seq_mismatch:
-    // Determine whether ring is FULL (seq - head < 0 — another
-    // round in flight, slot not ready) or another producer is
-    // mid-publish (seq - head > 0 — slot has a newer round
-    // already). FULL → bail; mid-publish → retry.
-    // w15 = seq - head (computed above). Tested as a signed
-    // 32-bit value: negative → FULL, positive → retry.
-    clrex
+    // FULL → bail; mid-publish (single-producer MVP: can't
+    // happen, but kept defensively for symmetry with the
+    // x86 path) → retry. No clrex needed — exclusive
+    // monitor isn't used in the single-producer simplified
+    // path above.
     cmp     w15, #0
     b.lt    .Lenq_full
     b       .Lenq_retry
