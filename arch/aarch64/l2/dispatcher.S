@@ -58,6 +58,19 @@
 .equ TX_QUEUE_OFF,              1 * VIRTQ_STRIDE
 .equ VIRTQ_MAX_SIZE,            0x100
 .equ POLL_BUDGET,               10000000
+// TX-specific poll budget. Pi 5 under Firecracker
+// occasionally needs significantly more wall-clock time
+// than 10M iters to see the device's first TX UsedRing.idx
+// update — see the TX:TIMEOUT_DBG diagnostic landed in
+// the prior commit, which confirmed `idx=0 exp=0` (device
+// never acked) was the failure mode. Bumping the TX budget
+// 5x (10M → 50M) gives the host's virtio-net thread more
+// scheduling slack on the cold-cache first-TX path without
+// pushing the outer tracer-bullet TIMEOUT (15s) over its
+// limit — RX:TIMEOUT iterations still burn only the
+// smaller POLL_BUDGET, so a no-traffic dispatch loop's
+// total wall-clock cost is unchanged.
+.equ TX_POLL_BUDGET,            50000000
 
 // Lengths of cross-file symbols (newline_msg, tx_test_pkt) live in
 // boot.S so the `_end - _start` difference can't be evaluated at
@@ -866,7 +879,7 @@ l2_dispatch:
     str     wzr, [sp, #88]                       // reinit per-dispatch counter for TX
 
     add     x11, x27, #2                         // x11 = &TX UsedRing.idx
-    ldr     w9, =POLL_BUDGET
+    ldr     w9, =TX_POLL_BUDGET
 .Ltx_wait_loop:
     yield                                        // KVM liveness
     ldarh   w10, [x11]                           // load-acquire TX UsedRing.idx
