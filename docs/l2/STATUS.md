@@ -276,13 +276,16 @@ deferred work completed" directive), the queue is:
 3. ~~STATUS.md fuzz/UART notes + honest D068 reframe~~
    ✅ done (this commit + DECISIONS.md D068)
 4. ~~TX API implementation~~ per `docs/l2/TX_API.md`
-   ✅ done (task #48; phases b.1–b.4 across commits a8bea34
-   through 5b0f359). End-to-end e2e test passing on x86_64.
-   aarch64 has build infrastructure; Pi-side runner deferred.
-   Phases remaining: (c) ARP responder migration to queue,
-   (d) ETH-012/013 regression tests against the new TX path.
-5. **L3-callable receive surface** — dispatcher hands
-   inbound frames + metadata to a registered consumer
+   ✅ done across phases b.1–b.4, (c) ARP migration, (d)
+   ETH-012/013 tests. End-to-end on x86_64; aarch64 has
+   the build infrastructure (Pi runner still pending).
+5. ~~L3-callable receive surface~~ ✅ done. Dispatcher
+   calls `l3_rx_dispatch(frame_addr, wire_len)` for each
+   accepted non-ARP RX frame. Symbol lives in
+   `arch/<arch>/l3/stub.S` today (emits `L3:RX_FRAME` and
+   returns). Real L3 replaces stub.S without dispatcher
+   changes. Test:
+   `test_l3_rx_surface.test_l3_dispatch_fires_on_non_arp_unicast_frame`.
 6. **ARP cache + initiator** — outbound ARP, enables
    outbound IP traffic to non-cached peers
 7. **Statistics / counters** — per-class drop counts, RX/TX

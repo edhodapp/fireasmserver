@@ -92,11 +92,16 @@ MEM_OBJECTS   := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(MEM_SOURCES))
 ifneq ($(filter $(PLATFORM),firecracker failpath),)
 L2_SOURCES    := $(sort $(wildcard l2/*.S))
 L2_OBJECTS    := $(patsubst l2/%.S,$(BUILD_DIR)/l2/%.o,$(L2_SOURCES))
+# L3 stub — D068 item 5 hand-off symbol; see arch/aarch64/l3/stub.S.
+L3_SOURCES    := $(sort $(wildcard l3/*.S))
+L3_OBJECTS    := $(patsubst l3/%.S,$(BUILD_DIR)/l3/%.o,$(L3_SOURCES))
 else
 L2_SOURCES    :=
 L2_OBJECTS    :=
+L3_SOURCES    :=
+L3_OBJECTS    :=
 endif
-ARCH_OBJECTS  := $(MEM_OBJECTS) $(L2_OBJECTS)
+ARCH_OBJECTS  := $(MEM_OBJECTS) $(L2_OBJECTS) $(L3_OBJECTS)
 OBJECTS       := $(PLAT_OBJECTS) $(ARCH_OBJECTS)
 LINKER_SCRIPT := $(SRC_DIR)/linker.ld
 ELF           := $(BUILD_DIR)/guest.elf
@@ -113,6 +118,9 @@ $(BUILD_DIR)/memory/%.o: memory/%.S | $(BUILD_DIR)/memory
 	$(AS) $(ASFLAGS) -o $@ $<
 
 $(BUILD_DIR)/l2/%.o: l2/%.S | $(BUILD_DIR)/l2
+	$(AS) $(ASFLAGS) -o $@ $<
+
+$(BUILD_DIR)/l3/%.o: l3/%.S | $(BUILD_DIR)/l3
 	$(AS) $(ASFLAGS) -o $@ $<
 
 # Codegen produces both .inc files in one tool invocation; the
@@ -132,7 +140,7 @@ $(ELF): $(OBJECTS) $(LINKER_SCRIPT)
 $(BINARY): $(ELF)
 	$(OBJCOPY) -O binary $< $@
 
-$(BUILD_DIR) $(BUILD_DIR)/memory $(BUILD_DIR)/l2:
+$(BUILD_DIR) $(BUILD_DIR)/memory $(BUILD_DIR)/l2 $(BUILD_DIR)/l3:
 	mkdir -p $@
 
 clean:

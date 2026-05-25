@@ -143,6 +143,10 @@ extern l2_tx_buffer_pool_alloc
 extern l2_tx_buffer_addr
 extern l2_tx_enqueue
 
+; D068 working order item 5: L3-callable RX surface. Symbol
+; lives in arch/x86_64/l3/stub.S today; real L3 replaces it.
+extern l3_rx_dispatch
+
 ; TX API ring + pool constants (mirrored from arch/x86_64/l2/tx_api.S
 ; and arch/x86_64/platform/firecracker/regions.yaml; keep in sync).
 L2_TX_RING_MASK         equ 15
@@ -618,7 +622,36 @@ l2_dispatch:
     call emit_bytes
 
 .l2_arp_no_enqueue:
+    ; ARP-for-us path done — skip L3 hand-off (the responder
+    ; consumed this frame). Jump past the L3 call.
+    jmp .l2_after_l3
 .l2_no_arp:
+    ; --- L3 hand-off (item 5, D068 working order) ---
+    ;
+    ; Reached on accepted frames that were NOT ARP-for-us
+    ; (either truly non-ARP, or ARP with wrong OPER/TPA).
+    ; Call l3_rx_dispatch(rdi = frame_addr, esi = wire_len)
+    ; where frame_addr skips the 12-byte virtio_net_hdr to
+    ; land on the Ethernet header, and wire_len is the
+    ; bytes from dst MAC through end of payload.
+    ;
+    ; The current L3 is a stub in arch/x86_64/l3/stub.S
+    ; that emits L3:RX_FRAME len=XXXX and returns; the
+    ; integration test pins on that marker. Real L3
+    ; replaces stub.S without dispatcher changes.
+    ;
+    ; Register preservation: r11 (num_buffers) is needed
+    ; by the RX:FRAME emit chain below; SysV makes r11
+    ; caller-saved so we push/pop it across the L3 call.
+    ; rax (RX buffer ptr) is dead after the L3 call site;
+    ; rbx (used_len) is callee-saved and survives.
+    push r11
+    lea rdi, [rax + 12]                              ; frame_addr = RX buf + virtio_net_hdr
+    mov esi, ebx                                     ; wire_len = used_len - 12
+    sub esi, 12
+    call l3_rx_dispatch
+    pop r11
+.l2_after_l3:
     mov esi, [rsp + 4]                               ; restore hdr_len
     mov edi, [rsp + 12]                              ; restore id
 

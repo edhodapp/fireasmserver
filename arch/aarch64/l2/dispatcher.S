@@ -606,7 +606,29 @@ l2_dispatch:
     bl      emit_bytes
 
 .Larp_no_enqueue:
+    // ARP-for-us path done — skip the L3 hand-off (the
+    // responder consumed this frame). Jump past the L3 call.
+    b       .Lafter_l3
 .Lno_arp:
+    // --- L3 hand-off (item 5, D068 working order) ---
+    //
+    // Reached on accepted frames that were NOT ARP-for-us.
+    // Call l3_rx_dispatch(x0 = frame_addr, w1 = wire_len)
+    // where frame_addr skips the 12-byte virtio_net_hdr to
+    // land on the Ethernet header, and wire_len is the
+    // bytes from dst MAC through end of payload (= used_len
+    // minus 12, which is what virtio reported minus the
+    // virtio_net_hdr the device prepended).
+    //
+    // x21 (used_len) and w20 (id) are AAPCS64 callee-saved
+    // and survive the L3 call automatically. x9 (RX buffer
+    // ptr) is caller-saved — read it BEFORE the call to
+    // compute frame_addr; after the call, x9 is dead in
+    // this dispatch.
+    add     x0, x9, #12                           // frame_addr = RX buf + virtio_net_hdr
+    sub     w1, w21, #12                          // wire_len = used_len - 12
+    bl      l3_rx_dispatch
+.Lafter_l3:
 
     // Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
     adr     x1, rx_frame_prefix_msg

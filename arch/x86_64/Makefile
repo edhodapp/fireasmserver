@@ -113,11 +113,21 @@ MEM_OBJECTS  := $(patsubst memory/%.S,$(BUILD_DIR)/memory/%.o,$(MEM_SOURCES))
 ifneq ($(filter $(PLATFORM),firecracker failpath),)
 L2_SOURCES   := $(sort $(wildcard l2/*.S))
 L2_OBJECTS   := $(patsubst l2/%.S,$(BUILD_DIR)/l2/%.o,$(L2_SOURCES))
+# L3 stub: the dispatcher's hand-off symbol for accepted
+# non-ARP RX frames. D068 working order item 5 — see
+# arch/x86_64/l3/stub.S for the contract. Future production
+# L3 replaces stub.S; gated on the same firecracker/failpath
+# filter so the qemu platform doesn't pull in unresolved
+# emit_bytes / emit_hex32 refs.
+L3_SOURCES   := $(sort $(wildcard l3/*.S))
+L3_OBJECTS   := $(patsubst l3/%.S,$(BUILD_DIR)/l3/%.o,$(L3_SOURCES))
 else
 L2_SOURCES   :=
 L2_OBJECTS   :=
+L3_SOURCES   :=
+L3_OBJECTS   :=
 endif
-ARCH_OBJECTS := $(MEM_OBJECTS) $(L2_OBJECTS)
+ARCH_OBJECTS := $(MEM_OBJECTS) $(L2_OBJECTS) $(L3_OBJECTS)
 OBJECTS      := $(PLAT_OBJECTS) $(ARCH_OBJECTS)
 LINKER_SCRIPT := $(SRC_DIR)/linker.ld
 BINARY := $(BUILD_DIR)/guest.elf
@@ -135,6 +145,9 @@ $(BUILD_DIR)/memory/%.o: memory/%.S | $(BUILD_DIR)/memory
 $(BUILD_DIR)/l2/%.o: l2/%.S | $(BUILD_DIR)/l2
 	$(AS) $(ASFLAGS) -o $@ $<
 
+$(BUILD_DIR)/l3/%.o: l3/%.S | $(BUILD_DIR)/l3
+	$(AS) $(ASFLAGS) -o $@ $<
+
 # Both .inc files are produced in one tool invocation; the second
 # target rule for memreq_pin_hot.inc just points at the same recipe.
 $(BUILD_DIR)/memreq_records.inc \
@@ -148,7 +161,7 @@ $(BUILD_DIR)/memreq_pin_hot.inc &: \
 $(BINARY): $(OBJECTS) $(LINKER_SCRIPT)
 	$(LD) $(LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS)
 
-$(BUILD_DIR) $(BUILD_DIR)/memory $(BUILD_DIR)/l2:
+$(BUILD_DIR) $(BUILD_DIR)/memory $(BUILD_DIR)/l2 $(BUILD_DIR)/l3:
 	mkdir -p $@
 
 clean:
