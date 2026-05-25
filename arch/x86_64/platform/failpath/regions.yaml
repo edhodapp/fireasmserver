@@ -193,3 +193,42 @@ regions:
 
       Allocator zero-init leaves next_alloc = next_free = 0
       (pool empty / all buffers free) which is correct.
+
+  - name: arp_cache
+    tier: cold
+    lifetime: steady_state
+    owner: 0
+    writable: true
+    size: 576          # 64-byte header + 16 entries × 32 bytes
+    align: 64          # cache-line aligned header
+    doc: >
+      ARP cache for D068 item 6 — cache + initiator + state
+      machine. Single-core MVP shape (multi-core sharing will
+      need a refresh when D058 actor boundaries land).
+
+      Header (64 B):
+        +0   atomic u32 generation_counter (incremented on
+             every cache access; entries record their
+             last-access value for LRU eviction)
+        +4   u32 entries_used (0..16; lookup short-circuits
+             when the cache is sparse)
+        +8..63 reserved
+
+      Entries (16 × 32 B):
+        +0   u32 ip                       (BE wire bytes; 0 sentinel = FREE slot)
+        +4   u8[6] mac                    (peer MAC)
+        +10  u8 state                     (0=FREE, 1=INCOMPLETE,
+                                           2=REACHABLE, 3=STALE,
+                                           4=PROBE, 5=FAILED)
+        +11  u8 retry_count               (probe retries; reset on REACHABLE)
+        +12  u32 last_access_gen          (LRU bookkeeping)
+        +16  u64 last_event_time_cycles   (CNTVCT_EL0 / rdtsc at
+                                           last state-changing event;
+                                           populated in 6.e timers)
+        +24  u64 next_action_time_cycles  (when the entry's next
+                                           transition should fire;
+                                           populated in 6.e)
+
+      Phase 6.a uses only the ip/mac/state/lru_gen fields; the
+      timing fields stay zero until 6.e wires the state machine.
+      Allocator zero-init leaves every entry FREE.

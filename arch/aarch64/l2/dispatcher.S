@@ -158,6 +158,10 @@
 .equ L2_TX_POOL_NEXT_FREE,      8
 .equ L2_TX_PAYLOAD_OFFSET,      26
 
+// D068 working order item 6, phase 6.a/6.b: ARP cache state
+// matching arch/aarch64/l2/arp_cache.S.
+.equ ARP_STATE_REACHABLE,       2
+
 .text
 .global l2_dispatch
 l2_dispatch:
@@ -515,8 +519,13 @@ l2_dispatch:
     ldrh    w14, [x9, #24]                        // EtherType
     cmp     w14, #0x0608
     b.ne    .Lno_arp
+    // ARP frame. Branch on OPER: request (0x0100 LE) → existing
+    // responder path; reply (0x0200 LE) → phase 6.b cache
+    // insert. Other OPER values fall through to L3 (stub no-op).
     ldrh    w14, [x9, #32]                        // ARP OPER
-    cmp     w14, #0x0100
+    cmp     w14, #0x0200                          // reply?
+    b.eq    .Larp_reply_path
+    cmp     w14, #0x0100                          // request?
     b.ne    .Lno_arp
     ldrh    w14, [x9, #50]                        // TPA bytes 0-1 (C0 A8 LE → 0xA8C0)
     mov     w15, #0xA8C0
@@ -604,7 +613,53 @@ l2_dispatch:
     adr     x1, arp_reply_msg
     mov     w2, #(arp_reply_msg_end - arp_reply_msg)
     bl      emit_bytes
+    b       .Larp_no_enqueue
 
+    // --- Phase 6.b: ARP REPLY → cache update ---
+    //
+    // Mirror of arch/x86_64/l2/dispatcher.S phase 6.b.
+    // Stash SHA+SPA from the inbound reply into the same
+    // slots the request path uses (request/reply are
+    // mutually exclusive per dispatch iteration), then call
+    // arp_cache_insert(w0=ip, x1=mac_ptr, w2=state=REACHABLE).
+    // x19-x28 are AAPCS64 callee-saved so the dispatcher's
+    // pinned state survives the call.
+.Larp_reply_path:
+    ldrh    w14, [x9, #50]                        // TPA bytes 0-1
+    mov     w15, #0xA8C0
+    cmp     w14, w15
+    b.ne    .Lno_arp                              // reply not for us → L3 (no-op)
+    ldrh    w14, [x9, #52]                        // TPA bytes 2-3
+    mov     w15, #0x022A
+    cmp     w14, w15
+    b.ne    .Lno_arp
+
+    // Stash SHA + SPA at the request path's slots.
+    ldrh    w14, [x9, #34]
+    strh    w14, [sp, #112]
+    ldrh    w14, [x9, #36]
+    strh    w14, [sp, #114]
+    ldrh    w14, [x9, #38]
+    strh    w14, [sp, #116]
+    ldr     w14, [x9, #40]
+    str     w14, [sp, #108]
+
+    ldr     w0, [sp, #108]                        // ip arg
+    add     x1, sp, #112                          // mac ptr arg
+    mov     w2, #ARP_STATE_REACHABLE              // state
+    bl      arp_cache_insert
+
+    // Emit ARP:CACHE_INSERT ip=XXXXXXXX
+    adr     x1, arp_cache_insert_msg
+    mov     w2, #(arp_cache_insert_msg_end - arp_cache_insert_msg)
+    bl      emit_bytes
+    ldr     w5, [sp, #108]                        // SPA
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #NEWLINE_MSG_LEN
+    bl      emit_bytes
+
+    // Fall through to .Larp_no_enqueue (skip L3 hand-off).
 .Larp_no_enqueue:
     // ARP-for-us path done — skip the L3 hand-off (the
     // responder consumed this frame). Jump past the L3 call.
@@ -1304,4 +1359,7 @@ arp_request_msg_end:
 arp_reply_msg:
     .ascii  "ARP:REPLY\n"
 arp_reply_msg_end:
+arp_cache_insert_msg:
+    .ascii  "ARP:CACHE_INSERT ip="
+arp_cache_insert_msg_end:
 

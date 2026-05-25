@@ -286,6 +286,18 @@ deferred work completed" directive), the queue is:
    returns). Real L3 replaces stub.S without dispatcher
    changes. Test:
    `test_l3_rx_surface.test_l3_dispatch_fires_on_non_arp_unicast_frame`.
+6. **ARP cache + initiator** — in progress (full state
+   machine per the design pick on 2026-05-25). Sub-phases:
+   - 6.a ✅ cache region + lookup/insert primitives in
+     `arch/<arch>/l2/arp_cache.S`.
+   - 6.b ✅ dispatcher RX recognition hook — ARP REPLY
+     for our IP fires `arp_cache_insert`. Test:
+     `test_arp_cache.test_arp_reply_inserts_into_cache`.
+   - 6.c outbound ARP initiator (TX API request build).
+   - 6.d `arp_resolve(ip) → MAC` API for L3 callers.
+   - 6.e timer + state machine (REACHABLE → STALE →
+     PROBE → REACHABLE/FAILED).
+   - 6.f gratuitous ARP at boot.
 6. **ARP cache + initiator** — outbound ARP, enables
    outbound IP traffic to non-cached peers
 7. **Statistics / counters** — per-class drop counts, RX/TX

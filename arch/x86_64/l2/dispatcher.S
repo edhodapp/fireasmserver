@@ -147,6 +147,12 @@ extern l2_tx_enqueue
 ; lives in arch/x86_64/l3/stub.S today; real L3 replaces it.
 extern l3_rx_dispatch
 
+; D068 working order item 6, phase 6.a/6.b: ARP cache.
+; Symbol lives in arch/x86_64/l2/arp_cache.S.
+extern arp_cache_insert
+
+ARP_STATE_REACHABLE       equ 2     ; matches arp_cache.S
+
 ; TX API ring + pool constants (mirrored from arch/x86_64/l2/tx_api.S
 ; and arch/x86_64/platform/firecracker/regions.yaml; keep in sync).
 L2_TX_RING_MASK         equ 15
@@ -517,7 +523,14 @@ l2_dispatch:
 
     cmp word [rax + 24], 0x0608                      ; EtherType (0x0806 BE)
     jne .l2_no_arp
-    cmp word [rax + 32], 0x0100                      ; OPER (0x0001 BE)
+    ; ARP frame. Branch on OPER: request (0x0001 BE = 0x0100 LE)
+    ; takes the responder path; reply (0x0002 BE = 0x0200 LE)
+    ; takes the cache-insert path (phase 6.b). Other OPER values
+    ; fall through to L3 (the stub no-ops, matching the
+    ; pre-cache behavior for unknown ARP).
+    cmp word [rax + 32], 0x0200                      ; OPER reply?
+    je  .l2_arp_reply_path
+    cmp word [rax + 32], 0x0100                      ; OPER request?
     jne .l2_no_arp
     cmp dword [rax + 50], 0x022AA8C0                 ; TPA = 192.168.42.2
     jne .l2_no_arp
@@ -635,6 +648,59 @@ l2_dispatch:
     lea rsi, [rel arp_reply_msg]
     mov ecx, arp_reply_len
     call emit_bytes
+    jmp .l2_arp_no_enqueue
+
+    ; --- Phase 6.b: ARP REPLY → cache update ---
+    ;
+    ; Reached when we receive an ARP reply targeted at our IP.
+    ; Pull SHA + SPA from the inbound payload (same offsets as
+    ; the request path, since ARP body layout is identical for
+    ; request and reply per RFC 826), then call
+    ; arp_cache_insert to record sender's MAC against sender's
+    ; IP with state = REACHABLE. The cache becomes the L3
+    ; resolver's data source once arp_resolve lands in 6.d.
+    ;
+    ; r11 (num_buffers) MUST survive arp_cache_insert per the
+    ; same reasoning as the request path's TX-API call chain.
+    ; The [rsp+16] save slot covers both — single-iteration
+    ; mutual exclusion (a frame is either request OR reply,
+    ; never both).
+.l2_arp_reply_path:
+    cmp dword [rax + 50], 0x022AA8C0                 ; TPA = our IP?
+    jne .l2_no_arp                                   ; reply not for us → L3 (no-op)
+
+    ; Stash SHA + SPA into the same slots the request path uses
+    ; (request/reply mutual exclusion makes this safe).
+    mov r10d, [rax + 34]                             ; SHA bytes 0-3
+    mov [rsp + 24], r10d
+    movzx r10d, word [rax + 38]                      ; SHA bytes 4-5
+    mov [rsp + 28], r10w
+    mov r10d, [rax + 40]                             ; SPA
+    mov [rsp + 20], r10d
+
+    ; Save r11 before insert call (same reason as enqueue
+    ; path).
+    mov [rsp + 16], r11d
+
+    mov edi, [rsp + 20]                              ; ip arg
+    lea rsi, [rsp + 24]                              ; mac ptr arg
+    mov edx, ARP_STATE_REACHABLE                     ; state = 2
+    call arp_cache_insert
+
+    ; Emit ARP:CACHE_INSERT ip=XXXXXXXX (just the IP — the
+    ; MAC is the same as the inbound frame's src and would
+    ; only duplicate info; serial real estate matters).
+    lea rsi, [rel arp_cache_insert_msg]
+    mov ecx, arp_cache_insert_msg_len
+    call emit_bytes
+    mov eax, [rsp + 20]                              ; SPA (BE wire bytes as LE u32)
+    call emit_hex32
+    lea rsi, [rel newline]
+    mov ecx, 1
+    call emit_bytes
+
+    ; Fall through to .l2_arp_no_enqueue for the r11 restore +
+    ; skip-L3 jump (the reply was for us, L3 doesn't want it).
 
 .l2_arp_no_enqueue:
     ; ARP-for-us path done — skip L3 hand-off (the responder
@@ -1312,6 +1378,8 @@ arp_request_msg:         db 'ARP:REQUEST', 10
 arp_request_len          equ $ - arp_request_msg
 arp_reply_msg:           db 'ARP:REPLY', 10
 arp_reply_len            equ $ - arp_reply_msg
+arp_cache_insert_msg:    db 'ARP:CACHE_INSERT ip='
+arp_cache_insert_msg_len equ $ - arp_cache_insert_msg
 ; Mark the stack as non-executable. Without this section the linker
 ; assumes RWX stack and warns; the other NASM-emitted units in this
 ; build (arch/x86_64/memory/*.S) do the same.
