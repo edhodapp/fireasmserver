@@ -140,6 +140,12 @@ extern __memreq_addr__tx_arp_buf
 extern __memreq_addr__l2_tx_pending
 extern __memreq_addr__l2_tx_buffer_pool
 
+; Phase (c) ARP responder migration: the RX recognition site
+; uses the producer-side TX API to enqueue the reply.
+extern l2_tx_buffer_pool_alloc
+extern l2_tx_buffer_addr
+extern l2_tx_enqueue
+
 ; TX API ring + pool constants (mirrored from arch/x86_64/l2/tx_api.S
 ; and arch/x86_64/platform/firecracker/regions.yaml; keep in sync).
 L2_TX_RING_MASK         equ 15
@@ -154,6 +160,7 @@ L2_TX_SLOT_PAYLOAD_LEN  equ 20
 L2_TX_PENDING_TAIL      equ 8
 L2_TX_POOL_NEXT_FREE    equ 8
 L2_TX_PAYLOAD_OFFSET    equ 26    ; producer payload start within pool buffer
+L2_TX_POOL_IDX_FULL     equ 0xFFFFFFFF
 
 ; FSA-4: per-dispatch TX reclaim budget. Same role as
 ; RX_FRAME_BUDGET for the multi-frame TX reclaim loop — caps the
@@ -545,6 +552,75 @@ l2_dispatch:
     lea rsi, [rel arp_request_msg]
     mov ecx, arp_request_len
     call emit_bytes
+
+    ; --- Phase (c): queue the ARP reply via the TX API ---
+    ;
+    ; Replaces the prior inline build into tx_arp_buf that ran
+    ; in the TX phase. Now the recognition site is the
+    ; producer: alloc one pool buffer, write the 28-byte ARP
+    ; reply body at +PAYLOAD_OFFSET, enqueue one request with
+    ; dst = sender's MAC, etype = 0x0806, payload_len = 28.
+    ; The dispatcher's TX phase queue-drain consumer (b.3)
+    ; handles the rest — virtio_net_hdr + Eth header build,
+    ; runt-pad to 60-wire, virtio submit, reclaim, pool free.
+    ;
+    ; This block runs AFTER the ARP:REQUEST emit so emit_bytes
+    ; has already clobbered the live state that .l2_no_arp's
+    ; restore picks back up from [rsp+4]/[rsp+12]; we're free
+    ; to use any caller-saved register.
+    ;
+    ; Pool-full fallback: if the alloc returns 0xFFFFFFFF, skip
+    ; the enqueue and the ARP:REPLY emit — the reply just won't
+    ; go out, same robustness behaviour the canary path has
+    ; today (no failure marker on inability to send).
+    call l2_tx_buffer_pool_alloc
+    cmp eax, L2_TX_POOL_IDX_FULL
+    je .l2_arp_no_enqueue
+    push rax                                         ; save pool_idx
+    mov edi, eax
+    call l2_tx_buffer_addr                           ; rax = pool buffer base
+    add rax, L2_TX_PAYLOAD_OFFSET                    ; rax = producer payload slot
+
+    ; ARP body bytes 0-27 at rax (the wire bytes per
+    ; arp_reply_template, minus the Ethernet header which the
+    ; consumer builds in front of us).
+    mov word  [rax + 0],  0x0100                     ; HTYPE 0x0001 BE
+    mov word  [rax + 2],  0x0008                     ; PTYPE 0x0800 BE
+    mov byte  [rax + 4],  6                          ; HLEN
+    mov byte  [rax + 5],  4                          ; PLEN
+    mov word  [rax + 6],  0x0200                     ; OPER 0x0002 BE (reply)
+    mov dword [rax + 8],  GUEST_MAC_LE_LO32          ; SHA bytes 0-3
+    mov word  [rax + 12], GUEST_MAC_LE_HI16          ; SHA bytes 4-5
+    mov dword [rax + 14], 0x022AA8C0                 ; SPA = 192.168.42.2 wire bytes
+
+    ; THA + TPA from the sender_mac/sender_ip stashes. After
+    ; the `push rax` the stashes are 8 bytes deeper than the
+    ; documented frame offsets: original sender_mac @
+    ; [rsp+24] is now at [rsp+32], sender_ip @ [rsp+20] now
+    ; at [rsp+28].
+    mov r10d,         [rsp + 32]                     ; THA bytes 0-3
+    mov [rax + 18],   r10d
+    movzx r10d, word  [rsp + 36]                     ; THA bytes 4-5
+    mov [rax + 22],   r10w
+    mov r10d,         [rsp + 28]                     ; TPA
+    mov [rax + 24],   r10d
+
+    pop rax                                          ; pool_idx
+    lea rdi, [rsp + 24]                              ; dst MAC ptr (sender_mac stash)
+    mov esi, 0x0608                                  ; etype 0x0806 BE
+    mov edx, eax                                     ; pool_idx
+    mov ecx, 28                                      ; payload_len
+    call l2_tx_enqueue
+    ; eax = L2_TX_OK (0) or L2_TX_FULL (1) — ignored; the
+    ; consumer either sees it or not. A FULL here means a
+    ; producer just claimed the slot we'd have used; ARP
+    ; requester will retry per ARP's own semantics.
+
+    lea rsi, [rel arp_reply_msg]
+    mov ecx, arp_reply_len
+    call emit_bytes
+
+.l2_arp_no_enqueue:
 .l2_no_arp:
     mov esi, [rsp + 4]                               ; restore hdr_len
     mov edi, [rsp + 12]                              ; restore id
@@ -768,69 +844,13 @@ l2_dispatch:
     jmp .l2_have_tx_addr
 
 .l2_tx_queue_empty:
-    ; --- FSA-4(A): build ARP reply if matched, else use canary ---
-    ;
-    ; If an ARP request matched during RX consume (arp_match @
-    ; [rsp + 16]), build a reply frame in tx_arp_buf by copying
-    ; the rodata arp_reply_template and patching dst MAC + THA +
-    ; TPA from the stashed sender info. r8 = chosen TX buffer addr
-    ; (tx_arp_buf when arp_match, tx_test_pkt when not).
-    cmp dword [rsp + 16], 0
-    je .l2_use_canary
-
-    ; Copy the 72-byte template into tx_arp_buf via 4× 16-byte
-    ; movdqu pairs of GPR loads. Actually use 64-bit movs for
-    ; simplicity (no SSE register needed here): 9× mov rcx + mov
-    ; [r8 + N], rcx covers 72 bytes.
-    mov r8, [rel __memreq_addr__tx_arp_buf]
-    lea rdi, [rel arp_reply_template]
-    mov rcx, [rdi + 0]
-    mov [r8 + 0], rcx
-    mov rcx, [rdi + 8]
-    mov [r8 + 8], rcx
-    mov rcx, [rdi + 16]
-    mov [r8 + 16], rcx
-    mov rcx, [rdi + 24]
-    mov [r8 + 24], rcx
-    mov rcx, [rdi + 32]
-    mov [r8 + 32], rcx
-    mov rcx, [rdi + 40]
-    mov [r8 + 40], rcx
-    mov rcx, [rdi + 48]
-    mov [r8 + 48], rcx
-    mov rcx, [rdi + 56]
-    mov [r8 + 56], rcx
-    mov rcx, [rdi + 64]
-    mov [r8 + 64], rcx
-
-    ; Patch dst MAC @ +12 from sender_mac stash (6 bytes).
-    mov ecx, [rsp + 24]                              ; SHA bytes 0-3
-    mov [r8 + 12], ecx
-    movzx ecx, word [rsp + 28]                       ; SHA bytes 4-5
-    mov [r8 + 16], cx
-
-    ; Patch THA @ +44 from sender_mac stash.
-    mov ecx, [rsp + 24]
-    mov [r8 + 44], ecx
-    movzx ecx, word [rsp + 28]
-    mov [r8 + 48], cx
-
-    ; Patch TPA @ +50 from sender_ip stash.
-    mov ecx, [rsp + 20]
-    mov [r8 + 50], ecx
-
-    lea rsi, [rel arp_reply_msg]
-    mov ecx, arp_reply_len
-    call emit_bytes
-    ; emit_bytes clobbers rax/rcx/rsi/rdi; r8 (caller-saved) is
-    ; not touched by the helper's implementation but the contract
-    ; doesn't promise it. Re-derive tx_arp_buf for the desc write.
-    mov r8, [rel __memreq_addr__tx_arp_buf]
-    jmp .l2_have_tx_addr
-
-.l2_use_canary:
+    ; Phase (c): the inline FSA-4(A) ARP-build path is gone.
+    ; ARP replies now flow through the TX API queue from the
+    ; RX recognition site; the queue-drain consumer above
+    ; handles them. Queue-empty therefore means there's
+    ; genuinely nothing to send, so submit the canary so the
+    ; TX path is always exercised end-to-end.
     lea r8, [rel tx_test_pkt]
-
 .l2_have_tx_addr:
     ; rbx = desc[desc_idx] base. Each desc is 16 bytes.
     lea rbx, [r15 + TX_QUEUE_OFF + VIRTQ_OFF_DESC]
