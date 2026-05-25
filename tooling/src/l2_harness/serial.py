@@ -29,6 +29,7 @@ test).
 
 from __future__ import annotations
 
+import os.path
 import re
 import time
 from pathlib import Path
@@ -246,13 +247,14 @@ class SerialLog:
             return current
         if current.startswith(self._cursor_snapshot):
             return current[len(self._cursor_snapshot):]
-        common = 0
-        limit = min(len(current), len(self._cursor_snapshot))
-        while common < limit and (
-            current[common] == self._cursor_snapshot[common]
-        ):
-            common += 1
-        return current[common:]
+        # os.path.commonprefix is misnamed (it operates on
+        # strings, no path semantics) but is the C-implemented
+        # LCP available in the stdlib — significantly faster
+        # than a Python loop as cleaned text grows.
+        common = os.path.commonprefix(
+            [current, self._cursor_snapshot],
+        )
+        return current[len(common):]
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:
         """Block until `marker` appears AFTER the last checkpoint.
