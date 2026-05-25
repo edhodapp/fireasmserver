@@ -878,6 +878,39 @@ l2_dispatch:
     adr     x1, tx_timeout_msg
     mov     w2, #(tx_timeout_msg_end - tx_timeout_msg)
     bl      emit_bytes
+    // Diagnostic emit on TIMEOUT (post-cursor-fix Pi flake
+    // investigation): dump the device's last-visible
+    // UsedRing.idx vs our expected shadow. Three outcomes:
+    //   idx == exp → device never acked; kick reached it but
+    //     no completion fired before the budget exhausted
+    //     (H1 — host KVM scheduling jitter > poll budget
+    //     wall-clock).
+    //   idx > exp → device acked but our acquire loop didn't
+    //     observe it (H3 — barrier/race; should never happen
+    //     given ldarh is a load-acquire on inner-shareable
+    //     Normal memory).
+    //   idx < exp → device went backwards (impossible under
+    //     virtio spec; would indicate a bug elsewhere).
+    // w28 is AAPCS64 callee-saved so survives every emit
+    // call. x11 and x19 are also safe (x19 is the RX virtq
+    // base pin set in the dispatcher's prologue).
+    adr     x1, tx_timeout_dbg_msg
+    mov     w2, #(tx_timeout_dbg_msg_end - tx_timeout_dbg_msg)
+    bl      emit_bytes
+    // Re-derive &TX UsedRing.idx (x11 is caller-saved; was
+    // clobbered by the emit chain above).
+    add     x11, x19, #(TX_QUEUE_OFF + VIRTQ_OFF_USED)
+    add     x11, x11, #2
+    ldarh   w5, [x11]
+    bl      emit_hex32
+    adr     x1, tx_timeout_exp_msg
+    mov     w2, #(tx_timeout_exp_msg_end - tx_timeout_exp_msg)
+    bl      emit_bytes
+    mov     w5, w28
+    bl      emit_hex32
+    adr     x1, newline_msg
+    mov     w2, #NEWLINE_MSG_LEN
+    bl      emit_bytes
     b       .Ltx_writeback                        // writeback then clean halt
 
 .Ltx_reclaim_body:
@@ -1215,6 +1248,12 @@ tx_submitted_msg_end:
 tx_timeout_msg:
     .ascii  "TX:TIMEOUT\n"
 tx_timeout_msg_end:
+tx_timeout_dbg_msg:
+    .ascii  "TX:TIMEOUT_DBG idx="
+tx_timeout_dbg_msg_end:
+tx_timeout_exp_msg:
+    .ascii  " exp="
+tx_timeout_exp_msg_end:
 tx_reclaimed_prefix_msg:
     .ascii  "TX:RECLAIMED id="
 tx_reclaimed_prefix_msg_end:
