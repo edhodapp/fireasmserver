@@ -78,14 +78,15 @@ POST_MARKER_QUIESCE_SECONDS = 0.5
 
 @pytest.fixture(scope="session")
 def _ensure_txapi_built() -> None:
-    """Build firecracker_txapi if absent.
+    """Build firecracker_txapi via `make` — always invoke.
 
-    The build is fast (~1 s) and idempotent — `make` no-ops if
-    the binary is up to date. Session-scoped so multiple tests
-    in this file (if added later) share one build.
+    Don't short-circuit on `TXAPI_GUEST_ELF.exists()`: that
+    would consume any stale binary at the path regardless of
+    whether it was built with `TXAPI_PREBAKE=1`. Make is fast
+    on a no-op build (sub-second when nothing changed) and is
+    the authoritative dependency tracker. Per Gemini MED on
+    the phase (d) review.
     """
-    if TXAPI_GUEST_ELF.exists():
-        return
     subprocess.run(
         ["make", "-C",
          str(REPO_ROOT / "arch" / "x86_64"),
