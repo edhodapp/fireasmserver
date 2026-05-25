@@ -6,6 +6,25 @@ assert on marker emission and to capture the full guest serial
 log for the artifact directory on failure.
 
 Per `docs/l2/HARNESS.md` §3.5.
+
+Read model
+----------
+SerialLog maintains an internal cursor (`_cursor`) so that
+`wait_for` / `assert_marker_observed` / `assert_marker_absent`
+only see content appended SINCE the last `checkpoint()` call
+(default: since construction). The full file is still available
+via `text()` for diagnostics and AssertionError context. This
+matters when a test needs to verify a REPEATED marker (e.g., a
+second READY after a reboot) — without a cursor, the search
+would match the first occurrence and never wait for the
+second.
+
+Backing storage is incremental: each refresh seeks to where the
+last read left off and consumes only new bytes, so the cost of
+`wait_for`'s ~50 ms polling is O(delta) rather than O(N) per
+poll (the prior implementation re-read + re-stripped the whole
+file each tick, which became O(N²) over the life of a long
+test).
 """
 
 from __future__ import annotations
@@ -83,42 +102,116 @@ class SerialLog:
     this class only reads. Safe to use across multiple tests
     against the same guest (e.g., assert markers from earlier
     interactions).
+
+    Cursor semantics: at construction, cursor = 0 (matches
+    behavior before the cursor was introduced — wait_for sees
+    the full file). Call `checkpoint()` after observing an
+    event to advance the cursor; subsequent wait_for /
+    assert_marker_observed only consider content after the
+    checkpoint. `text()` is always full-history for diagnostics.
     """
 
     def __init__(self, path: Path) -> None:
         self._path = path
+        # Incremental read state. `_cleaned_buf` holds the
+        # accumulated content of complete lines after the
+        # Firecracker-strip regex; `_raw_partial` is whatever
+        # follows the last newline (we cannot safely line-strip
+        # a partial line in case the FC log injection is still
+        # arriving).
+        self._cleaned_buf: str = ""
+        self._raw_partial: str = ""
+        self._bytes_consumed: int = 0
+        self._cursor: int = 0
 
     @property
     def path(self) -> Path:
         """The on-disk path being tailed."""
         return self._path
 
-    def text(self) -> str:
-        """Snapshot the full log as a text string.
+    def _refresh(self) -> None:
+        """Read any new bytes since last refresh; merge to buffer.
 
-        Decoded as utf-8 with errors=replace so any partial-byte
-        boundary on a midstream read doesn't raise; the harness
-        cares about marker substrings, not byte-exact integrity.
-        Firecracker startup log lines are stripped to avoid the
-        mid-line interleave failure mode described in the module
-        docstring's `_FIRECRACKER_LOG_LINE_RE` comment.
+        Cheap when no new bytes are present (one stat + early
+        return). When new bytes ARE present, only the delta is
+        decoded + regex-stripped. Lines past the last newline
+        are held in `_raw_partial` until a later refresh
+        appends their terminator.
         """
         if not self._path.exists():
-            return ""
-        raw = self._path.read_bytes().decode("utf-8", errors="replace")
-        return _FIRECRACKER_LOG_LINE_RE.sub("", raw)
+            return
+        size = self._path.stat().st_size
+        if size <= self._bytes_consumed:
+            return
+        with self._path.open("rb") as fh:
+            fh.seek(self._bytes_consumed)
+            chunk = fh.read(size - self._bytes_consumed)
+        self._bytes_consumed = size
+        self._raw_partial += chunk.decode("utf-8", errors="replace")
+        last_nl = self._raw_partial.rfind("\n")
+        if last_nl == -1:
+            return
+        consumable = self._raw_partial[:last_nl + 1]
+        self._raw_partial = self._raw_partial[last_nl + 1:]
+        self._cleaned_buf += _FIRECRACKER_LOG_LINE_RE.sub("", consumable)
+
+    def _full_cleaned(self) -> str:
+        """Cleaned text of full log so far, including the unfinished
+        tail line (best-effort strip on partial).
+
+        The partial-strip is best-effort because a Firecracker
+        log line currently mid-write may match incompletely; on
+        the next refresh, once the line completes and lands in
+        `_cleaned_buf`, it gets stripped properly.
+        """
+        return self._cleaned_buf + _FIRECRACKER_LOG_LINE_RE.sub(
+            "", self._raw_partial,
+        )
+
+    def text(self) -> str:
+        """Snapshot the FULL cleaned log as a text string.
+
+        Used for diagnostics and AssertionError context — see
+        `_tail_for_assert`. Cursor is ignored; this is always
+        the complete history.
+        """
+        self._refresh()
+        return self._full_cleaned()
+
+    def checkpoint(self) -> None:
+        """Mark current end-of-log as the cursor.
+
+        Subsequent `wait_for` / `assert_marker_observed` only
+        consider content appended after this point. Use to
+        verify repeated events (e.g., second READY after a
+        reboot, or a second TX:RECLAIMED after stimulating
+        another frame).
+        """
+        self._refresh()
+        self._cursor = len(self._full_cleaned())
+
+    def _text_since_cursor(self) -> str:
+        """Cleaned content appended after the last checkpoint."""
+        self._refresh()
+        return self._full_cleaned()[self._cursor:]
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:
-        """Block until `marker` appears in the log or timeout.
+        """Block until `marker` appears AFTER the last checkpoint.
 
         Returns True on observation, False on timeout. Always
         performs at least one snapshot check before considering
         the timeout expired — `timeout=0.0` therefore means "look
         right now, don't wait" rather than "always return False."
+
+        Default cursor is 0 (set at construction), so a fresh
+        SerialLog sees the full log just like the pre-cursor
+        implementation. Tests that need event-vs-event
+        discrimination should call `checkpoint()` between
+        stimuli.
         """
         deadline = time.monotonic() + timeout
         while True:
-            if marker in self.text():
+            if marker in self._text_since_cursor():
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -135,10 +228,33 @@ class SerialLog:
 
     def assert_marker_absent(self, marker: str,
                              window: float = 1.0) -> None:
-        """Sleep `window` seconds; raise if `marker` appears at all."""
+        """Sleep `window` seconds; raise if `marker` appears DURING the
+        window.
+
+        Window-only semantics: captures the log length at entry,
+        sleeps `window` seconds, then checks the delta. A marker
+        that was already present before the call does NOT trigger
+        the assertion — only NEW emissions during the window do.
+
+        This matches the documented intent of the existing
+        callers (see e.g.
+        `test_arp_request_reply.py:155-162`), which use it to
+        verify "no marker fired during the capture window after
+        sending a stimulus." Pre-cursor semantics ("marker
+        nowhere in the log") would have produced false positives
+        on any test that ran after another test in the same
+        guest lifecycle, which is currently masked by the
+        per-test guest fixture but would break the moment a test
+        wanted to verify a sequence of stimuli.
+        """
+        self._refresh()
+        window_start = len(self._full_cleaned())
         time.sleep(window)
-        if marker in self.text():
+        self._refresh()
+        appended = self._full_cleaned()[window_start:]
+        if marker in appended:
             raise AssertionError(
-                f"marker {marker!r} unexpectedly observed\n"
+                f"marker {marker!r} unexpectedly observed in "
+                f"{window}s window\n"
                 f"{_tail_for_assert(self.text(), self._path)}"
             )
