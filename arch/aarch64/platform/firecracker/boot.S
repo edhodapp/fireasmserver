@@ -868,6 +868,23 @@ _entry:
     strh    w9, [x10, #0]                    // rx_next_avail = N
     dsb     sy
 
+    // --- 6.f diagnosis: breadcrumb PRE / call / POST ---
+    //
+    // PRE marker fires if we reach the call site. POST fires
+    // if arp_send_request returns. The Pi hang shows
+    // RX:POPULATED but no ARP:TX_REQUEST — PRE/POST tell us
+    // whether the call site is reached and whether the
+    // call returns.
+    adr     x1, gratuitous_pre_msg
+    mov     w2, #(gratuitous_pre_msg_end - gratuitous_pre_msg)
+    bl      emit_bytes
+    movz    w0, #0xA8C0
+    movk    w0, #0x022A, lsl #16             // w0 = 0x022AA8C0
+    bl      arp_send_request
+    adr     x1, gratuitous_post_msg
+    mov     w2, #(gratuitous_post_msg_end - gratuitous_post_msg)
+    bl      emit_bytes
+
     // --- FSA-1: hand off to L2 dispatcher ---
     //
     // Everything from this point through RX consume, TX submit, and
@@ -1362,6 +1379,12 @@ driver_ok_fail_msg_end:
 rx_populated_msg:
     .ascii  "RX:POPULATED\n"
 rx_populated_msg_end:
+gratuitous_pre_msg:
+    .ascii  "GRAT:PRE\n"
+gratuitous_pre_msg_end:
+gratuitous_post_msg:
+    .ascii  "GRAT:POST\n"
+gratuitous_post_msg_end:
 newline_msg:
     .ascii  "\n"
 newline_msg_end:
