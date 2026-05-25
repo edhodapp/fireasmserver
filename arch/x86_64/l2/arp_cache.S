@@ -60,8 +60,33 @@ ARP_STATE_FREE            equ 0
 
 extern __memreq_addr__arp_cache
 
+; TX API surface — see arch/x86_64/l2/tx_api.S. arp_send_request
+; below allocates a pool buffer, writes the 28-byte ARP request
+; body, and enqueues with broadcast dst + 0x0806 BE etype.
+extern l2_tx_buffer_pool_alloc
+extern l2_tx_buffer_addr
+extern l2_tx_enqueue
+
+; emit_bytes / emit_hex32 for the ARP:REQUEST_SENT marker.
+extern emit_bytes
+extern emit_hex32
+
+L2_TX_POOL_IDX_FULL       equ 0xFFFFFFFF
+L2_TX_PAYLOAD_OFFSET      equ 26
+
+; GUEST_MAC + GUEST_IP wire constants. Mirrored from
+; dispatcher.S; the cross-file consistency is human discipline
+; (the dispatcher file's `arp_request_msg` and the inbound
+; recognition's TPA constant both reflect the same source of
+; truth — GUEST_MAC = 02:00:00:00:00:01, GUEST_IP =
+; 192.168.42.2 → wire bytes c0 a8 2a 02).
+GUEST_MAC_LE_LO32         equ 0x00000002
+GUEST_MAC_LE_HI16         equ 0x00000100
+GUEST_IP_WIRE_LE          equ 0x022AA8C0
+
 global arp_cache_lookup
 global arp_cache_insert
+global arp_send_request
 
 [bits 64]
 section .text
@@ -165,5 +190,97 @@ arp_cache_insert:
     mov [rdx + ARP_ENTRY_LRU_GEN], eax
     pop rbx
     ret
+
+; ================================================================
+; arp_send_request — send a broadcast ARP request
+; ================================================================
+;   In:  edi = target_ip_be (4-byte BE wire value in low 32 bits)
+;   Out: eax = 0 on OK, 1 on pool/queue FULL
+;   Clobbers: rax, rcx, rdx, rsi, rdi, r8-r11, flags.
+;   Stack: 16-byte local frame (preserves alignment); stashes
+;          target_ip across the TX API call chain.
+;
+; Builds the 28-byte ARP request body in the producer's pool
+; buffer (SHA = GUEST_MAC, SPA = GUEST_IP, THA = 00...00,
+; TPA = target_ip), then enqueues via the L2 TX API with
+; broadcast dst MAC + 0x0806 BE ethertype. The dispatcher's
+; TX queue-drain consumer (b.3) builds the wire frame and
+; submits to virtio on the next iteration. Emits
+; ARP:REQUEST_SENT ip=XXXXXXXX after a successful enqueue;
+; emits ARP:REQUEST_FULL on pool/queue exhaustion (lets the
+; observability surface distinguish the two failure modes).
+;
+; arp_resolve (phase 6.d) is the L3-side caller; phase 6.f
+; will also call this with TPA = GUEST_IP for gratuitous
+; ARP at boot.
+arp_send_request:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16                                        ; local frame
+    mov [rsp + 0], edi                                 ; stash target_ip across calls
+
+    call l2_tx_buffer_pool_alloc                       ; eax = pool_idx
+    cmp eax, L2_TX_POOL_IDX_FULL
+    je  .arp_send_full
+    mov [rsp + 8], eax                                 ; stash pool_idx
+
+    mov edi, eax
+    call l2_tx_buffer_addr                             ; rax = pool buffer base
+    add rax, L2_TX_PAYLOAD_OFFSET                      ; rax = payload start
+
+    ; ARP request body (28 bytes).
+    mov word  [rax + 0],  0x0100                       ; HTYPE 0x0001 BE
+    mov word  [rax + 2],  0x0008                       ; PTYPE 0x0800 BE
+    mov byte  [rax + 4],  6                            ; HLEN
+    mov byte  [rax + 5],  4                            ; PLEN
+    mov word  [rax + 6],  0x0100                       ; OPER 0x0001 BE (request)
+    mov dword [rax + 8],  GUEST_MAC_LE_LO32            ; SHA bytes 0-3
+    mov word  [rax + 12], GUEST_MAC_LE_HI16            ; SHA bytes 4-5
+    mov dword [rax + 14], GUEST_IP_WIRE_LE             ; SPA
+    mov dword [rax + 18], 0                            ; THA bytes 0-3 = 0
+    mov word  [rax + 22], 0                            ; THA bytes 4-5 = 0
+    mov ecx, [rsp + 0]                                 ; target_ip stashed at entry
+    mov [rax + 24], ecx                                ; TPA
+
+    ; Enqueue: dst = broadcast, etype = 0x0806 BE, pool_idx,
+    ; payload_len = 28.
+    lea rdi, [rel arp_broadcast_mac]
+    mov esi, 0x0608                                    ; etype 0x0806 BE → LE u16 = 0x0608
+    mov edx, [rsp + 8]                                 ; pool_idx
+    mov ecx, 28                                        ; payload_len
+    call l2_tx_enqueue
+    test eax, eax
+    jnz  .arp_send_full                                ; queue FULL
+
+    ; Emit ARP:REQUEST_SENT ip=XXXXXXXX
+    lea rsi, [rel arp_request_sent_msg]
+    mov ecx, arp_request_sent_msg_len
+    call emit_bytes
+    mov eax, [rsp + 0]
+    call emit_hex32
+    lea rsi, [rel arp_send_newline]
+    mov ecx, 1
+    call emit_bytes
+
+    xor eax, eax
+    leave
+    ret
+
+.arp_send_full:
+    lea rsi, [rel arp_request_full_msg]
+    mov ecx, arp_request_full_msg_len
+    call emit_bytes
+    mov eax, 1
+    leave
+    ret
+
+section .rodata
+arp_broadcast_mac:
+    db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+arp_request_sent_msg:    db 'ARP:REQUEST_SENT ip='
+arp_request_sent_msg_len equ $ - arp_request_sent_msg
+arp_request_full_msg:    db 'ARP:REQUEST_FULL', 10
+arp_request_full_msg_len equ $ - arp_request_full_msg
+arp_send_newline:        db 10
 
 section .note.GNU-stack noalloc noexec nowrite progbits

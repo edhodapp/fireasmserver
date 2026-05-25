@@ -938,6 +938,15 @@ _entry:
     mov     w2, w21                           // pool_idx
     mov     w3, #10                           // payload_len
     bl      l2_tx_enqueue
+
+    // --- Phase 6.c: also exercise the ARP initiator. ---
+    // Broadcast ARP request for HOST_DEFAULT_IP (192.168.42.1,
+    // wire bytes c0 a8 2a 01 → LE u32 = 0x012AA8C0). Test at
+    // tooling/tests/integration/test_arp_initiator.py asserts
+    // the corresponding marker + tap0 capture.
+    ldr     w0, =0x012AA8C0
+    bl      arp_send_request
+
     // Re-derive UART base for the dispatch loop's emit chains
     // (dispatcher caller-contract: x0 = UART base).
     movz    x0, #0x4000, lsl #16

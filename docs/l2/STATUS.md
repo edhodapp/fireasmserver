@@ -293,7 +293,17 @@ deferred work completed" directive), the queue is:
    - 6.b ✅ dispatcher RX recognition hook — ARP REPLY
      for our IP fires `arp_cache_insert`. Test:
      `test_arp_cache.test_arp_reply_inserts_into_cache`.
-   - 6.c outbound ARP initiator (TX API request build).
+   - 6.c ✅ outbound ARP initiator —
+     `arp_send_request(target_ip)` builds an ARP request
+     body in a TX API pool buffer and enqueues with
+     broadcast dst. Wired into the TXAPI_PREBAKE block
+     for testing. Test:
+     `test_arp_initiator.test_arp_initiator_sends_request_for_host_ip`
+     (verifies the marker + the wire frame on tap0). Caveat:
+     Linux's tap0 ARP reply is 42 wire bytes (no padding to
+     60), so the dispatcher correctly drops it per ETH-003;
+     round-trip cache update is exercised via padded scapy
+     replies in test_arp_cache, not via the host's auto-reply.
    - 6.d `arp_resolve(ip) → MAC` API for L3 callers.
    - 6.e timer + state machine (REACHABLE → STALE →
      PROBE → REACHABLE/FAILED).

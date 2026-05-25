@@ -184,6 +184,11 @@ extern l2_tx_pending_init   ; arch/x86_64/l2/tx_api.S — Vyukov ring seq[] pre-
 extern l2_tx_buffer_pool_alloc
 extern l2_tx_buffer_addr
 extern l2_tx_enqueue
+; arch/x86_64/l2/arp_cache.S — outbound ARP initiator
+; (D068 phase 6.c). Also gated on TXAPI_PREBAKE so the
+; production build doesn't auto-send an ARP at boot until
+; phase 6.f wires gratuitous ARP intentionally.
+extern arp_send_request
 L2_TX_PAYLOAD_OFFSET equ 26
 %endif
 
@@ -881,6 +886,16 @@ kernel_main_64:
     ; pool just inited and ring is empty. We do not assert; a
     ; FULL return would result in no frame being sent and the
     ; pytest assertion would catch it as a missing capture.
+
+    ; --- Phase 6.c: also exercise the ARP initiator. ---
+    ; Send a broadcast ARP request for HOST_DEFAULT_IP
+    ; (192.168.42.1, wire bytes c0 a8 2a 01 → LE u32 = 0x012AA8C0).
+    ; The dispatcher's TX queue-drain consumer (b.3) submits
+    ; this on the same or next iteration as the TXAPI test
+    ; frame; tooling/tests/integration/test_arp_initiator.py
+    ; sniffs tap0 for it.
+    mov edi, 0x012AA8C0
+    call arp_send_request
 %endif
     mov ebx, 100
 .dispatch_loop:

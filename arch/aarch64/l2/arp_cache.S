@@ -29,9 +29,16 @@
 
 .equ ARP_STATE_FREE,            0
 
+// TX API + emit symbols for arp_send_request below.
+.equ L2_TX_POOL_IDX_FULL,       0xFFFFFFFF
+.equ L2_TX_PAYLOAD_OFFSET,      26
+.equ GUEST_MAC_LE_LO32,         0x00000002
+.equ GUEST_MAC_LE_HI16,         0x00000100
+
 .text
 .global arp_cache_lookup
 .global arp_cache_insert
+.global arp_send_request
 
 // ================================================================
 // arp_cache_lookup
@@ -129,3 +136,86 @@ arp_cache_insert:
     str     w12, [x9, #ARP_CACHE_HDR_GEN]
     str     w12, [x13, #ARP_ENTRY_LRU_GEN]
     ret
+
+// ================================================================
+// arp_send_request — send a broadcast ARP request
+// ================================================================
+//   In:  w0 = target_ip_be
+//   Out: w0 = 0 on OK, 1 on pool/queue FULL
+//   AAPCS64; uses x19 callee-saved internally to stash
+//   target_ip across the TX API call chain.
+arp_send_request:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]                 // x19 = target_ip; x20 = pool_idx
+    mov     w19, w0
+
+    bl      l2_tx_buffer_pool_alloc             // w0 = pool_idx
+    cmn     w0, #1                              // == 0xFFFFFFFF?
+    b.eq    .Larp_send_full
+    mov     w20, w0
+
+    bl      l2_tx_buffer_addr                   // x0 = pool buffer base
+    add     x9, x0, #L2_TX_PAYLOAD_OFFSET       // x9 = payload start
+
+    mov     w10, #0x0100
+    strh    w10, [x9, #0]                       // HTYPE 0x0001 BE
+    mov     w10, #0x0008
+    strh    w10, [x9, #2]                       // PTYPE 0x0800 BE
+    mov     w10, #6
+    strb    w10, [x9, #4]                       // HLEN
+    mov     w10, #4
+    strb    w10, [x9, #5]                       // PLEN
+    mov     w10, #0x0100
+    strh    w10, [x9, #6]                       // OPER 0x0001 BE (request)
+    mov     w10, #GUEST_MAC_LE_LO32
+    str     w10, [x9, #8]                       // SHA bytes 0-3
+    mov     w10, #GUEST_MAC_LE_HI16
+    strh    w10, [x9, #12]                      // SHA bytes 4-5
+    ldr     w10, =0x022AA8C0                    // GUEST_IP wire LE
+    str     w10, [x9, #14]                      // SPA
+    str     wzr, [x9, #18]                      // THA bytes 0-3 = 0
+    strh    wzr, [x9, #22]                      // THA bytes 4-5 = 0
+    str     w19, [x9, #24]                      // TPA = target_ip
+
+    adr     x0, arp_broadcast_mac               // dst MAC
+    mov     w1, #0x0608                         // etype 0x0806 BE
+    mov     w2, w20                             // pool_idx
+    mov     w3, #28                             // payload_len
+    bl      l2_tx_enqueue
+    cbnz    w0, .Larp_send_full
+
+    adr     x1, arp_request_sent_msg
+    mov     w2, #(arp_request_sent_msg_end - arp_request_sent_msg)
+    bl      emit_bytes
+    mov     w5, w19
+    bl      emit_hex32
+    adr     x1, arp_send_newline
+    mov     w2, #1
+    bl      emit_bytes
+
+    mov     w0, #0
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+.Larp_send_full:
+    adr     x1, arp_request_full_msg
+    mov     w2, #(arp_request_full_msg_end - arp_request_full_msg)
+    bl      emit_bytes
+    mov     w0, #1
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+.section .rodata
+arp_broadcast_mac:
+    .byte   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+arp_request_sent_msg:
+    .ascii  "ARP:REQUEST_SENT ip="
+arp_request_sent_msg_end:
+arp_request_full_msg:
+    .ascii  "ARP:REQUEST_FULL\n"
+arp_request_full_msg_end:
+arp_send_newline:
+    .byte   10
