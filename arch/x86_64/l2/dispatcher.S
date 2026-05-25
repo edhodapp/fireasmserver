@@ -574,6 +574,21 @@ l2_dispatch:
     ; the enqueue and the ARP:REPLY emit — the reply just won't
     ; go out, same robustness behaviour the canary path has
     ; today (no failure marker on inability to send).
+    ;
+    ; r11 (num_buffers) MUST survive this block — the RX:FRAME
+    ; emit chain below relies on it. l2_tx_enqueue clobbers
+    ; r11 per its docstring; save it to the [rsp+16] slot
+    ; (formerly the arp_match flag, freed in phase c.3) and
+    ; restore at .l2_arp_no_enqueue. Bug fixed (caught after
+    ; the L3 surface landed): without this save, `num_bufs`
+    ; in the RX:FRAME marker on the iteration that handled
+    ; an ARP-for-us frame showed garbage (e.g. 0x0019F080)
+    ; because r11 was clobbered between the consume body's
+    ; load and the emit chain's push r11. The garbage was
+    ; informational-only — the test's tap0 capture passed
+    ; the actual ARP reply through — but the wrong marker is
+    ; load-bearing for trace-bullet diagnostics.
+    mov [rsp + 16], r11d
     call l2_tx_buffer_pool_alloc
     cmp eax, L2_TX_POOL_IDX_FULL
     je .l2_arp_no_enqueue
@@ -623,7 +638,12 @@ l2_dispatch:
 
 .l2_arp_no_enqueue:
     ; ARP-for-us path done — skip L3 hand-off (the responder
-    ; consumed this frame). Jump past the L3 call.
+    ; consumed this frame). Restore r11 (num_buffers) from
+    ; the [rsp+16] save slot — l2_tx_enqueue clobbered it.
+    ; On the pool-full sub-path the restore is a no-op (r11
+    ; was never clobbered; the save and restore are the same
+    ; value); cheaper than branching to skip.
+    mov r11d, [rsp + 16]
     jmp .l2_after_l3
 .l2_no_arp:
     ; --- L3 hand-off (item 5, D068 working order) ---
