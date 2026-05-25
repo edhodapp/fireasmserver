@@ -43,6 +43,15 @@ TXAPI_GUEST_ELF = (
 
 MARKER_TIMEOUT_SECONDS = 5.0
 
+# INCOMPLETE → FAILED now takes ARP_MAX_RETRIES + 1 tick
+# cycles (3 retries × 100ms aging threshold + initial age =
+# ~400ms wall-clock minimum). Plus the dispatcher's per-iter
+# RX:TIMEOUT cost grows when there's interleaved traffic.
+# Use a longer budget for the FAILED-after-retries test so
+# the FAIL transition fits in the dispatch loop's wall-clock
+# window.
+INCOMPLETE_FAILED_TIMEOUT_SECONDS = 15.0
+
 
 @pytest.fixture(scope="session")
 def _ensure_txapi_built_for_state() -> None:
@@ -122,9 +131,12 @@ def test_incomplete_entry_ages_to_failed(
             "ARP:RESOLVE_PENDING ip=642AA8C0",
             timeout=MARKER_TIMEOUT_SECONDS,
         )
-        # Then wait for tick to drive the timeout transition.
+        # Then wait for tick to drive the retry → FAIL chain.
+        # See INCOMPLETE_FAILED_TIMEOUT_SECONDS comment for the
+        # budget rationale (3 retries × tick interval + iter
+        # cost).
         serial.assert_marker_observed(
             "ARP:STATE_CHANGE ip=642AA8C0 old=00000001 new=00000005",
-            timeout=MARKER_TIMEOUT_SECONDS,
+            timeout=INCOMPLETE_FAILED_TIMEOUT_SECONDS,
         )
         time.sleep(0.1)

@@ -67,6 +67,12 @@ ARP_STATE_STALE           equ 3
 ARP_STATE_PROBE           equ 4
 ARP_STATE_FAILED          equ 5
 
+; Maximum probe-style retries before giving up on an
+; INCOMPLETE (6.e.3) or PROBE (6.e.4) entry. Linux's
+; default is 3; we match to keep the behaviour mental model
+; portable for engineers reading along.
+ARP_MAX_RETRIES           equ 3
+
 ARP_RESOLVE_OK            equ 0
 ARP_RESOLVE_PENDING       equ 1
 ARP_RESOLVE_FAILED        equ 2
@@ -477,13 +483,30 @@ arp_cache_tick:
 
 .tick_incomplete:
     ; INCOMPLETE entry — arp_resolve issued the request, no
-    ; reply arrived. Phase 6.e.2 minimum: after AGING_CYCLES
-    ; elapse, transition to FAILED. Retry logic (6.e.3) and
-    ; PROBE state (6.e.4) layer on top.
+    ; reply arrived. After AGING_CYCLES: retry up to
+    ; ARP_MAX_RETRIES times (re-send arp_send_request, bump
+    ; retry_count, restart age clock), then transition to
+    ; FAILED. 6.e.4 adds the symmetric PROBE-state retry
+    ; path; 6.f adds gratuitous ARP at boot.
     mov rdx, rbx
     sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]
     cmp rdx, ARP_AGING_CYCLES
     jb  .tick_next
+    movzx eax, byte [r10 + ARP_ENTRY_RETRY]
+    cmp al, ARP_MAX_RETRIES
+    jae .tick_incomplete_fail
+    ; Retry: bump retry_count, restart age clock, re-send.
+    inc al
+    mov [r10 + ARP_ENTRY_RETRY], al
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
+    push rcx                                           ; preserve scan index
+    push r10                                           ; preserve walker
+    mov edi, [r10 + ARP_ENTRY_IP]
+    call arp_send_request
+    pop r10
+    pop rcx
+    jmp .tick_next
+.tick_incomplete_fail:
     mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_FAILED
     mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
     mov edi, ARP_STATE_INCOMPLETE

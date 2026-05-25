@@ -37,6 +37,8 @@
 .equ ARP_STATE_PROBE,           4
 .equ ARP_STATE_FAILED,          5
 
+.equ ARP_MAX_RETRIES,           3
+
 .equ ARP_RESOLVE_OK,            0
 .equ ARP_RESOLVE_PENDING,       1
 .equ ARP_RESOLVE_FAILED,        2
@@ -407,16 +409,26 @@ arp_cache_tick:
     b       .Ltick_emit_state_change
 
 .Ltick_incomplete:
-    // INCOMPLETE entry — arp_resolve issued the request, no
-    // reply arrived. 6.e.2 minimum: after AGING_CYCLES,
-    // transition to FAILED. Retry logic + PROBE arrive in
-    // 6.e.3/6.e.4.
+    // INCOMPLETE entry: 6.e.3 retry behaviour. After
+    // AGING_CYCLES elapse, retry up to ARP_MAX_RETRIES times
+    // before transitioning to FAILED.
     ldr     x11, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
     sub     x11, x19, x11
     movz    w12, #0x4980
     movk    w12, #0x0052, lsl #16
     cmp     x11, x12
     b.lo    .Ltick_next
+    ldrb    w10, [x21, #ARP_ENTRY_RETRY]
+    cmp     w10, #ARP_MAX_RETRIES
+    b.hs    .Ltick_incomplete_fail
+    // Retry: bump retry_count, restart age clock, re-send.
+    add     w10, w10, #1
+    strb    w10, [x21, #ARP_ENTRY_RETRY]
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    ldr     w0, [x21]                       // ip arg for arp_send_request
+    bl      arp_send_request
+    b       .Ltick_next
+.Ltick_incomplete_fail:
     mov     w10, #ARP_STATE_FAILED
     strb    w10, [x21, #ARP_ENTRY_STATE]
     str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
