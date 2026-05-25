@@ -27,9 +27,11 @@
 ; Public API:
 ;
 ;   arp_cache_lookup(edi = ip_be)
-;     → rax = pointer to 6-byte MAC if found (state != FREE),
-;       0 otherwise. Bumps the entry's last_access_gen on hit
-;       so insert's LRU eviction prefers least-recently-used.
+;     → rax = pointer to the cache ENTRY (32 bytes starting at
+;       the IP field) if found, 0 otherwise. Callers read
+;       [rax + ARP_ENTRY_MAC] for the MAC, [rax + ARP_ENTRY_STATE]
+;       for the state byte. Bumps the entry's last_access_gen on
+;       hit so insert's LRU eviction prefers least-recently-used.
 ;
 ;   arp_cache_insert(edi = ip_be, rsi = mac_ptr, edx = new_state)
 ;     Three-pass slot selection in precedence order:
@@ -57,6 +59,13 @@ ARP_ENTRY_RETRY           equ 11
 ARP_ENTRY_LRU_GEN         equ 12
 
 ARP_STATE_FREE            equ 0
+ARP_STATE_INCOMPLETE      equ 1
+ARP_STATE_REACHABLE       equ 2
+; 3=STALE, 4=PROBE, 5=FAILED — phase 6.e wires the transitions
+
+ARP_RESOLVE_OK            equ 0
+ARP_RESOLVE_PENDING       equ 1
+ARP_RESOLVE_FAILED        equ 2
 
 extern __memreq_addr__arp_cache
 
@@ -87,6 +96,7 @@ GUEST_IP_WIRE_LE          equ 0x022AA8C0
 global arp_cache_lookup
 global arp_cache_insert
 global arp_send_request
+global arp_resolve
 
 [bits 64]
 section .text
@@ -120,7 +130,7 @@ arp_cache_lookup:
     inc eax
     mov [r8 + ARP_CACHE_HDR_GEN], eax
     mov [r9 + ARP_ENTRY_LRU_GEN], eax
-    lea rax, [r9 + ARP_ENTRY_MAC]
+    mov rax, r9                                        ; return entry pointer
     ret
 
 ; ================================================================
@@ -274,13 +284,135 @@ arp_send_request:
     leave
     ret
 
+; ================================================================
+; arp_resolve — L3-callable IP → MAC resolution
+; ================================================================
+;   In:  edi = ip_be, rsi = out_mac_ptr (caller's 6-byte buffer)
+;   Out: eax = status: 0 OK (MAC copied into out_mac_ptr),
+;                      1 PENDING (request in flight, retry later),
+;                      2 FAILED (pool/queue full)
+;   Clobbers: caller-saved set; uses rbx + r12 internally so
+;   push/pops them.
+;
+; Single-call semantics: cache hit with state REACHABLE returns
+; OK with the MAC. Cache miss inserts an INCOMPLETE placeholder
+; and sends an ARP request; caller polls again later. Other
+; states (INCOMPLETE, PROBE, STALE, FAILED) return PENDING
+; without re-sending — the state machine (phase 6.e) drives
+; transitions on its own timer.
+arp_resolve:
+    push rbx
+    push r12
+    mov ebx, edi                                       ; ebx = ip
+    mov r12, rsi                                       ; r12 = out_mac_ptr
+
+    mov edi, ebx
+    call arp_cache_lookup                              ; rax = entry ptr or 0
+    test rax, rax
+    jz  .resolve_miss
+
+    ; Cache hit — branch on state.
+    cmp byte [rax + ARP_ENTRY_STATE], ARP_STATE_REACHABLE
+    jne .resolve_pending_hit
+
+    ; REACHABLE: copy MAC bytes from entry into caller's buffer.
+    mov ecx, [rax + ARP_ENTRY_MAC]
+    mov [r12], ecx
+    movzx ecx, word [rax + ARP_ENTRY_MAC + 4]
+    mov [r12 + 4], cx
+
+    lea rsi, [rel arp_resolve_ok_msg]
+    mov ecx, arp_resolve_ok_msg_len
+    call emit_bytes
+    mov eax, ebx
+    call emit_hex32
+    lea rsi, [rel arp_send_newline]
+    mov ecx, 1
+    call emit_bytes
+
+    mov eax, ARP_RESOLVE_OK
+    pop r12
+    pop rbx
+    ret
+
+.resolve_pending_hit:
+    ; Cache hit but not REACHABLE (INCOMPLETE/STALE/PROBE/FAILED).
+    ; Return PENDING without sending a fresh request — the state
+    ; machine handles retries.
+    lea rsi, [rel arp_resolve_pending_msg]
+    mov ecx, arp_resolve_pending_msg_len
+    call emit_bytes
+    mov eax, ebx
+    call emit_hex32
+    lea rsi, [rel arp_send_newline]
+    mov ecx, 1
+    call emit_bytes
+    mov eax, ARP_RESOLVE_PENDING
+    pop r12
+    pop rbx
+    ret
+
+.resolve_miss:
+    ; Cache miss — record an INCOMPLETE placeholder so subsequent
+    ; lookups (before the reply lands) see the entry and don't
+    ; re-send a request.
+    mov edi, ebx
+    lea rsi, [rel arp_zero_mac]
+    mov edx, ARP_STATE_INCOMPLETE
+    call arp_cache_insert
+
+    ; Send the actual ARP request.
+    mov edi, ebx
+    call arp_send_request
+    test eax, eax
+    jnz .resolve_send_failed
+
+    lea rsi, [rel arp_resolve_pending_msg]
+    mov ecx, arp_resolve_pending_msg_len
+    call emit_bytes
+    mov eax, ebx
+    call emit_hex32
+    lea rsi, [rel arp_send_newline]
+    mov ecx, 1
+    call emit_bytes
+    mov eax, ARP_RESOLVE_PENDING
+    pop r12
+    pop rbx
+    ret
+
+.resolve_send_failed:
+    ; arp_send_request returned FULL; its own marker
+    ; (ARP:REQUEST_FULL) already emitted. Surface a distinct
+    ; resolve-level marker so the L3 caller can tell which
+    ; layer ran out.
+    lea rsi, [rel arp_resolve_failed_msg]
+    mov ecx, arp_resolve_failed_msg_len
+    call emit_bytes
+    mov eax, ebx
+    call emit_hex32
+    lea rsi, [rel arp_send_newline]
+    mov ecx, 1
+    call emit_bytes
+    mov eax, ARP_RESOLVE_FAILED
+    pop r12
+    pop rbx
+    ret
+
 section .rodata
 arp_broadcast_mac:
     db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+arp_zero_mac:
+    db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 arp_request_sent_msg:    db 'ARP:REQUEST_SENT ip='
 arp_request_sent_msg_len equ $ - arp_request_sent_msg
 arp_request_full_msg:    db 'ARP:REQUEST_FULL', 10
 arp_request_full_msg_len equ $ - arp_request_full_msg
+arp_resolve_ok_msg:      db 'ARP:RESOLVE_OK ip='
+arp_resolve_ok_msg_len   equ $ - arp_resolve_ok_msg
+arp_resolve_pending_msg: db 'ARP:RESOLVE_PENDING ip='
+arp_resolve_pending_msg_len equ $ - arp_resolve_pending_msg
+arp_resolve_failed_msg:  db 'ARP:RESOLVE_FAILED ip='
+arp_resolve_failed_msg_len equ $ - arp_resolve_failed_msg
 arp_send_newline:        db 10
 
 section .note.GNU-stack noalloc noexec nowrite progbits

@@ -947,6 +947,24 @@ _entry:
     ldr     w0, =0x012AA8C0
     bl      arp_send_request
 
+    // --- Phase 6.d: exercise arp_resolve (cache + initiator). ---
+    // Different target IP from 6.c (192.168.42.99 → wire LE
+    // 0x632AA8C0). Three steps: MISS-path resolve, direct
+    // cache insert, HIT-path resolve. Test asserts
+    // ARP:RESOLVE_PENDING then ARP:RESOLVE_OK in order.
+    sub     sp, sp, #16                     // scratch for out-buf
+    ldr     w0, =0x632AA8C0
+    mov     x1, sp
+    bl      arp_resolve                     // expect PENDING
+    ldr     w0, =0x632AA8C0
+    adr     x1, arp_resolve_test_fake_mac
+    mov     w2, #2                          // ARP_STATE_REACHABLE
+    bl      arp_cache_insert
+    ldr     w0, =0x632AA8C0
+    mov     x1, sp
+    bl      arp_resolve                     // expect OK
+    add     sp, sp, #16
+
     // Re-derive UART base for the dispatch loop's emit chains
     // (dispatcher caller-contract: x0 = UART base).
     movz    x0, #0x4000, lsl #16
@@ -1373,6 +1391,10 @@ txapi_prebake_dst_mac:
 txapi_prebake_msg:
     .ascii  "TXAPI:PREBAKE\n"
 txapi_prebake_msg_end:
+// Fake MAC for the 6.d arp_resolve cache-HIT test. Distinctive
+// value to make a bad-copy bug visually obvious.
+arp_resolve_test_fake_mac:
+    .byte   0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x99
 .endif
 
 // _image_end is defined in the linker script (placed after both .text

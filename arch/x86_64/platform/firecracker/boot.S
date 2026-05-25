@@ -185,10 +185,13 @@ extern l2_tx_buffer_pool_alloc
 extern l2_tx_buffer_addr
 extern l2_tx_enqueue
 ; arch/x86_64/l2/arp_cache.S — outbound ARP initiator
-; (D068 phase 6.c). Also gated on TXAPI_PREBAKE so the
-; production build doesn't auto-send an ARP at boot until
-; phase 6.f wires gratuitous ARP intentionally.
+; (D068 phase 6.c) + arp_resolve API (6.d) +
+; arp_cache_insert (6.a). All gated on TXAPI_PREBAKE so the
+; production build doesn't auto-call them until 6.f wires
+; gratuitous ARP intentionally.
 extern arp_send_request
+extern arp_resolve
+extern arp_cache_insert
 L2_TX_PAYLOAD_OFFSET equ 26
 %endif
 
@@ -896,6 +899,31 @@ kernel_main_64:
     ; sniffs tap0 for it.
     mov edi, 0x012AA8C0
     call arp_send_request
+
+    ; --- Phase 6.d: exercise arp_resolve (cache + initiator). ---
+    ; Use a DIFFERENT target IP (192.168.42.99 → wire LE
+    ; 0x632AA8C0) so the resolve traffic doesn't collide with
+    ; the 6.c HOST_IP request just enqueued. Three steps:
+    ;   1. resolve(IP) on empty cache → MISS path: insert
+    ;      INCOMPLETE, send request, return PENDING.
+    ;   2. arp_cache_insert(IP, fake_mac, REACHABLE) directly,
+    ;      bypassing the wire (the host wouldn't reply to a
+    ;      synthetic test IP anyway).
+    ;   3. resolve(IP) again → cache HIT REACHABLE → OK.
+    ; The test asserts ARP:RESOLVE_PENDING then ARP:RESOLVE_OK
+    ; in that order.
+    sub rsp, 16                                      ; scratch for resolve out-buf
+    mov edi, 0x632AA8C0
+    mov rsi, rsp
+    call arp_resolve                                 ; expect PENDING
+    mov edi, 0x632AA8C0
+    lea rsi, [rel arp_resolve_test_fake_mac]
+    mov edx, 2                                       ; ARP_STATE_REACHABLE
+    call arp_cache_insert
+    mov edi, 0x632AA8C0
+    mov rsi, rsp
+    call arp_resolve                                 ; expect OK
+    add rsp, 16
 %endif
     mov ebx, 100
 .dispatch_loop:
@@ -1246,6 +1274,12 @@ txapi_prebake_dst_mac:
     db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 txapi_prebake_msg:     db 'TXAPI:PREBAKE', 10
 txapi_prebake_len      equ $ - txapi_prebake_msg
+; Fake MAC for the 6.d arp_resolve cache-HIT test. Caller
+; passes this as the mac_ptr arg to arp_cache_insert; the
+; subsequent resolve copies it into the output buffer.
+; Distinctive value to make a bad-copy bug visually obvious.
+arp_resolve_test_fake_mac:
+    db 0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x99
 %endif
 
 driver_ok_fail_msg:    db 'DRIVER_OK:FAIL status='

@@ -8,7 +8,8 @@
 // AAPCS64 calling convention:
 //
 //   arp_cache_lookup(w0 = ip_be)
-//     → x0 = pointer to 6-byte MAC on hit, 0 on miss.
+//     → x0 = pointer to the cache ENTRY (32 bytes; IP at +0,
+//       MAC at +4, state at +10, ...) on hit, 0 on miss.
 //
 //   arp_cache_insert(w0 = ip_be, x1 = mac_ptr, w2 = state)
 //     → nothing.
@@ -28,6 +29,13 @@
 .equ ARP_ENTRY_LRU_GEN,         12
 
 .equ ARP_STATE_FREE,            0
+.equ ARP_STATE_INCOMPLETE,      1
+.equ ARP_STATE_REACHABLE,       2
+// 3=STALE, 4=PROBE, 5=FAILED — phase 6.e wires the transitions
+
+.equ ARP_RESOLVE_OK,            0
+.equ ARP_RESOLVE_PENDING,       1
+.equ ARP_RESOLVE_FAILED,        2
 
 // TX API + emit symbols for arp_send_request below.
 .equ L2_TX_POOL_IDX_FULL,       0xFFFFFFFF
@@ -39,6 +47,7 @@
 .global arp_cache_lookup
 .global arp_cache_insert
 .global arp_send_request
+.global arp_resolve
 
 // ================================================================
 // arp_cache_lookup
@@ -68,7 +77,7 @@ arp_cache_lookup:
     add     w12, w12, #1
     str     w12, [x9, #ARP_CACHE_HDR_GEN]
     str     w12, [x10, #ARP_ENTRY_LRU_GEN]
-    add     x0, x10, #ARP_ENTRY_MAC
+    mov     x0, x10                                   // return entry pointer
     ret
 
 // ================================================================
@@ -219,3 +228,111 @@ arp_request_full_msg:
 arp_request_full_msg_end:
 arp_send_newline:
     .byte   10
+
+// ================================================================
+// arp_resolve — L3-callable IP → MAC resolution
+// ================================================================
+//   In:  w0 = ip_be, x1 = out_mac_ptr (caller's 6-byte buffer)
+//   Out: w0 = status: 0 OK, 1 PENDING, 2 FAILED
+//   Uses x19 + x20 callee-saved internally.
+//
+// See the x86_64 mirror for the semantic contract.
+arp_resolve:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]                 // x19 = ip; x20 = out_mac_ptr
+    mov     w19, w0
+    mov     x20, x1
+
+    bl      arp_cache_lookup                    // x0 = entry ptr or 0
+    cbz     x0, .Lresolve_miss
+
+    // Cache hit — branch on state.
+    ldrb    w9, [x0, #ARP_ENTRY_STATE]
+    cmp     w9, #ARP_STATE_REACHABLE
+    b.ne    .Lresolve_pending_hit
+
+    // REACHABLE: copy MAC bytes from entry into caller's buffer.
+    ldr     w9, [x0, #ARP_ENTRY_MAC]
+    str     w9, [x20]
+    ldrh    w9, [x0, #(ARP_ENTRY_MAC + 4)]
+    strh    w9, [x20, #4]
+
+    adr     x1, arp_resolve_ok_msg
+    mov     w2, #(arp_resolve_ok_msg_end - arp_resolve_ok_msg)
+    bl      emit_bytes
+    mov     w5, w19
+    bl      emit_hex32
+    adr     x1, arp_send_newline
+    mov     w2, #1
+    bl      emit_bytes
+    mov     w0, #ARP_RESOLVE_OK
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+.Lresolve_pending_hit:
+    adr     x1, arp_resolve_pending_msg
+    mov     w2, #(arp_resolve_pending_msg_end - arp_resolve_pending_msg)
+    bl      emit_bytes
+    mov     w5, w19
+    bl      emit_hex32
+    adr     x1, arp_send_newline
+    mov     w2, #1
+    bl      emit_bytes
+    mov     w0, #ARP_RESOLVE_PENDING
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+.Lresolve_miss:
+    // Insert INCOMPLETE placeholder so subsequent lookups (before
+    // the reply lands) don't re-send a request.
+    mov     w0, w19
+    adr     x1, arp_zero_mac
+    mov     w2, #ARP_STATE_INCOMPLETE
+    bl      arp_cache_insert
+
+    mov     w0, w19
+    bl      arp_send_request
+    cbnz    w0, .Lresolve_send_failed
+
+    adr     x1, arp_resolve_pending_msg
+    mov     w2, #(arp_resolve_pending_msg_end - arp_resolve_pending_msg)
+    bl      emit_bytes
+    mov     w5, w19
+    bl      emit_hex32
+    adr     x1, arp_send_newline
+    mov     w2, #1
+    bl      emit_bytes
+    mov     w0, #ARP_RESOLVE_PENDING
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+.Lresolve_send_failed:
+    adr     x1, arp_resolve_failed_msg
+    mov     w2, #(arp_resolve_failed_msg_end - arp_resolve_failed_msg)
+    bl      emit_bytes
+    mov     w5, w19
+    bl      emit_hex32
+    adr     x1, arp_send_newline
+    mov     w2, #1
+    bl      emit_bytes
+    mov     w0, #ARP_RESOLVE_FAILED
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #32
+    ret
+
+.section .rodata
+arp_zero_mac:
+    .byte   0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+arp_resolve_ok_msg:
+    .ascii  "ARP:RESOLVE_OK ip="
+arp_resolve_ok_msg_end:
+arp_resolve_pending_msg:
+    .ascii  "ARP:RESOLVE_PENDING ip="
+arp_resolve_pending_msg_end:
+arp_resolve_failed_msg:
+    .ascii  "ARP:RESOLVE_FAILED ip="
+arp_resolve_failed_msg_end:

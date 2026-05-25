@@ -304,7 +304,13 @@ deferred work completed" directive), the queue is:
      60), so the dispatcher correctly drops it per ETH-003;
      round-trip cache update is exercised via padded scapy
      replies in test_arp_cache, not via the host's auto-reply.
-   - 6.d `arp_resolve(ip) → MAC` API for L3 callers.
+   - 6.d ✅ `arp_resolve(ip, out_mac) → status` API for L3
+     callers. Cache hit + REACHABLE → OK (MAC copied);
+     cache hit + other state → PENDING (no re-send);
+     cache miss → insert INCOMPLETE + send request + PENDING;
+     send failure → FAILED. Tested via TXAPI_PREBAKE
+     extension exercising both MISS and HIT paths. Test:
+     `test_arp_resolve.test_arp_resolve_miss_then_hit`.
    - 6.e timer + state machine (REACHABLE → STALE →
      PROBE → REACHABLE/FAILED).
    - 6.f gratuitous ARP at boot.
