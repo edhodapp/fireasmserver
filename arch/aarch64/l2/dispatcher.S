@@ -539,6 +539,71 @@ l2_dispatch:
     mov     w2, #(arp_request_msg_end - arp_request_msg)
     bl      emit_bytes
 
+    // --- Phase (c): queue the ARP reply via the TX API ---
+    //
+    // Mirrors arch/x86_64/l2/dispatcher.S phase (c.1).
+    // Producer side of the L2 TX API: alloc one pool buffer,
+    // write the 28-byte ARP reply body at +PAYLOAD_OFFSET,
+    // enqueue one request with dst = sender's MAC, etype =
+    // 0x0806, payload_len = 28. The dispatcher's TX phase
+    // queue-drain consumer (b.3) builds the wire frame and
+    // submits to virtio.
+    //
+    // Caller-saved regs (x9-x18) are all available; sender_mac
+    // and sender_ip stashes at [sp+112..117] and [sp+108..111]
+    // are untouched by the TX API calls. x19-x28 are AAPCS64
+    // callee-saved so the dispatcher's pinned state survives.
+    // emit_bytes / emit_hex32 self-load UART_BASE per task #44,
+    // so we don't need to preserve x0 across the call chain.
+    bl      l2_tx_buffer_pool_alloc           // w0 = pool_idx
+    cmn     w0, #1                            // == 0xFFFFFFFF (L2_TX_POOL_IDX_FULL = -1 as i32)
+    b.eq    .Larp_no_enqueue
+    mov     w14, w0                           // save idx (x14 caller-saved but not touched by buffer_addr)
+    bl      l2_tx_buffer_addr                 // x0 = pool buffer base
+    add     x9, x0, #L2_TX_PAYLOAD_OFFSET     // x9 = payload start
+
+    // Write 28-byte ARP body at x9.
+    mov     w10, #0x0100
+    strh    w10, [x9, #0]                     // HTYPE 0x0001 BE
+    mov     w10, #0x0008
+    strh    w10, [x9, #2]                     // PTYPE 0x0800 BE
+    mov     w10, #6
+    strb    w10, [x9, #4]                     // HLEN
+    mov     w10, #4
+    strb    w10, [x9, #5]                     // PLEN
+    mov     w10, #0x0200
+    strh    w10, [x9, #6]                     // OPER 0x0002 BE (reply)
+    mov     w10, #GUEST_MAC_LE_LO32           // 0x00000002
+    str     w10, [x9, #8]                     // SHA bytes 0-3
+    mov     w10, #GUEST_MAC_LE_HI16           // 0x00000100
+    strh    w10, [x9, #12]                    // SHA bytes 4-5
+    ldr     w10, =0x022AA8C0                  // SPA wire bytes c0 a8 2a 02 (LE u32)
+    str     w10, [x9, #14]
+    // THA from sender_mac stash.
+    ldrh    w10, [sp, #112]
+    strh    w10, [x9, #18]
+    ldrh    w10, [sp, #114]
+    strh    w10, [x9, #20]
+    ldrh    w10, [sp, #116]
+    strh    w10, [x9, #22]
+    // TPA from sender_ip stash.
+    ldr     w10, [sp, #108]
+    str     w10, [x9, #24]
+
+    // Enqueue.
+    add     x0, sp, #112                      // dst MAC ptr = sender_mac stash
+    mov     w1, #0x0608                       // etype 0x0806 BE
+    mov     w2, w14                           // pool_idx
+    mov     w3, #28                           // payload_len
+    bl      l2_tx_enqueue
+    // w0 = OK (0) or FULL (1); ignored — ARP requester retries
+    // on its own if the reply doesn't arrive.
+
+    adr     x1, arp_reply_msg
+    mov     w2, #(arp_reply_msg_end - arp_reply_msg)
+    bl      emit_bytes
+
+.Larp_no_enqueue:
 .Lno_arp:
 
     // Emit: RX:FRAME id=... hdr_len=... num_bufs=... used_len=...
@@ -756,83 +821,14 @@ l2_dispatch:
     b       .Larp_have_tx_addr
 
 .Ltx_queue_empty:
-    // --- FSA-4(A): pick TX buffer based on arp_match ---
-    //
-    // If an ARP request matched during RX consume, build a reply
-    // frame in tx_arp_buf and submit that. Otherwise submit the
-    // rodata canary (tx_test_pkt). Both are 72 bytes so desc.len
-    // is the same either way.
-    ldr     w13, [sp, #104]                       // arp_match
-    cbz     w13, .Larp_use_canary
-
-    // Build ARP reply in tx_arp_buf:
-    //   1. Copy the 72-byte arp_reply_template (rodata) over.
-    //      4× ldp/stp (64 B) + 1× ldr/str (8 B) = 72 B exactly.
-    //      Template has GUEST_MAC as src + SHA and GUEST_IP as
-    //      SPA pre-baked; dst MAC, THA, TPA are placeholder 0s.
-    //   2. Patch dst MAC @ +12 from stashed sender MAC.
-    //   3. Patch THA @ +44 from stashed sender MAC.
-    //   4. Patch TPA @ +50 from stashed sender IP.
-    adrp    x10, __memreq_addr__tx_arp_buf
-    add     x10, x10, :lo12:__memreq_addr__tx_arp_buf
-    ldr     x10, [x10]                            // x10 = tx_arp_buf base
-    adrp    x11, arp_reply_template
-    add     x11, x11, :lo12:arp_reply_template
-
-    // Template copy: 9× 8-byte words via 4 ldp/stp + 1 ldr/str.
-    ldp     x12, x13, [x11, #0]
-    stp     x12, x13, [x10, #0]
-    ldp     x12, x13, [x11, #16]
-    stp     x12, x13, [x10, #16]
-    ldp     x12, x13, [x11, #32]
-    stp     x12, x13, [x10, #32]
-    ldp     x12, x13, [x11, #48]
-    stp     x12, x13, [x10, #48]
-    ldr     x12, [x11, #64]
-    str     x12, [x10, #64]
-
-    // Patch dst MAC at +12 from sender_mac stash.
-    ldrh    w12, [sp, #112]
-    strh    w12, [x10, #12]
-    ldrh    w12, [sp, #114]
-    strh    w12, [x10, #14]
-    ldrh    w12, [sp, #116]
-    strh    w12, [x10, #16]
-
-    // Patch THA at +44 from sender_mac stash.
-    ldrh    w12, [sp, #112]
-    strh    w12, [x10, #44]
-    ldrh    w12, [sp, #114]
-    strh    w12, [x10, #46]
-    ldrh    w12, [sp, #116]
-    strh    w12, [x10, #48]
-
-    // Patch TPA at +50 from sender_ip stash (two halves; +50 is
-    // 2-aligned only).
-    ldrh    w12, [sp, #108]
-    strh    w12, [x10, #50]
-    ldrh    w12, [sp, #110]
-    strh    w12, [x10, #52]
-
-    // x10 stays = tx_arp_buf base for the desc.addr write below.
-
-    adr     x1, arp_reply_msg
-    mov     w2, #(arp_reply_msg_end - arp_reply_msg)
-    bl      emit_bytes
-
-    // emit_bytes preserves x10 per the helper's preserve list
-    // (x0, x5, x6, x7, x8, x30 only — but the implementation
-    // doesn't touch x9-x18 either). To stay robust against a
-    // future emit_bytes that *does* clobber x10, re-derive
-    // tx_arp_buf base here.
-    adrp    x10, __memreq_addr__tx_arp_buf
-    add     x10, x10, :lo12:__memreq_addr__tx_arp_buf
-    ldr     x10, [x10]
-    b       .Larp_have_tx_addr
-.Larp_use_canary:
+    // Phase (c): the inline FSA-4(A) ARP-build path is gone.
+    // ARP replies now flow through the TX API queue from the
+    // RX recognition site; the queue-drain consumer above
+    // handles them. Queue-empty therefore means there's
+    // genuinely nothing to send, so submit the canary so the
+    // TX path is always exercised end-to-end.
     adrp    x10, tx_test_pkt
     add     x10, x10, :lo12:tx_test_pkt           // runtime addr of canary
-
 .Larp_have_tx_addr:
     add     x11, x19, #TX_QUEUE_OFF               // x11 = TX desc[0] base
     add     x11, x11, x16, lsl #4                 // x11 = TX desc[desc_idx] base (16 B/desc)
