@@ -390,6 +390,10 @@ arp_cache_tick:
     b.eq    .Ltick_reachable
     cmp     w10, #ARP_STATE_INCOMPLETE
     b.eq    .Ltick_incomplete
+    cmp     w10, #ARP_STATE_STALE
+    b.eq    .Ltick_stale
+    cmp     w10, #ARP_STATE_PROBE
+    b.eq    .Ltick_probe
     b       .Ltick_next
 
 .Ltick_reachable:
@@ -434,7 +438,52 @@ arp_cache_tick:
     str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
     mov     w22, #ARP_STATE_INCOMPLETE
     mov     w23, #ARP_STATE_FAILED
-    // fall through
+    b       .Ltick_emit_state_change
+
+.Ltick_stale:
+    // Aged STALE → PROBE: re-send refresh + reset retry.
+    ldr     x11, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    sub     x11, x19, x11
+    movz    w12, #0x4980
+    movk    w12, #0x0052, lsl #16
+    cmp     x11, x12
+    b.lo    .Ltick_next
+    mov     w10, #ARP_STATE_PROBE
+    strb    w10, [x21, #ARP_ENTRY_STATE]
+    strb    wzr, [x21, #ARP_ENTRY_RETRY]
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    ldr     w0, [x21]
+    bl      arp_send_request
+    mov     w22, #ARP_STATE_STALE
+    mov     w23, #ARP_STATE_PROBE
+    b       .Ltick_emit_state_change
+
+.Ltick_probe:
+    // Same retry-then-FAIL shape as INCOMPLETE. PROBE →
+    // REACHABLE happens via the dispatcher's RX-reply hook
+    // (phase 6.b) calling arp_cache_insert with REACHABLE.
+    ldr     x11, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    sub     x11, x19, x11
+    movz    w12, #0x4980
+    movk    w12, #0x0052, lsl #16
+    cmp     x11, x12
+    b.lo    .Ltick_next
+    ldrb    w10, [x21, #ARP_ENTRY_RETRY]
+    cmp     w10, #ARP_MAX_RETRIES
+    b.hs    .Ltick_probe_fail
+    add     w10, w10, #1
+    strb    w10, [x21, #ARP_ENTRY_RETRY]
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    ldr     w0, [x21]
+    bl      arp_send_request
+    b       .Ltick_next
+.Ltick_probe_fail:
+    mov     w10, #ARP_STATE_FAILED
+    strb    w10, [x21, #ARP_ENTRY_STATE]
+    str     x19, [x21, #ARP_ENTRY_LAST_EVENT_CYCLES]
+    mov     w22, #ARP_STATE_PROBE
+    mov     w23, #ARP_STATE_FAILED
+    // fall through to emit (next label is .Ltick_emit_state_change)
 
 .Ltick_emit_state_change:
     // w22 = old state, w23 = new state. x21 + x20 + x19

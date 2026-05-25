@@ -979,7 +979,10 @@ _entry:
     movz    x0, #0x4000, lsl #16
     movk    x0, #0x2000              // x0 = UART_BASE
 .endif
-    mov     x20, #100
+    // Dispatch loop iteration cap. Was 100 (Pi flake era).
+    // Bumped to 200 to give the 6.e state machine's
+    // per-entry transition chains enough runway.
+    mov     x20, #200
 .Ldispatch_loop:
     bl      l2_dispatch
     cbnz    w0, .Lset_failed

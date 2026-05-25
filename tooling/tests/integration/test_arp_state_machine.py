@@ -43,14 +43,14 @@ TXAPI_GUEST_ELF = (
 
 MARKER_TIMEOUT_SECONDS = 5.0
 
-# INCOMPLETE → FAILED now takes ARP_MAX_RETRIES + 1 tick
-# cycles (3 retries × 100ms aging threshold + initial age =
-# ~400ms wall-clock minimum). Plus the dispatcher's per-iter
-# RX:TIMEOUT cost grows when there's interleaved traffic.
-# Use a longer budget for the FAILED-after-retries test so
-# the FAIL transition fits in the dispatch loop's wall-clock
-# window.
-INCOMPLETE_FAILED_TIMEOUT_SECONDS = 15.0
+# INCOMPLETE → FAILED takes ARP_MAX_RETRIES + 1 tick cycles
+# (3 retries × 100ms aging threshold + initial age = ~400ms
+# wall-clock minimum). Plus the dispatcher's per-iter
+# RX:TIMEOUT cost grows when there's interleaved traffic,
+# AND the 6.e.4 STALE → PROBE chain for the 632AA8C0 entry
+# now also pumps additional TX retries, slowing each
+# dispatcher iter further. 25 s gives comfortable margin.
+INCOMPLETE_FAILED_TIMEOUT_SECONDS = 25.0
 
 
 @pytest.fixture(scope="session")
@@ -137,6 +137,44 @@ def test_incomplete_entry_ages_to_failed(
         # cost).
         serial.assert_marker_observed(
             "ARP:STATE_CHANGE ip=642AA8C0 old=00000001 new=00000005",
+            timeout=INCOMPLETE_FAILED_TIMEOUT_SECONDS,
+        )
+        time.sleep(0.1)
+
+
+# pylint: disable=unused-argument,invalid-name
+def test_stale_entry_probes_then_fails(
+    _ensure_txapi_built_for_state: None,
+    artifact_dir: Path,
+) -> None:
+    """A STALE entry transitions through PROBE → FAILED when
+    no ARP reply confirms refresh.
+
+    Chain (entry 192.168.42.99, 0x632AA8C0):
+      pre-bake → REACHABLE
+      tick aging → STALE   (covered by test above)
+      tick aging → PROBE   (re-send + reset retry)
+      tick × ARP_MAX_RETRIES → FAILED
+
+    Asserts the full state evolution via the per-transition
+    markers.
+    """
+    cfg = FirecrackerConfig(
+        kernel_image_path=TXAPI_GUEST_ELF,
+        artifact_dir=artifact_dir,
+    )
+    with launched_guest(cfg) as guest:
+        serial = SerialLog(guest.serial_log_path)
+        serial.assert_marker_observed(
+            "ARP:STATE_CHANGE ip=632AA8C0 old=00000002 new=00000003",
+            timeout=MARKER_TIMEOUT_SECONDS,
+        )
+        serial.assert_marker_observed(
+            "ARP:STATE_CHANGE ip=632AA8C0 old=00000003 new=00000004",
+            timeout=INCOMPLETE_FAILED_TIMEOUT_SECONDS,
+        )
+        serial.assert_marker_observed(
+            "ARP:STATE_CHANGE ip=632AA8C0 old=00000004 new=00000005",
             timeout=INCOMPLETE_FAILED_TIMEOUT_SECONDS,
         )
         time.sleep(0.1)

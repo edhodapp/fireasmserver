@@ -939,7 +939,13 @@ kernel_main_64:
     call arp_resolve                                 ; expect PENDING (cache miss)
     add rsp, 16
 %endif
-    mov ebx, 100
+    ; Dispatch loop iteration cap. Was 100 (Pi flake era). Bumped
+    ; to 200 to give the 6.e state machine's per-entry transition
+    ; chains (REACHABLE → STALE → PROBE → 3 retries → FAILED is
+    ; up to 6 actions × ~4 iters/action = ~24 iters per entry,
+    ; and tests now pre-bake two entries that drive concurrent
+    ; chains) enough runway to complete observably.
+    mov ebx, 500
 .dispatch_loop:
     call l2_dispatch
     test eax, eax

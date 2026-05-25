@@ -460,14 +460,17 @@ arp_cache_tick:
     xor ecx, ecx                                       ; ecx = slot index
 .tick_scan:
     movzx eax, byte [r10 + ARP_ENTRY_STATE]
-    ; Branch on state — only REACHABLE and INCOMPLETE drive
-    ; transitions today. STALE/PROBE/FAILED entries are leaf
-    ; states for this commit; 6.e.3 + 6.e.4 wire their tick
-    ; behavior.
     cmp al, ARP_STATE_REACHABLE
     je  .tick_reachable
     cmp al, ARP_STATE_INCOMPLETE
     je  .tick_incomplete
+    cmp al, ARP_STATE_STALE
+    je  .tick_stale
+    cmp al, ARP_STATE_PROBE
+    je  .tick_probe
+    ; FAILED entries are terminal here (6.e.5 might add a
+    ; retry-from-FAILED transition); FREE entries skip
+    ; outright.
     jmp .tick_next
 
 .tick_reachable:
@@ -510,6 +513,65 @@ arp_cache_tick:
     mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_FAILED
     mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
     mov edi, ARP_STATE_INCOMPLETE
+    mov esi, ARP_STATE_FAILED
+    ; .tick_stale follows in source order so an unconditional
+    ; jump to .tick_emit_state_change is required here — the
+    ; fall-through trick the original 6.e.2 commit assumed
+    ; broke when 6.e.4 added .tick_stale between this label
+    ; and the emit chain.
+    jmp .tick_emit_state_change
+
+.tick_stale:
+    ; Aged STALE → PROBE: re-send a request to refresh, reset
+    ; retry counter. Linux's neighbour cache calls this
+    ; "DELAY → PROBE" but our MVP skips the DELAY intermediate
+    ; state (no recent-traffic gating in a single-core MVP).
+    mov rdx, rbx
+    sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]
+    cmp rdx, ARP_AGING_CYCLES
+    jb  .tick_next
+    mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_PROBE
+    mov byte [r10 + ARP_ENTRY_RETRY], 0
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
+    push rcx
+    push r10
+    mov edi, [r10 + ARP_ENTRY_IP]
+    call arp_send_request
+    pop r10
+    pop rcx
+    mov edi, ARP_STATE_STALE
+    mov esi, ARP_STATE_PROBE
+    jmp .tick_emit_state_change
+
+.tick_probe:
+    ; Same retry-then-FAIL shape as INCOMPLETE; just the
+    ; old-state byte differs in the marker. PROBE →
+    ; REACHABLE happens via the dispatcher's RX-reply hook
+    ; (phase 6.b) which calls arp_cache_insert with state
+    ; REACHABLE — overwriting the entry regardless of
+    ; previous state, so the PROBE state naturally clears
+    ; on a successful refresh.
+    mov rdx, rbx
+    sub rdx, [r10 + ARP_ENTRY_LAST_EVENT_CYCLES]
+    cmp rdx, ARP_AGING_CYCLES
+    jb  .tick_next
+    movzx eax, byte [r10 + ARP_ENTRY_RETRY]
+    cmp al, ARP_MAX_RETRIES
+    jae .tick_probe_fail
+    inc al
+    mov [r10 + ARP_ENTRY_RETRY], al
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
+    push rcx
+    push r10
+    mov edi, [r10 + ARP_ENTRY_IP]
+    call arp_send_request
+    pop r10
+    pop rcx
+    jmp .tick_next
+.tick_probe_fail:
+    mov byte [r10 + ARP_ENTRY_STATE], ARP_STATE_FAILED
+    mov [r10 + ARP_ENTRY_LAST_EVENT_CYCLES], rbx
+    mov edi, ARP_STATE_PROBE
     mov esi, ARP_STATE_FAILED
     ; fall through to emit
 
