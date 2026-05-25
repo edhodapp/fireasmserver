@@ -125,6 +125,39 @@ def test_checkpoint_hides_pre_existing_marker(tmp_path: Path) -> None:
     assert serial.wait_for("READY", timeout=_SHORT_WINDOW)
 
 
+def test_checkpoint_fallback_does_not_leak_pre_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """When the snapshot is no longer a strict prefix (because
+    a partial got stripped after the checkpoint), the fallback
+    must NOT return content that existed before checkpoint.
+
+    Gemini MED from the post-snapshot-cursor review: returning
+    full current text in the fallback case re-exposed history
+    that should have been hidden. The fix returns
+    `current[longest_common_prefix:]` instead.
+    """
+    log = tmp_path / "serial.log"
+    # cleaned_buf at checkpoint = "READY\n"; partial = a
+    # timestamp prefix that hasn't yet matched the regex
+    # (`[` not yet on disk).
+    log.write_text("READY\n2026-05-24T16:37:37")
+    serial = SerialLog(log)
+    _ = serial.text()
+    serial.checkpoint()
+    # Complete the FC line + append a new event. The completed
+    # FC line gets stripped → snapshot's "2026-..." portion
+    # vanishes from current cleaned text.
+    with log.open("a") as fh:
+        fh.write(".929 [l2-harness:main] Success\nRX:FRAME id=1\n")
+    # READY is BEFORE checkpoint and must NOT match.
+    assert not serial.wait_for("READY", timeout=_SHORT_WINDOW), (
+        "fallback leaked pre-checkpoint marker"
+    )
+    # RX:FRAME is AFTER checkpoint and must match.
+    assert serial.wait_for("RX:FRAME", timeout=_SHORT_WINDOW)
+
+
 def test_checkpoint_during_partial_fc_line_no_leak(
     tmp_path: Path,
 ) -> None:

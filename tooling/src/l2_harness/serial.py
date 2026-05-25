@@ -218,28 +218,41 @@ class SerialLog:
         """Cleaned content appended after the last checkpoint.
 
         Returns the suffix of the current cleaned text after
-        the snapshot taken at checkpoint. Two cases:
+        the snapshot taken at checkpoint. Three cases:
 
-          1. Current text starts with snapshot → return the
+          1. No checkpoint set (snapshot empty) → return full
+             current cleaned text (matches behavior before
+             cursor was introduced).
+
+          2. Current text starts with snapshot → return the
              suffix (the normal case: snapshot stays a stable
              prefix as new content is appended).
 
-          2. Snapshot is NO LONGER a prefix → the partial
-             content captured in snapshot has since been
-             stripped (e.g., a partial FC line that completed).
-             Fall back to returning current full cleaned text
-             — we lose the discrimination from this checkpoint
-             but it's still correct: every fully-cleaned
-             character in current is genuine guest output, no
-             FC tail leak.
+          3. Snapshot is no longer a prefix → the partial
+             content captured at checkpoint has since been
+             stripped (e.g., a partial timestamp that grew
+             into a complete FC line and got removed). Compute
+             the longest common prefix between snapshot and
+             current; return current's suffix past that point.
+             This is the only correct way to recover the
+             "appended" content when the snapshot ceases to
+             be literally a prefix — returning the full
+             current text would re-expose pre-checkpoint
+             markers (Gemini MED, post-snapshot-cursor review).
         """
         self._refresh()
         current = self._compute_full_cleaned()
-        if self._cursor_snapshot and current.startswith(
-            self._cursor_snapshot,
-        ):
+        if not self._cursor_snapshot:
+            return current
+        if current.startswith(self._cursor_snapshot):
             return current[len(self._cursor_snapshot):]
-        return current
+        common = 0
+        limit = min(len(current), len(self._cursor_snapshot))
+        while common < limit and (
+            current[common] == self._cursor_snapshot[common]
+        ):
+            common += 1
+        return current[common:]
 
     def wait_for(self, marker: str, timeout: float = 1.0) -> bool:
         """Block until `marker` appears AFTER the last checkpoint.
