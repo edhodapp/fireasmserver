@@ -877,6 +877,13 @@ _entry:
     // RFC 5227 / Linux's arp_send_request boot behaviour.
     // movz+movk rather than `ldr w0, =literal` to keep the
     // literal pool out of the picture.
+    //
+    // Return value (w0) intentionally not checked: pool is
+    // empty at boot (32 free buffers, generation 0) and the
+    // tx_pending ring is empty, so .Larp_send_full is
+    // unreachable here. The marker ARP:TX_REQ_FULL would
+    // appear in the serial log if this invariant were ever
+    // violated.
     movz    w0, #0xA8C0
     movk    w0, #0x022A, lsl #16
     bl      arp_send_request

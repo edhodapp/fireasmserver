@@ -829,11 +829,18 @@ kernel_main_64:
 
     ; --- D068 item 6.f: gratuitous ARP at boot ---
     ;
-    ; Announce our MAC binding for GUEST_IP (192.168.42.2
-    ; wire LE = 0x012AA8C0 — wait, GUEST_IP wire bytes are
-    ; c0 a8 2a 02 → LE u32 = 0x022AA8C0). arp_send_request
-    ; uses SPA = GUEST_IP in the request body, so TPA =
-    ; GUEST_IP yields SPA == TPA per RFC 5227.
+    ; Announce our MAC binding for GUEST_IP. The wire bytes
+    ; for 192.168.42.2 are c0 a8 2a 02 → LE u32 0x022AA8C0.
+    ; arp_send_request uses SPA = GUEST_IP in the request
+    ; body, so passing TPA = GUEST_IP yields SPA == TPA per
+    ; RFC 5227.
+    ;
+    ; Return value (eax) intentionally not checked: pool is
+    ; empty at boot (32 free buffers, generation 0) and the
+    ; tx_pending ring is empty, so .Larp_send_full is
+    ; unreachable here. The marker ARP:TX_REQ_FULL would
+    ; appear in the serial log if this invariant were ever
+    ; violated.
     mov edi, 0x022AA8C0
     call arp_send_request
 
