@@ -180,39 +180,12 @@ arp_send_request:
     stp     x19, x20, [sp, #16]                 // x19 = target_ip; x20 = pool_idx
     mov     w19, w0
 
-    // BREADCRUMB G1: entry
-    adr     x1, gb_g1
-    mov     w2, #3
-    bl      emit_bytes
-
-    // BREADCRUMB G1A: about to bl l2_tx_buffer_pool_alloc
-    adr     x1, gb_g1a
-    mov     w2, #4
-    bl      emit_bytes
-
     bl      l2_tx_buffer_pool_alloc             // w0 = pool_idx
-
-    // BREADCRUMB G1B: alloc returned
-    mov     w19, w19                            // (keep w19 = target_ip)
-    stp     x0, x1, [sp, #-16]!                 // save alloc result
-    adr     x1, gb_g1b
-    mov     w2, #4
-    bl      emit_bytes
-    ldp     x0, x1, [sp], #16
-
     cmn     w0, #1                              // == 0xFFFFFFFF?
     b.eq    .Larp_send_full
     mov     w20, w0
 
     bl      l2_tx_buffer_addr                   // x0 = pool buffer base
-
-    // BREADCRUMB G1C: addr returned
-    stp     x0, x1, [sp, #-16]!
-    adr     x1, gb_g1c
-    mov     w2, #4
-    bl      emit_bytes
-    ldp     x0, x1, [sp], #16
-
     add     x9, x0, #L2_TX_PAYLOAD_OFFSET       // x9 = payload start
 
     mov     w10, #0x0100
@@ -252,22 +225,12 @@ arp_send_request:
     lsr     w10, w19, #16
     strh    w10, [x9, #26]                      // TPA bytes 2-3
 
-    // BREADCRUMB G2: body written, about to enqueue
-    adr     x1, gb_g2
-    mov     w2, #3
-    bl      emit_bytes
-
     adr     x0, arp_broadcast_mac               // dst MAC
     mov     w1, #0x0608                         // etype 0x0806 BE
     mov     w2, w20                             // pool_idx
     mov     w3, #28                             // payload_len
     bl      l2_tx_enqueue
     cbnz    w0, .Larp_send_full
-
-    // BREADCRUMB G3: enqueue ok, about to emit ARP:TX_REQUEST
-    adr     x1, gb_g3
-    mov     w2, #3
-    bl      emit_bytes
 
     adr     x1, arp_request_sent_msg
     mov     w2, #(arp_request_sent_msg_end - arp_request_sent_msg)
@@ -296,10 +259,10 @@ arp_send_request:
 arp_broadcast_mac:
     .byte   0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 arp_request_sent_msg:
-    .ascii  "ARP:REQUEST_SENT ip="
+    .ascii  "ARP:TX_REQUEST ip="
 arp_request_sent_msg_end:
 arp_request_full_msg:
-    .ascii  "ARP:REQUEST_FULL\n"
+    .ascii  "ARP:TX_REQ_FULL\n"
 arp_request_full_msg_end:
 arp_send_newline:
     .byte   10
@@ -582,10 +545,3 @@ arp_state_change_old_end:
 arp_state_change_new_msg:
     .ascii  " new="
 arp_state_change_new_end:
-// 6.f Pi-hang diagnosis breadcrumbs. Remove once isolated.
-gb_g1:  .ascii "G1\n"
-gb_g1a: .ascii "G1A\n"
-gb_g1b: .ascii "G1B\n"
-gb_g1c: .ascii "G1C\n"
-gb_g2:  .ascii "G2\n"
-gb_g3:  .ascii "G3\n"

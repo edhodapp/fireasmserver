@@ -4,7 +4,7 @@ The firecracker_txapi build (TXAPI_PREBAKE=1) now also
 calls `arp_send_request(HOST_DEFAULT_IP)` after the TX
 API enqueue at boot. This test asserts:
 
-  1. The ARP:REQUEST_SENT marker fires with the right IP.
+  1. The ARP:TX_REQUEST marker fires with the right IP.
   2. A wire ARP request appears on tap0 with the right
      dst/src MACs, OPER=request, SHA=GUEST_MAC,
      SPA=GUEST_DEFAULT_IP, TPA=HOST_DEFAULT_IP.
@@ -86,7 +86,7 @@ def test_arp_initiator_sends_request_for_host_ip(
         pcap_path=capture_pcap,
     ) as cap, launched_guest(cfg) as guest:
         serial = SerialLog(guest.serial_log_path)
-        # ARP:REQUEST_SENT fires synchronously at boot when
+        # ARP:TX_REQUEST fires synchronously at boot when
         # the request is enqueued. The dispatcher then needs
         # one or two iterations to actually submit it on the
         # wire (iter 1 drains the TXAPI-TEST queue entry, iter
@@ -103,7 +103,7 @@ def test_arp_initiator_sends_request_for_host_ip(
         # test_arp_cache (which sends a padded reply via
         # scapy).
         serial.assert_marker_observed(
-            "ARP:REQUEST_SENT ip=012AA8C0",
+            "ARP:TX_REQUEST ip=012AA8C0",
             timeout=CAPTURE_TIMEOUT_SECONDS,
         )
         time.sleep(POST_MARKER_QUIESCE_SECONDS)

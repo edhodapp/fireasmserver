@@ -320,7 +320,30 @@ deferred work completed" directive), the queue is:
      ARP_MAX_RETRIES = 3 (matching Linux). Tests:
      `test_arp_state_machine` (3 cases: aging-to-stale,
      incomplete-to-failed, stale-to-probe-to-failed).
-   - 6.f gratuitous ARP at boot.
+   - 6.f ✅ gratuitous ARP at boot. Production boot.S on
+     both arches calls `arp_send_request(GUEST_IP)` after
+     virtio init, before the dispatch loop. The SPA == TPA
+     shape per RFC 5227 announces our MAC binding so peers
+     refresh any stale entry for our IP. Marker
+     `ARP:TX_REQUEST ip=022AA8C0` (renamed from the prior
+     `ARP:REQUEST_SENT` to avoid substring-collision with
+     the dispatcher's RX-side `ARP:REQUEST` marker).
+
+     **Pi-hang diagnosis bonus catch:** the original 6.f
+     attempt hung on Pi 5 inside arp_send_request. Diagnosis
+     via breadcrumb instrumentation localised it to the
+     pool-buffer body write. Root cause: bare-metal aarch64
+     without MMU treats memory as Device-nGnRnE, where (a)
+     LDAXR/STLXR exclusive monitors are UNPREDICTABLE and
+     (b) unaligned word stores generate Alignment Faults.
+     The Vyukov CAS in `l2_tx_buffer_pool_alloc` was
+     replaced with plain load/store (single-producer MVP
+     doesn't need the CAS), and the ARP body's word
+     stores at unaligned offsets (+8 SHA, +24 TPA, +18 src
+     MAC in the dispatcher) were split into halfword
+     pairs. Both fixes are aarch64-only; x86 didn't hit
+     either (LOCK CMPXCHG works on any memory type and x86
+     handles unaligned word stores natively).
 6. **ARP cache + initiator** — outbound ARP, enables
    outbound IP traffic to non-cached peers
 7. **Statistics / counters** — per-class drop counts, RX/TX

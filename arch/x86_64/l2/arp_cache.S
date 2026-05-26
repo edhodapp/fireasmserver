@@ -617,9 +617,14 @@ arp_broadcast_mac:
     db 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 arp_zero_mac:
     db 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-arp_request_sent_msg:    db 'ARP:REQUEST_SENT ip='
+; "ARP:TX_REQUEST" (not "ARP:REQUEST_SENT") so the marker
+; doesn't substring-collide with the dispatcher's RX-side
+; "ARP:REQUEST" marker — tests doing
+; `assert_marker_absent("ARP:REQUEST")` would otherwise trip
+; on every gratuitous-ARP-at-boot emit.
+arp_request_sent_msg:    db 'ARP:TX_REQUEST ip='
 arp_request_sent_msg_len equ $ - arp_request_sent_msg
-arp_request_full_msg:    db 'ARP:REQUEST_FULL', 10
+arp_request_full_msg:    db 'ARP:TX_REQ_FULL', 10
 arp_request_full_msg_len equ $ - arp_request_full_msg
 arp_resolve_ok_msg:      db 'ARP:RESOLVE_OK ip='
 arp_resolve_ok_msg_len   equ $ - arp_resolve_ok_msg

@@ -178,6 +178,7 @@ extern init_memory_layout
 extern l2_dispatch          ; arch/x86_64/l2/dispatcher.S (FSA-1)
 extern l2_tx_pending_init   ; arch/x86_64/l2/tx_api.S — Vyukov ring seq[] pre-init
 extern arp_cache_tick       ; arch/x86_64/l2/arp_cache.S — D068 item 6.e timer ticks
+extern arp_send_request     ; arch/x86_64/l2/arp_cache.S — 6.f gratuitous ARP at boot
 %ifdef TXAPI_PREBAKE
 ; arch/x86_64/l2/tx_api.S — producer-side functions for the TX
 ; API end-to-end test pre-bake. Build-flag-gated so production
@@ -825,6 +826,16 @@ kernel_main_64:
     mov rax, [rel __memreq_addr__l2_state]
     mov word [rax + 0], r13w                          ; rx_next_avail = N (clamped)
     mfence
+
+    ; --- D068 item 6.f: gratuitous ARP at boot ---
+    ;
+    ; Announce our MAC binding for GUEST_IP (192.168.42.2
+    ; wire LE = 0x012AA8C0 — wait, GUEST_IP wire bytes are
+    ; c0 a8 2a 02 → LE u32 = 0x022AA8C0). arp_send_request
+    ; uses SPA = GUEST_IP in the request body, so TPA =
+    ; GUEST_IP yields SPA == TPA per RFC 5227.
+    mov edi, 0x022AA8C0
+    call arp_send_request
 
     ; --- FSA-1: hand off to L2 dispatcher ---
     ;

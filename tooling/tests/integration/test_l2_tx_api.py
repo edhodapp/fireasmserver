@@ -67,13 +67,14 @@ EXPECTED_DST_MAC = bytes([0xFF] * 6)
 # canary stream while not blocking the test suite.
 CAPTURE_TIMEOUT_SECONDS = 3.0
 
-# Quiesce after the marker fires before stopping the sniffer. The
-# guest emits TX:RECLAIMED as soon as the virtio device acks the
-# descriptor; tap0's host-side netif_rx is on a different kernel
-# path and may lag by a few ms. Without this, the with-block can
-# exit before the frame lands on tap0. Same pattern as the
-# test_eth_src_mac POST_MARKER_QUIESCE_SECONDS.
-POST_MARKER_QUIESCE_SECONDS = 0.5
+# Quiesce after the marker fires before stopping the sniffer.
+# The first TX:RECLAIMED now belongs to the 6.f gratuitous ARP
+# (boot-time arp_send_request lands a queue entry that
+# iter 1 drains before the TXAPI test frame). The TXAPI test
+# frame goes on iter 2; the quiesce has to span that next iter
+# + its tap0 land time. ~2.5 s gives 2x headroom over a single
+# RX:TIMEOUT-driven iter (~1 s on x86 POLL_BUDGET=100M).
+POST_MARKER_QUIESCE_SECONDS = 2.5
 
 
 @pytest.fixture(scope="session")
