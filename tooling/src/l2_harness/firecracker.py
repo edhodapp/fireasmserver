@@ -26,7 +26,15 @@ from pydantic import BaseModel
 
 
 READY_MARKER_DEFAULT = "READY"
-READY_TIMEOUT_SECONDS_DEFAULT = 5.0
+# 5 s was tight enough that full-suite runs (parallel
+# Firecracker spawns + heavier tap0 / pcap setup load)
+# would intermittently time out before READY appeared,
+# while isolated runs always landed under 1 s. 15 s gives
+# enough headroom that the timeout still catches a stuck
+# boot but doesn't trip on host load. See the pre-existing
+# test_l2_fail_paths.py flakes that surfaced during D068
+# 6.f integration.
+READY_TIMEOUT_SECONDS_DEFAULT = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 2.0
 
 

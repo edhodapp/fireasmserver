@@ -312,7 +312,16 @@ l2_dispatch:
     adr     x1, rx_timeout_msg
     mov     w2, #(rx_timeout_msg_end - rx_timeout_msg)
     bl      emit_bytes
-    b       .Lok
+    // Fall through to TX phase. Pre-6.f this was `b .Lok`,
+    // which made the TX consume RX-driven only — any frame
+    // enqueued during an RX-idle stretch sat in the queue
+    // until the next inbound packet. Boot-time gratuitous
+    // ARP + arp_resolve probes (D068 6.c-6.f) trip this:
+    // nothing arrives on RX until our outbound frames provoke
+    // replies, and the TX phase never runs to send them. Fix:
+    // TX consume runs every dispatch iteration regardless of
+    // RX outcome.
+    b       .Ltx_phase
 
 .Lrx_received:
     // FSA-2: multi-frame consume loop. The wait loop above
@@ -808,6 +817,16 @@ l2_dispatch:
     // a free-list when TX gains multiple buffer slots. For
     // tx_next_avail = 0 (first call) and desc_idx = 0 the byte
     // effect is identical to the FSA-3 hardcoded form.
+.Ltx_phase:
+    // Re-load l2_state base. On the normal post-RX path x10
+    // already holds it (set by the writeback above); on the
+    // RX:TIMEOUT fall-through path it was clobbered by the
+    // emit_bytes call (x10 is caller-saved under AAPCS64).
+    // Cost is two adrp/add + an ldr — effectively free, and
+    // makes the label a self-sufficient entry point.
+    adrp    x10, __memreq_addr__l2_state
+    add     x10, x10, :lo12:__memreq_addr__l2_state
+    ldr     x10, [x10]                            // x10 = l2_state base
     ldrh    w15, [x10, #L2_STATE_TX_NEXT_AVAIL]   // tx_next_avail (FSA-4: persistent)
     mov     w16, #0                               // desc_idx (FSA-5: from free-list)
 

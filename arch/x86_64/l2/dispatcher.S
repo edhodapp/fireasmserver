@@ -307,7 +307,15 @@ l2_dispatch:
     lea rsi, [rel rx_timeout_msg]
     mov ecx, rx_timeout_len
     call emit_bytes
-    jmp .l2_ok
+    ; Fall through to TX phase. Pre-6.f this was `jmp .l2_ok`,
+    ; which made the TX consume RX-driven only — any frame
+    ; enqueued during an RX-idle stretch sat in the queue until
+    ; the next inbound packet. Boot-time gratuitous ARP +
+    ; arp_resolve probes (D068 6.c-6.f) trip this: nothing
+    ; arrives on RX until our outbound frames provoke replies,
+    ; and the TX phase never runs to send them. Fix: TX consume
+    ; runs every dispatch iteration regardless of RX outcome.
+    jmp .l2_tx_phase
 
 .l2_rx_received:
     ; FSA-2: multi-frame consume loop. The wait loop above
@@ -863,6 +871,14 @@ l2_dispatch:
     ; FSA-4: tx_next_avail loaded from l2_state. desc_idx still
     ; fixed at 0 because TX_BUF_COUNT = 1; FSA-5 will introduce
     ; a free-list when TX gains multiple buffer slots.
+.l2_tx_phase:
+    ; Re-load l2_state base. On the normal post-RX path rax
+    ; already holds it (set by the writeback above); on the
+    ; RX:TIMEOUT fall-through path rax is whatever emit_bytes
+    ; clobbered to. Cost is one mov from a memreq slot —
+    ; effectively free, and makes the label a self-sufficient
+    ; entry point.
+    mov rax, [rel __memreq_addr__l2_state]
     movzx r9d, word [rax + L2_STATE_TX_NEXT_AVAIL]
     xor r10d, r10d                                   ; desc_idx (FSA-5: from free-list)
 

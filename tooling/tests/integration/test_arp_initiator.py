@@ -40,13 +40,18 @@ TXAPI_GUEST_ELF = (
     / "firecracker_txapi" / "guest.elf"
 )
 
-CAPTURE_TIMEOUT_SECONDS = 5.0
-# Long enough for two dispatcher iterations after boot — iter 1
-# drains the TXAPI test request, iter 2 drains the ARP request
-# (~1 s per iter on x86 with POLL_BUDGET=100M when no RX
-# arrives). 2.5 s gives 2x headroom over the ~1.05 s the second
-# TX needs.
-POST_MARKER_QUIESCE_SECONDS = 2.5
+CAPTURE_TIMEOUT_SECONDS = 12.0
+# Long enough for three dispatcher iterations after boot —
+# in TXAPI_PREBAKE builds the queue order is:
+#   iter 1: 6.f gratuitous ARP (TPA=GUEST_IP, ip=022AA8C0)
+#   iter 2: TXAPI test frame (Ethertype 0x88B5)
+#   iter 3: prebake HOST_IP ARP probe (this test's target)
+# Per-iter cost is bounded by POLL_BUDGET (~2–3 s when no
+# RX is arriving) regardless of TX activity, so the iter-3
+# worst case is ~6–9 s. 8 s gives ~1.5x headroom on the
+# common case where iters 1–2 are RX-bound and finish in
+# under 1 s each.
+POST_MARKER_QUIESCE_SECONDS = 8.0
 
 
 @pytest.fixture(scope="session")
@@ -102,6 +107,15 @@ def test_arp_initiator_sends_request_for_host_ip(
         # pcap; the inbound-reply path is covered by
         # test_arp_cache (which sends a padded reply via
         # scapy).
+        # Target IP here is HOST_IP (192.168.42.1, LE u32
+        # 0x012AA8C0) — the TXAPI_PREBAKE harness calls
+        # arp_send_request(HOST_IP) as a probe. This is
+        # intentionally distinct from D068 6.f's production
+        # gratuitous ARP at boot, which targets GUEST_IP
+        # (0x022AA8C0) for the SPA == TPA shape. Both fire
+        # in this build (production 6.f on iter 0, prebake
+        # probe right after), and the dispatcher submits
+        # them on successive iterations.
         serial.assert_marker_observed(
             "ARP:TX_REQUEST ip=012AA8C0",
             timeout=CAPTURE_TIMEOUT_SECONDS,
