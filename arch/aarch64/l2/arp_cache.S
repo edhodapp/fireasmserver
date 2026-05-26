@@ -225,15 +225,32 @@ arp_send_request:
     strb    w10, [x9, #5]                       // PLEN
     mov     w10, #0x0100
     strh    w10, [x9, #6]                       // OPER 0x0001 BE (request)
-    mov     w10, #GUEST_MAC_LE_LO32
-    str     w10, [x9, #8]                       // SHA bytes 0-3
+    // SHA bytes 0-3: pool buffer + 64-byte pool header + 26-byte
+    // payload offset + 8 = pool_base + 98. 98 mod 4 = 2 →
+    // UNALIGNED for a 32-bit store on Device-typed memory
+    // (bare-metal aarch64 without MMU, ARM ARM B2.10.1).
+    // Split into two halfword stores — halfword offsets are
+    // 2-aligned which works on Device. Same fix at the TPA
+    // store below.
+    mov     w10, #GUEST_MAC_LE_LO32             // 0x00000002
+    strh    w10, [x9, #8]                       // SHA bytes 0-1 (= 0x02 0x00)
+    strh    wzr, [x9, #10]                      // SHA bytes 2-3 (= 0x00 0x00)
     mov     w10, #GUEST_MAC_LE_HI16
     strh    w10, [x9, #12]                      // SHA bytes 4-5
-    ldr     w10, =0x022AA8C0                    // GUEST_IP wire LE
+    // SPA at offset +14: pool + 104, 104 mod 4 = 0 — aligned,
+    // word store is fine here.
+    movz    w10, #0xA8C0
+    movk    w10, #0x022A, lsl #16               // w10 = 0x022AA8C0 (GUEST_IP wire LE)
     str     w10, [x9, #14]                      // SPA
+    // THA at +18: pool + 108, aligned. THA bytes 4-5 at +22:
+    // pool + 112, aligned. Word + halfword zero stores OK.
     str     wzr, [x9, #18]                      // THA bytes 0-3 = 0
     strh    wzr, [x9, #22]                      // THA bytes 4-5 = 0
-    str     w19, [x9, #24]                      // TPA = target_ip
+    // TPA at +24: pool + 114, 114 mod 4 = 2 → UNALIGNED.
+    // Split into two halfword stores.
+    strh    w19, [x9, #24]                      // TPA bytes 0-1
+    lsr     w10, w19, #16
+    strh    w10, [x9, #26]                      // TPA bytes 2-3
 
     // BREADCRUMB G2: body written, about to enqueue
     adr     x1, gb_g2

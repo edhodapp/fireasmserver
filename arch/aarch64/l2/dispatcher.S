@@ -865,21 +865,28 @@ l2_dispatch:
     add     x10, x10, x13, lsl #11                // x10 = pool buffer
 
     // Build wire frame headers in front of producer's payload.
-    //   +0..11  virtio_net_hdr = zeros. stp zero pair fills 16
-    //   bytes; only the first 12 carry meaning (the next 4 are
-    //   the dst MAC's first word, immediately overwritten below).
+    // Pool buffer is 4096-aligned (per regions.yaml); pool
+    // buffer N at pool_base + 64 + N * 2048 = also 64-byte-
+    // aligned. So [x10, #0] is aligned. But Device-typed
+    // memory (bare-metal aarch64 without MMU) rejects
+    // word stores that are not 4-byte-aligned within the
+    // buffer. Word offsets that need to be aligned: +12
+    // (dst MAC bytes 0-3 — aligned), +18 (src MAC bytes
+    // 0-3 — UNALIGNED, 18 mod 4 = 2). Split the +18 store
+    // into halfword pairs.
     stp     xzr, xzr, [x10, #0]
-    //   +12..17 dst MAC from entry
+    //   +12..17 dst MAC from entry (12 mod 4 = 0, word OK)
     ldr     w13, [x14, #L2_TX_SLOT_DST_MAC]      // bytes 0-3
     str     w13, [x10, #12]
     ldrh    w13, [x14, #(L2_TX_SLOT_DST_MAC + 4)] // bytes 4-5
     strh    w13, [x10, #16]
-    //   +18..23 src MAC = GUEST_MAC
-    mov     w13, #GUEST_MAC_LE_LO32
-    str     w13, [x10, #18]
+    //   +18..23 src MAC = GUEST_MAC (18 mod 4 = 2 → split)
+    mov     w13, #GUEST_MAC_LE_LO32              // 0x00000002
+    strh    w13, [x10, #18]                      // bytes 0-1 (= 0x02 0x00)
+    strh    wzr, [x10, #20]                      // bytes 2-3 (= 0x00 0x00)
     mov     w13, #GUEST_MAC_LE_HI16
     strh    w13, [x10, #22]
-    //   +24..25 ethertype
+    //   +24..25 ethertype (24 mod 2 = 0, halfword OK)
     ldrh    w13, [x14, #L2_TX_SLOT_ETHERTYPE]
     strh    w13, [x10, #24]
 
