@@ -4725,6 +4725,121 @@ are stretch goals whose timing depends on what L3 and
 operational deployment actually need. A future DECISIONS
 entry will close that milestone when reached.
 
+## 2026-06-05
+
+### D069: Source-authority discipline — authority-derived requirements carry verbatim source_refs
+
+**Requirements:** N/A — methodology decision; it governs how
+authority-derived requirements are authored and audited rather
+than specifying a runtime behavior of the server. The enforcing
+engineering-authoring rule (an ENG-NNN entry), the per-requirement
+`source_refs` schema, the audit gate, and the back-fill of existing
+authority-derived requirements land in follow-up commits under this
+decision.
+
+---
+
+**The decision.**
+
+Every requirement whose behavior derives from an external
+authority — an RFC, the ARM Architecture Reference Manual, the
+Intel SDM, the Virtio specification, a hardware datasheet — shall
+carry a `source_refs` field that quotes the authority **verbatim**,
+with:
+
+  - `kind` — statute / standard / specification / datasheet / erratum
+  - `citation` — the verbatim quoted text, with locating metadata
+    (document, section or page, retrieval URL)
+  - `content_hash` — SHA-256 of the quoted text
+  - `retrieved` — ISO date of retrieval
+
+The `citation` is a quote, not a paraphrase. Reviews and the audit
+check the implementation against the quoted authority, not against
+the requirement's prose restatement of it.
+
+Requirements that originate **internally** — fireasmserver's own
+design inventions (memory-region record format, allocator halt
+codes, the bytecode VM opcode set) — have no external authority and
+continue to trace up to `DECISIONS.md` only. `source_refs` is
+mandatory for the authority-derived subset and absent for the
+internally-originated subset; each requirement declares which it is,
+and the audit distinguishes the two by that marker.
+
+---
+
+**Why — validation, not verification.**
+
+The existing `REQUIREMENTS.md` already does **verification** well:
+every requirement traces down to implementation and tests, and the
+audit gates that those refs resolve. Verification answers *did we
+build the thing right* — is the code internally consistent with the
+requirement. That down-chain is sound.
+
+What the register does not yet do is **validation**: *did we build
+the right thing* — does the requirement faithfully capture what the
+authority actually says. Today every requirement traces up to a
+`DECISIONS.md` entry, and a decision is a prose paraphrase of the
+spec authored by the same operator who authored the implementation.
+If the spec was misread, the misreading is encoded identically in
+the decision, the requirement, the test, and the code — and every
+verification gate clears, because they are all consistent with one
+another. They are consistently wrong.
+
+This is the failure mode that sinks most projects. Verification
+machinery is comparatively easy and most teams have it; validation
+is where the project meets the world, and it is where the gap
+between the spec we think exists and the spec that actually exists
+goes undetected. Source-authority discipline closes that gap by
+adding the one edge the register is missing: requirement → verbatim
+external authority. A verbatim quote is invariant under operator
+misreading — the implementation is checked against the authority's
+own words, not against any rephrasing of them.
+
+---
+
+**The chain this completes.**
+
+`decisions → requirements → tests → code` is a deliberate descent
+from less formal to more formal: a decision is prose rationale; a
+requirement is a semi-formal INCOSE / RFC-2119 statement; a test is
+executable; code is machine-checked. Each rung increases formality
+and tightens communication from the human's intent toward the
+machine's execution. But the ladder is only as sound as its top
+rung's anchor. Until now the top rung anchors to an internal
+paraphrase — the ladder is rigorous yet rooted in something that can
+drift from reality. `source_refs` re-roots the top rung in external
+ground truth, so the formality gradient descends from authority
+rather than from an unverified restatement of it.
+
+---
+
+**The concrete leak this stops.**
+
+The recurring pre-push review finding — "num_buffers can't exist
+without MRG_RXBUF" — is an authority-drift event. It re-litigates on
+every push because nothing in the register pins the verbatim
+Virtio 1.2 §5.1.6 text that settles it. With a `source_refs` quote
+of that section attached to the requirement, the question is
+answered mechanically by the authority's own words, once, and stops
+costing a review cycle each push. This is the fireasmserver instance
+of the canonical authority-drift catch.
+
+---
+
+**Dual payoff — correctness anchor and certification evidence.**
+
+The same `source_refs` edge serves two ends at once. As a
+correctness mechanism it kills authority drift, above. As
+certification evidence it is the traceability an auditor reads: EU
+CRA and US NIST-SSDF conformance want requirements traced from
+authoritative sources down through implementation and test, and a
+verbatim authority citation with a content hash is precisely what
+makes that chain auditable rather than asserted. One edge, both
+payoffs — consistent with the globally-accessible-cloud cert-
+readiness posture the project has adopted. The audit gate that
+enforces `source_refs` presence and well-formedness is, by the same
+token, an SSDF-style process control.
+
 ## Future decisions (not yet made)
 - virtio-net driver design
 - TCP state machine implementation
