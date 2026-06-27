@@ -1,0 +1,29 @@
+req_id: MR-OWNER
+category: MR
+title: "Owner identification on every memreq record"
+statement: >-
+  Every memreq record shall declare exactly one owner_id value at
+  record offset 28 as a little-endian uint16.
+verb_strength: shall
+status: implemented
+authority_class: internally_originated
+notes: "Internally-originated — fireasmserver's own record format, no external authority."
+derived_from:
+  - D058
+source_refs: []
+implementation_refs:
+  - arch: x86_64
+    file: arch/x86_64/memory/memreq.inc
+    symbol: null
+    note: "macro arg owner"
+  - arch: aarch64
+    file: arch/aarch64/memory/memreq.inc
+    symbol: null
+    note: "macro arg owner"
+verification_refs:
+  - ref_kind: property
+    file: tooling/tests/test_memlayout_properties.py
+    symbol: null
+    note: "owner_id field bounds"
+supersedes: null
+superseded_by: null

@@ -1,0 +1,69 @@
+req_id: VIO-R-NUMBUF
+category: VIO-R
+title: "num_buffers is unconditional under modern virtio; equals 1 without MRG_RXBUF"
+statement: >-
+  When operating as a modern (VIRTIO_F_VERSION_1) device with
+  VIRTIO_NET_F_MRG_RXBUF not negotiated, the dispatcher shall treat
+  virtio_net_hdr.num_buffers as an always-present field and shall
+  validate that its value equals 1.
+verb_strength: shall
+status: implemented
+authority_class: authority_derived
+notes: "Worked example for D069 source-authority discipline."
+derived_from:
+  - D044
+  - D069
+source_refs:
+  - authority_id: virtio-1.2
+    kind: specification
+    section: "§5.1.6"
+    section_title: "Device Operation — struct virtio_net_hdr"
+    citation: |-
+      u8 flags;
+      u8 gso_type;
+      le16 hdr_len;
+      le16 gso_size;
+      le16 csum_start;
+      le16 csum_offset;
+      le16 num_buffers;
+      le32 hash_value;        (Only if VIRTIO_NET_F_HASH_REPORT negotiated)
+    content_hash: "sha256:f080f7876cff10c1dd6c39f52d4d6b78917f9e5b73320d6ba9dedc430cd47f25"
+    retrieved: "2026-06-07"
+    retrieval_source: "oasis-tcs/virtio-spec device-types/net/description.tex"
+  - authority_id: virtio-1.2
+    kind: specification
+    section: "§5.1.6.1"
+    section_title: "Legacy Interface: Device Operation"
+    citation: >-
+      The legacy driver only presented num_buffers in the struct
+      virtio_net_hdr when VIRTIO_NET_F_MRG_RXBUF was negotiated; without
+      that feature the structure was 2 bytes shorter.
+    content_hash: "sha256:dada45dacf5a7aaf21218612e9234ba50f5803f2f6788a8da139b432fcf6b496"
+    retrieved: "2026-06-07"
+    retrieval_source: "oasis-tcs/virtio-spec device-types/net/description.tex"
+  - authority_id: virtio-1.2
+    kind: specification
+    section: "§5.1.6"
+    section_title: "Processing of Incoming Packets"
+    citation: >-
+      If VIRTIO_NET_F_MRG_RXBUF has not been negotiated, the device MUST
+      set num_buffers to 1.
+    content_hash: "sha256:c7b93bf12de522b387034ccdca670f6a2b9774b313a2ab88a137098b1796b3bf"
+    retrieved: "2026-06-07"
+    retrieval_source: "oasis-tcs/virtio-spec device-types/net/description.tex"
+implementation_refs:
+  - arch: x86_64
+    file: arch/x86_64/l2/dispatcher.S
+    symbol: null
+    note: "num_buffers == 1 validation"
+  - arch: aarch64
+    file: arch/aarch64/l2/dispatcher.S
+    symbol: null
+    note: "num_buffers == 1 validation"
+verification_refs:
+  - ref_kind: integration
+    file: tooling/tests/integration/test_l2_arp.py
+    symbol: null
+    note: "dispatcher num_bufs fail-path"
+supersedes: null
+superseded_by: null

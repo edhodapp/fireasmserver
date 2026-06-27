@@ -1,0 +1,8 @@
+# Authorities lookup for the reqdb golden fixture.
+# Open authorities admit a verbatim citation body; closed (paywalled)
+# ones do not. Only virtio-1.2 is referenced by this fixture.
+- authority_id: virtio-1.2
+  full_title: "Virtual I/O Device (VIRTIO) Version 1.2"
+  publisher: OASIS
+  access: open
+  canonical_url: "https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html"

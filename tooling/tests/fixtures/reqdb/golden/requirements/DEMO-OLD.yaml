@@ -1,0 +1,21 @@
+req_id: DEMO-OLD
+category: DEMO
+title: "Superseded demo requirement"
+statement: >-
+  The system shall demonstrate the superseded side of a supersession
+  pair so the round-trip fixture exercises the self-referential link.
+verb_strength: shall
+status: na
+authority_class: internally_originated
+notes: "Fixture — exercises the superseded_by self-reference."
+derived_from:
+  - D068
+source_refs: []
+implementation_refs:
+  - arch: common
+    file: docs/l2/STATUS.md
+    symbol: null
+    note: "fixture implementation ref"
+verification_refs: []
+supersedes: null
+superseded_by: DEMO-NEW
