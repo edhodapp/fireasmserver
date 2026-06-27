@@ -20,7 +20,7 @@ from reqdb.model import (
     VerificationRef,
 )
 from reqdb.parser import load_reqdb
-from reqdb.sqlite_gen import read_sqlite, write_sqlite
+from reqdb.sqlite_gen import UnknownAuthorityError, read_sqlite, write_sqlite
 
 __all__ = [
     "Authority",
@@ -28,6 +28,7 @@ __all__ = [
     "ReqDB",
     "Requirement",
     "SourceRef",
+    "UnknownAuthorityError",
     "VerificationRef",
     "load_reqdb",
     "read_sqlite",

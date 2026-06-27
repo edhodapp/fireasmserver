@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import TypeVar
+
+from pydantic import BaseModel
 
 from reqdb.model import (
     Authority,
@@ -27,6 +30,20 @@ from reqdb.model import (
     SourceRef,
     VerificationRef,
 )
+
+_RefT = TypeVar("_RefT", bound=BaseModel)
+
+
+class UnknownAuthorityError(ValueError):
+    """A requirement's ``source_ref`` cites an ``authority_id`` absent
+    from the authorities lookup.
+
+    Raised by :func:`write_sqlite` before any rows are written, naming
+    the offending requirement and authority, so an authoring typo
+    surfaces with context instead of as an opaque SQLite foreign-key
+    violation mid-insert.
+    """
+
 
 _SCHEMA = """
 CREATE TABLE authorities (
@@ -90,7 +107,11 @@ def write_sqlite(db: ReqDB, out_path: Path) -> None:
     Any existing file is replaced, so the build is idempotent. Foreign
     keys are enforced; authorities are inserted before the requirements
     and child rows that reference them.
+
+    Raises :class:`UnknownAuthorityError` (before touching ``out_path``)
+    if any source_ref cites an authority absent from the lookup.
     """
+    _check_authority_refs(db)
     if out_path.exists():
         out_path.unlink()
     conn = sqlite3.connect(str(out_path))
@@ -122,6 +143,24 @@ def read_sqlite(db_path: Path) -> ReqDB:
     finally:
         conn.close()
     return ReqDB(authorities=authorities, requirements=requirements)
+
+
+def _check_authority_refs(db: ReqDB) -> None:
+    """Fail loud, with context, if a source_ref cites an unknown authority.
+
+    The SQLite foreign key would also catch this, but only as an opaque
+    mid-insert ``IntegrityError``; this names the requirement and the
+    authority so an authoring typo is diagnosable.
+    """
+    known = {authority.authority_id for authority in db.authorities}
+    for req in db.requirements:
+        for ref in req.source_refs:
+            if ref.authority_id not in known:
+                raise UnknownAuthorityError(
+                    f"requirement {req.req_id!r} cites unknown "
+                    f"authority_id {ref.authority_id!r}; "
+                    f"known authorities: {sorted(known)}",
+                )
 
 
 def _insert_authorities(
@@ -198,20 +237,81 @@ def _read_authorities(conn: sqlite3.Connection) -> list[Authority]:
 
 
 def _read_requirements(conn: sqlite3.Connection) -> list[Requirement]:
-    """Read every requirement with its child rows, ordered by ``req_id``."""
+    """Read every requirement with its child rows, ordered by ``req_id``.
+
+    Child rows are fetched one query per table (not one per requirement)
+    and grouped by ``req_id`` in memory — avoiding an N+1 query pattern
+    while preserving authored child-list order via ``ORDER BY req_id, id``.
+    """
     rows = conn.execute(
         "SELECT req_id, category, title, statement, verb_strength, "
         "status, authority_class, notes, supersedes, superseded_by "
         "FROM requirements ORDER BY req_id",
     ).fetchall()
-    return [_row_to_requirement(conn, row) for row in rows]
+    decisions = _group_decisions(conn)
+    source_refs = _group_refs(
+        conn,
+        "SELECT req_id, authority_id, kind, section, section_title, "
+        "citation, content_hash, retrieved, retrieval_source "
+        "FROM source_refs ORDER BY req_id, id",
+        SourceRef,
+    )
+    impl_refs = _group_refs(
+        conn,
+        "SELECT req_id, arch, file, symbol, note "
+        "FROM implementation_refs ORDER BY req_id, id",
+        ImplementationRef,
+    )
+    verif_refs = _group_refs(
+        conn,
+        "SELECT req_id, ref_kind, file, symbol, note "
+        "FROM verification_refs ORDER BY req_id, id",
+        VerificationRef,
+    )
+    return [
+        _build_requirement(
+            row, decisions, source_refs, impl_refs, verif_refs,
+        )
+        for row in rows
+    ]
 
 
-def _row_to_requirement(
+def _group_decisions(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """Group derives-from decision ids by ``req_id``, in insert order."""
+    grouped: dict[str, list[str]] = {}
+    rows = conn.execute(
+        "SELECT req_id, decision_id FROM requirement_decisions "
+        "ORDER BY req_id, id",
+    ).fetchall()
+    for row in rows:
+        grouped.setdefault(row["req_id"], []).append(row["decision_id"])
+    return grouped
+
+
+def _group_refs(
     conn: sqlite3.Connection,
+    query: str,
+    model: type[_RefT],
+) -> dict[str, list[_RefT]]:
+    """Group a child-ref table by ``req_id``, in insert order, validating
+    each row into ``model``. One query for the whole table (no N+1)."""
+    grouped: dict[str, list[_RefT]] = {}
+    for row in conn.execute(query).fetchall():
+        data = dict(row)
+        req_id = data.pop("req_id")
+        grouped.setdefault(req_id, []).append(model.model_validate(data))
+    return grouped
+
+
+def _build_requirement(
     row: sqlite3.Row,
+    decisions: dict[str, list[str]],
+    source_refs: dict[str, list[SourceRef]],
+    impl_refs: dict[str, list[ImplementationRef]],
+    verif_refs: dict[str, list[VerificationRef]],
 ) -> Requirement:
-    """Assemble a :class:`Requirement` from its scalar row plus children."""
+    """Assemble a :class:`Requirement` from its scalar row plus the
+    pre-grouped child collections (empty list when a req has none)."""
     req_id = row["req_id"]
     return Requirement(
         req_id=req_id,
@@ -222,60 +322,10 @@ def _row_to_requirement(
         status=row["status"],
         authority_class=row["authority_class"],
         notes=row["notes"],
-        derived_from=_read_decisions(conn, req_id),
-        source_refs=_read_source_refs(conn, req_id),
-        implementation_refs=_read_impl_refs(conn, req_id),
-        verification_refs=_read_verif_refs(conn, req_id),
+        derived_from=decisions.get(req_id, []),
+        source_refs=source_refs.get(req_id, []),
+        implementation_refs=impl_refs.get(req_id, []),
+        verification_refs=verif_refs.get(req_id, []),
         supersedes=row["supersedes"],
         superseded_by=row["superseded_by"],
     )
-
-
-def _read_decisions(conn: sqlite3.Connection, req_id: str) -> list[str]:
-    """Read a requirement's derives-from decision ids, in insert order."""
-    rows = conn.execute(
-        "SELECT decision_id FROM requirement_decisions "
-        "WHERE req_id = ? ORDER BY id",
-        (req_id,),
-    ).fetchall()
-    return [row["decision_id"] for row in rows]
-
-
-def _read_source_refs(
-    conn: sqlite3.Connection,
-    req_id: str,
-) -> list[SourceRef]:
-    """Read a requirement's source refs, in insert order."""
-    rows = conn.execute(
-        "SELECT authority_id, kind, section, section_title, citation, "
-        "content_hash, retrieved, retrieval_source FROM source_refs "
-        "WHERE req_id = ? ORDER BY id",
-        (req_id,),
-    ).fetchall()
-    return [SourceRef.model_validate(dict(row)) for row in rows]
-
-
-def _read_impl_refs(
-    conn: sqlite3.Connection,
-    req_id: str,
-) -> list[ImplementationRef]:
-    """Read a requirement's implementation refs, in insert order."""
-    rows = conn.execute(
-        "SELECT arch, file, symbol, note FROM implementation_refs "
-        "WHERE req_id = ? ORDER BY id",
-        (req_id,),
-    ).fetchall()
-    return [ImplementationRef.model_validate(dict(row)) for row in rows]
-
-
-def _read_verif_refs(
-    conn: sqlite3.Connection,
-    req_id: str,
-) -> list[VerificationRef]:
-    """Read a requirement's verification refs, in insert order."""
-    rows = conn.execute(
-        "SELECT ref_kind, file, symbol, note FROM verification_refs "
-        "WHERE req_id = ? ORDER BY id",
-        (req_id,),
-    ).fetchall()
-    return [VerificationRef.model_validate(dict(row)) for row in rows]

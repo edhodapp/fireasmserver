@@ -21,7 +21,15 @@ from pathlib import Path
 
 import pytest
 
-from reqdb import ReqDB, load_reqdb, read_sqlite, write_sqlite
+from reqdb import (
+    ReqDB,
+    Requirement,
+    SourceRef,
+    UnknownAuthorityError,
+    load_reqdb,
+    read_sqlite,
+    write_sqlite,
+)
 
 _GOLDEN = Path(__file__).parent / "fixtures" / "reqdb" / "golden"
 
@@ -83,6 +91,9 @@ def test_write_empty_db_produces_zero_rows(tmp_path: Path) -> None:
     assert out.exists()
     counts = _row_counts(out)
     assert all(count == 0 for count in counts.values())
+    # Reading it back exercises the batched readers against empty child
+    # tables and round-trips to the empty model.
+    assert read_sqlite(out) == ReqDB()
 
 
 def test_read_missing_file_raises(tmp_path: Path) -> None:
@@ -90,6 +101,44 @@ def test_read_missing_file_raises(tmp_path: Path) -> None:
     empty file and return a silently-empty model."""
     with pytest.raises(FileNotFoundError):
         read_sqlite(tmp_path / "missing.sqlite")
+
+
+def test_write_unknown_authority_raises_with_context(tmp_path: Path) -> None:
+    """A source_ref citing an authority absent from the lookup must fail
+    with a contextful error naming the requirement and the authority —
+    not an opaque SQLite foreign-key violation — and must leave no file
+    behind (validation precedes any write)."""
+    db = ReqDB(
+        authorities=[],
+        requirements=[
+            Requirement(
+                req_id="X-1",
+                category="X",
+                title="cites a missing authority",
+                statement="The system shall cite an unknown authority.",
+                verb_strength="shall",
+                status="implemented",
+                authority_class="authority_derived",
+                source_refs=[
+                    SourceRef(
+                        authority_id="no-such-authority",
+                        kind="specification",
+                        section="§1",
+                        content_hash="sha256:00",
+                        retrieved="2026-06-27",
+                        retrieval_source="test",
+                    ),
+                ],
+            ),
+        ],
+    )
+    out = tmp_path / "bad.sqlite"
+    with pytest.raises(UnknownAuthorityError) as excinfo:
+        write_sqlite(db, out)
+    message = str(excinfo.value)
+    assert "X-1" in message
+    assert "no-such-authority" in message
+    assert not out.exists()
 
 
 def test_rebuild_overwrites_existing_db(tmp_path: Path) -> None:
