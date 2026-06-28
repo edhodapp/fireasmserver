@@ -16,18 +16,22 @@ raises).
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from reqdb import (
+    Authority,
     DuplicateIdError,
+    ImplementationRef,
     ReqDB,
     Requirement,
     SourceRef,
     UnknownAuthorityError,
+    VerificationRef,
     load_reqdb,
     read_sqlite,
     sqlite_gen,
@@ -56,6 +60,30 @@ def _row_counts(db_path: Path) -> dict[str, int]:
     finally:
         conn.close()
     return counts
+
+
+# (model, its table, fields that project to child tables not columns)
+_FIELD_COVERAGE: list[tuple[type[BaseModel], str, set[str]]] = [
+    (Authority, "authorities", set()),
+    (SourceRef, "source_refs", set()),
+    (ImplementationRef, "implementation_refs", set()),
+    (VerificationRef, "verification_refs", set()),
+    (
+        Requirement,
+        "requirements",
+        {
+            "derived_from",
+            "source_refs",
+            "implementation_refs",
+            "verification_refs",
+        },
+    ),
+]
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Column names of ``table``, via the sqlite3 schema as oracle."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def test_build_golden_produces_expected_rows(tmp_path: Path) -> None:
@@ -229,3 +257,56 @@ def test_write_failure_preserves_existing_db(
 
     assert out.read_bytes() == before
     assert not (tmp_path / "reqdb.sqlite.tmp").exists()
+
+
+def test_build_is_reproducible(tmp_path: Path) -> None:
+    """Building the same model twice yields byte-identical databases — a
+    reproducible projection. Silent nondeterminism in a generated
+    artefact is the most corrosive failure to miss: it defeats diffing,
+    caching, and content-hash identity downstream."""
+    db = load_reqdb(_GOLDEN)
+    first = tmp_path / "first.sqlite"
+    second = tmp_path / "second.sqlite"
+    write_sqlite(db, first)
+    write_sqlite(db, second)
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_schema_covers_every_model_field(tmp_path: Path) -> None:
+    """Projection completeness, independent of the round-trip: every
+    scalar field of every model must have a column in its table, so a
+    field added to the model but forgotten in the schema is caught even
+    when no fixture exercises it. Multi-valued fields project to child
+    tables (the child models are themselves checked here; derived_from
+    via the junction table)."""
+    out = tmp_path / "reqdb.sqlite"
+    write_sqlite(load_reqdb(_GOLDEN), out)
+    conn = sqlite3.connect(str(out))
+    try:
+        for model, table, child_fields in _FIELD_COVERAGE:
+            scalar = set(model.model_fields) - child_fields
+            missing = scalar - _columns(conn, table)
+            assert not missing, f"{table} missing columns {missing}"
+        assert "decision_id" in _columns(conn, "requirement_decisions")
+    finally:
+        conn.close()
+
+
+def test_source_ref_content_hashes_recompute() -> None:
+    """D069 validation as a test: every source_ref that carries a
+    citation must have content_hash == sha256 of that citation, so the
+    stored hash genuinely pins the quoted authority text. sha256 is the
+    external oracle. The count assertion guards against the loop
+    vacuously checking nothing."""
+    db = load_reqdb(_GOLDEN)
+    checked = 0
+    for req in db.requirements:
+        for ref in req.source_refs:
+            if ref.citation is None:
+                continue
+            digest = hashlib.sha256(ref.citation.encode("utf-8")).hexdigest()
+            assert ref.content_hash == f"sha256:{digest}", (
+                f"{req.req_id} {ref.section}"
+            )
+            checked += 1
+    assert checked == _EXPECT_SOURCE_REFS
