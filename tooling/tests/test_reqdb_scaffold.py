@@ -44,6 +44,7 @@ _GOLDEN = Path(__file__).parent / "fixtures" / "reqdb" / "golden"
 _EXPECT_REQUIREMENTS = 4
 _EXPECT_AUTHORITIES = 1
 _EXPECT_SOURCE_REFS = 3        # all three on VIO-R-NUMBUF
+_EXPECT_CITED_SOURCE_REFS = 3  # of those, all 3 carry a citation today
 _EXPECT_IMPL_REFS = 6          # numbuf 2 + mr-owner 2 + demo pair 1+1
 
 _TABLES = ("requirements", "authorities", "source_refs", "implementation_refs")
@@ -263,7 +264,13 @@ def test_build_is_reproducible(tmp_path: Path) -> None:
     """Building the same model twice yields byte-identical databases — a
     reproducible projection. Silent nondeterminism in a generated
     artefact is the most corrosive failure to miss: it defeats diffing,
-    caching, and content-hash identity downstream."""
+    caching, and content-hash identity downstream.
+
+    The byte-identity holds because the SQLite file format embeds no
+    timestamp and the build uses a fixed insert order and a single
+    commit; it is, however, sensitive to the SQLite library version
+    (page format / defaults). If this ever flakes across environments,
+    that is the first place to look — not a reqdb regression."""
     db = load_reqdb(_GOLDEN)
     first = tmp_path / "first.sqlite"
     second = tmp_path / "second.sqlite"
@@ -284,8 +291,11 @@ def test_schema_covers_every_model_field(tmp_path: Path) -> None:
     conn = sqlite3.connect(str(out))
     try:
         for model, table, child_fields in _FIELD_COVERAGE:
-            scalar = set(model.model_fields) - child_fields
-            missing = scalar - _columns(conn, table)
+            fields = set(model.model_fields)
+            # self-check the exclusion list: a typo'd child-field name
+            # would otherwise silently weaken the coverage assertion.
+            assert child_fields <= fields, f"{table} stale child_fields"
+            missing = (fields - child_fields) - _columns(conn, table)
             assert not missing, f"{table} missing columns {missing}"
         assert "decision_id" in _columns(conn, "requirement_decisions")
     finally:
@@ -297,7 +307,9 @@ def test_source_ref_content_hashes_recompute() -> None:
     citation must have content_hash == sha256 of that citation, so the
     stored hash genuinely pins the quoted authority text. sha256 is the
     external oracle. The count assertion guards against the loop
-    vacuously checking nothing."""
+    vacuously checking nothing — and is tied to the *cited* population,
+    not the total, so a closed-authority ref (citation=None, hash still
+    present) added later doesn't fail this test for the wrong reason."""
     db = load_reqdb(_GOLDEN)
     checked = 0
     for req in db.requirements:
@@ -309,4 +321,4 @@ def test_source_ref_content_hashes_recompute() -> None:
                 f"{req.req_id} {ref.section}"
             )
             checked += 1
-    assert checked == _EXPECT_SOURCE_REFS
+    assert checked == _EXPECT_CITED_SOURCE_REFS

@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import get_args
 
-from hypothesis import given, settings, strategies as st
+from hypothesis import example, given, settings, strategies as st
 
 from reqdb import (
     Authority,
@@ -40,9 +40,11 @@ from reqdb.model import (
     VerificationKind,
 )
 
-# Identifiers are ASCII only, so Python's str sort matches SQLite's
-# BINARY collation — the round-trip's ORDER BY then agrees with the
-# parser's sort, keeping the identity exact.
+# Identifiers use only single-byte (ASCII) characters, so Python's
+# code-point sort equals SQLite's BINARY (byte) collation. That is the
+# load-bearing invariant: it makes the round-trip's ORDER BY agree with
+# the pre-sort below, keeping the identity exact. A multi-byte character
+# here would break the equivalence and the property with it.
 _IDENT = st.text(
     alphabet="abcdefghijklmnopqrstuvwxyz0123456789-",
     min_size=1,
@@ -157,6 +159,51 @@ def _reqdbs(draw: st.DrawFn) -> ReqDB:
 
 @given(_reqdbs())
 @settings(max_examples=100)
+@example(
+    # A guaranteed populated case: one authority, one requirement
+    # carrying all three child-ref kinds plus derived_from. The random
+    # strategy permits empty DBs, so this pins at least one rich example
+    # even if the strategy is later weakened toward the degenerate case.
+    db=ReqDB(
+        authorities=[
+            Authority(
+                authority_id="a1",
+                full_title="t",
+                publisher="p",
+                access="open",
+                canonical_url=None,
+            ),
+        ],
+        requirements=[
+            Requirement(
+                req_id="r1",
+                category="c",
+                title="t",
+                statement="s",
+                verb_strength="shall",
+                status="implemented",
+                authority_class="authority_derived",
+                derived_from=["D1"],
+                source_refs=[
+                    SourceRef(
+                        authority_id="a1",
+                        kind="specification",
+                        section="§1",
+                        content_hash="h",
+                        retrieved="2026-06-28",
+                        retrieval_source="x",
+                    ),
+                ],
+                implementation_refs=[
+                    ImplementationRef(arch="common", file="f"),
+                ],
+                verification_refs=[
+                    VerificationRef(ref_kind="proof", file="t"),
+                ],
+            ),
+        ],
+    ),
+)
 def test_roundtrip_identity_over_random_reqdbs(db: ReqDB) -> None:
     """text→model→sqlite→model is the identity for any valid ReqDB."""
     with tempfile.TemporaryDirectory() as tmp:
