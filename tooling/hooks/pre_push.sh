@@ -240,8 +240,32 @@ run_ontology_audit() {
     "$REPO_ROOT/.venv/bin/audit-ontology" --exit-nonzero-on-gap
 }
 
+run_python_gates() {
+    echo
+    echo "=== pre-push: Python lint + type gates (mirror CI) ==="
+    # The per-commit hook only lints / type-checks *staged* files, so a
+    # dependency bump (e.g. pyelftools 0.33 adding inline types) can
+    # introduce errors in untouched files that pass locally yet fail
+    # CI's whole-tree checks. This gate runs exactly what
+    # .github/workflows/python-gates.yml runs — flake8 over all of
+    # tooling/src + tooling/tests, mypy --strict and pylint over all of
+    # tooling/src — so the local result and CI cannot diverge. Fast
+    # (seconds), so it runs first and fails before the slow cells.
+    if [[ ! -x "$REPO_ROOT/.venv/bin/flake8" ]]; then
+        echo "SKIP: no .venv/bin/flake8 (run: pip install -e .[dev])"
+        return 0
+    fi
+    "$REPO_ROOT/.venv/bin/flake8" tooling/src/ tooling/tests/ || return 1
+    "$REPO_ROOT/.venv/bin/mypy" --strict tooling/src/ || return 1
+    "$REPO_ROOT/.venv/bin/pylint" --rcfile=.pylintrc tooling/src/ \
+        || return 1
+}
+
 echo "=== fireasmserver pre-push integration tests ==="
 
+# Lint/type gates first — fast, and they mirror CI exactly so a push
+# that would fail CI's Python Quality Gates fails here instead.
+run_python_gates                     || fail=1
 run_local_cell x86_64  firecracker   || fail=1
 # TRACE=1 on aarch64/qemu: captures the QEMU instruction stream and
 # runs branch-cov — lets developers see the same coverage numbers

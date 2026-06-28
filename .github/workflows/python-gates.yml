@@ -33,10 +33,14 @@ jobs:
       - run: pip install -e ".[dev]"
       - name: flake8
         run: flake8 tooling/src/ tooling/tests/
+      # Whole tree, not a hand-maintained dir list: a new package
+      # (e.g. reqdb) must not be able to escape type/lint checks just
+      # by not being listed here. flake8 above already covers all of
+      # tooling/src + tooling/tests.
       - name: mypy
-        run: mypy --strict tooling/src/qemu_harness/ tooling/src/branch_cov/
+        run: mypy --strict tooling/src/
       - name: pylint
-        run: pylint --rcfile=.pylintrc tooling/src/qemu_harness/ tooling/src/branch_cov/
+        run: pylint --rcfile=.pylintrc tooling/src/
 
   test:
     name: Tests (Python ${{ matrix.python-version }})
