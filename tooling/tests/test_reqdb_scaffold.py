@@ -20,14 +20,17 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from reqdb import (
+    DuplicateIdError,
     ReqDB,
     Requirement,
     SourceRef,
     UnknownAuthorityError,
     load_reqdb,
     read_sqlite,
+    sqlite_gen,
     write_sqlite,
 )
 
@@ -153,3 +156,76 @@ def test_rebuild_overwrites_existing_db(tmp_path: Path) -> None:
     assert read_sqlite(out) == db
     counts = _row_counts(out)
     assert counts["requirements"] == _EXPECT_REQUIREMENTS
+
+
+def test_unknown_yaml_key_rejected() -> None:
+    """Unknown top-level keys in canonical requirement text must be
+    rejected, not silently dropped — a typo like `implementation_ref`
+    (missing the plural s) would otherwise lose data from the source of
+    truth without a trace."""
+    with pytest.raises(ValidationError):
+        Requirement.model_validate(
+            {
+                "req_id": "X-1",
+                "category": "X",
+                "title": "t",
+                "statement": "s",
+                "verb_strength": "shall",
+                "status": "implemented",
+                "authority_class": "internally_originated",
+                "implementation_ref": [{"arch": "common", "file": "f"}],
+            },
+        )
+
+
+def test_load_missing_requirements_dir_raises(tmp_path: Path) -> None:
+    """A source tree lacking a requirements/ directory must fail loud,
+    not silently produce an empty ReqDB — a wrong path or partial
+    checkout would otherwise generate an empty projection that looks
+    like a successful build."""
+    (tmp_path / "authorities.yaml").write_text("[]\n", encoding="utf-8")
+    with pytest.raises(FileNotFoundError):
+        load_reqdb(tmp_path)
+
+
+def test_write_duplicate_req_id_raises(tmp_path: Path) -> None:
+    """A duplicate req_id must fail with a contextful error before any
+    write, not as an opaque mid-insert IntegrityError leaving a partial
+    file."""
+    req = Requirement(
+        req_id="DUP",
+        category="X",
+        title="t",
+        statement="s",
+        verb_strength="shall",
+        status="implemented",
+        authority_class="internally_originated",
+    )
+    db = ReqDB(authorities=[], requirements=[req, req])
+    out = tmp_path / "dup.sqlite"
+    with pytest.raises(DuplicateIdError) as excinfo:
+        write_sqlite(db, out)
+    assert "DUP" in str(excinfo.value)
+    assert not out.exists()
+
+
+def test_write_failure_preserves_existing_db(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the build fails mid-way, an existing database at out_path is
+    left intact (atomic temp-then-replace) and no .tmp residue remains."""
+    db = load_reqdb(_GOLDEN)
+    out = tmp_path / "reqdb.sqlite"
+    write_sqlite(db, out)
+    before = out.read_bytes()
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated build failure")
+
+    monkeypatch.setattr(sqlite_gen, "_build_db", _boom)
+    with pytest.raises(RuntimeError):
+        write_sqlite(db, out)
+
+    assert out.read_bytes() == before
+    assert not (tmp_path / "reqdb.sqlite.tmp").exists()

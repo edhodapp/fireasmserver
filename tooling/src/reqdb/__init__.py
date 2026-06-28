@@ -20,10 +20,16 @@ from reqdb.model import (
     VerificationRef,
 )
 from reqdb.parser import load_reqdb
-from reqdb.sqlite_gen import UnknownAuthorityError, read_sqlite, write_sqlite
+from reqdb.sqlite_gen import (
+    DuplicateIdError,
+    UnknownAuthorityError,
+    read_sqlite,
+    write_sqlite,
+)
 
 __all__ = [
     "Authority",
+    "DuplicateIdError",
     "ImplementationRef",
     "ReqDB",
     "Requirement",

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 AccessClass = Literal["open", "closed"]
 SourceKind = Literal[
@@ -47,6 +47,8 @@ class Authority(BaseModel):
     body; closed ones (paywalled IEEE) do not.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     authority_id: str
     full_title: str
     publisher: str
@@ -64,6 +66,8 @@ class SourceRef(BaseModel):
     against a licensed copy.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     authority_id: str
     kind: SourceKind
     section: str
@@ -79,6 +83,8 @@ class ImplementationRef(BaseModel):
     two-arch / one-design split is first-class — one requirement, one
     implementation row per architecture."""
 
+    model_config = ConfigDict(extra="forbid")
+
     arch: Arch
     file: str
     symbol: str | None = None
@@ -87,6 +93,8 @@ class ImplementationRef(BaseModel):
 
 class VerificationRef(BaseModel):
     """A test or proof that verifies a requirement."""
+
+    model_config = ConfigDict(extra="forbid")
 
     ref_kind: VerificationKind
     file: str
@@ -98,6 +106,8 @@ class Requirement(BaseModel):
     """One requirement — the scalar fields plus child lists for the
     multi-valued relationships (source / implementation / verification
     refs and the derives-from-decisions junction)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     req_id: str
     category: str
@@ -123,6 +133,8 @@ class ReqDB(BaseModel):
     """The full in-memory requirements set — the authorities lookup
     plus every requirement. This is what the parser produces and what
     the SQLite / ReqIF generators consume."""
+
+    model_config = ConfigDict(extra="forbid")
 
     authorities: list[Authority] = Field(default_factory=list)
     requirements: list[Requirement] = Field(default_factory=list)

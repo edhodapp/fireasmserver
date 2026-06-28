@@ -37,7 +37,16 @@ def _load_authorities(path: Path) -> list[Authority]:
 
 
 def _load_requirements(req_dir: Path) -> list[Requirement]:
-    """Parse every ``*.yaml`` requirement file, sorted by ``req_id``."""
+    """Parse every ``*.yaml`` requirement file, sorted by ``req_id``.
+
+    A missing ``req_dir`` is an error, not an empty result: globbing an
+    absent directory yields nothing, which would silently produce an
+    empty :class:`ReqDB` from a wrong path or partial checkout.
+    """
+    if not req_dir.is_dir():
+        raise FileNotFoundError(
+            f"reqdb requirements directory not found: {req_dir}",
+        )
     requirements = [
         Requirement.model_validate(
             yaml.safe_load(path.read_text(encoding="utf-8")),

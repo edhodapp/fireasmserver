@@ -16,6 +16,7 @@ those links is a model-level check, deferred.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from pathlib import Path
 from typing import TypeVar
@@ -42,6 +43,17 @@ class UnknownAuthorityError(ValueError):
     the offending requirement and authority, so an authoring typo
     surfaces with context instead of as an opaque SQLite foreign-key
     violation mid-insert.
+    """
+
+
+class DuplicateIdError(ValueError):
+    """Two records share a primary-key id (``authority_id`` or
+    ``req_id``).
+
+    Raised by :func:`write_sqlite` before any rows are written, naming
+    the duplicates, so the conflict surfaces with context instead of as
+    an opaque SQLite UNIQUE/IntegrityError mid-insert (which would also
+    leave a partial file behind).
     """
 
 
@@ -104,17 +116,34 @@ CREATE TABLE requirement_decisions (
 def write_sqlite(db: ReqDB, out_path: Path) -> None:
     """Project ``db`` into a fresh SQLite file at ``out_path``.
 
-    Any existing file is replaced, so the build is idempotent. Foreign
-    keys are enforced; authorities are inserted before the requirements
-    and child rows that reference them.
+    The database is built in a sibling temporary file and atomically
+    renamed into place (``os.replace``), so a failed or interrupted
+    build never leaves a partial/corrupt file at ``out_path`` — an
+    existing one stays intact. Foreign keys are enforced; authorities
+    are inserted before the requirements and child rows that reference
+    them.
 
-    Raises :class:`UnknownAuthorityError` (before touching ``out_path``)
-    if any source_ref cites an authority absent from the lookup.
+    Raises (before any write) :class:`UnknownAuthorityError` if a
+    source_ref cites an authority absent from the lookup, or
+    :class:`DuplicateIdError` if two records share a primary-key id.
     """
     _check_authority_refs(db)
-    if out_path.exists():
-        out_path.unlink()
-    conn = sqlite3.connect(str(out_path))
+    _check_unique_ids(db)
+    tmp_path = out_path.with_name(f"{out_path.name}.tmp")
+    try:
+        _build_db(tmp_path, db)
+        os.replace(tmp_path, out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _build_db(tmp_path: Path, db: ReqDB) -> None:
+    """Construct the SQLite database at ``tmp_path`` (a temporary file).
+
+    Clears any stale partial first, then builds with foreign keys on.
+    """
+    tmp_path.unlink(missing_ok=True)
+    conn = sqlite3.connect(str(tmp_path))
     try:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(_SCHEMA)
@@ -161,6 +190,29 @@ def _check_authority_refs(db: ReqDB) -> None:
                     f"authority_id {ref.authority_id!r}; "
                     f"known authorities: {sorted(known)}",
                 )
+
+
+def _check_unique_ids(db: ReqDB) -> None:
+    """Fail loud, with context, on duplicate primary-key ids.
+
+    The SQLite PRIMARY KEY would also catch this, but only as an opaque
+    mid-insert ``IntegrityError`` that leaves a partial file; this names
+    the duplicates up front.
+    """
+    _check_unique([a.authority_id for a in db.authorities], "authority_id")
+    _check_unique([r.req_id for r in db.requirements], "req_id")
+
+
+def _check_unique(ids: list[str], label: str) -> None:
+    """Raise :class:`DuplicateIdError` if ``ids`` holds any duplicate."""
+    seen: set[str] = set()
+    dups: set[str] = set()
+    for value in ids:
+        if value in seen:
+            dups.add(value)
+        seen.add(value)
+    if dups:
+        raise DuplicateIdError(f"duplicate {label}(s): {sorted(dups)}")
 
 
 def _insert_authorities(
