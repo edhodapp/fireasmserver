@@ -13,6 +13,7 @@ from capstone import (  # type: ignore[import-untyped]
     Cs,
 )
 from elftools.elf.elffile import ELFFile
+from elftools.elf.sections import SymbolTableSection
 from pydantic import BaseModel
 
 # SHF_EXECINSTR — ELF section flag bit for executable code.
@@ -71,8 +72,7 @@ def _detect_arch(elf: ELFFile) -> str:
 def _code_sections(elf: ELFFile) -> list[tuple[bytes, int]]:
     """Yield (data, base_addr) for each executable section."""
     out: list[tuple[bytes, int]] = []
-    # pyelftools lacks type stubs; iter_sections is untyped.
-    for section in elf.iter_sections():  # type: ignore[no-untyped-call]
+    for section in elf.iter_sections():
         if section["sh_flags"] & _SHF_EXECINSTR:
             out.append((section.data(), section["sh_addr"]))
     return out
@@ -80,10 +80,8 @@ def _code_sections(elf: ELFFile) -> list[tuple[bytes, int]]:
 
 def _symbol_address(elf: ELFFile, name: str) -> int:
     """Return the address (st_value) of the named symbol, or raise."""
-    symtab = elf.get_section_by_name(  # type: ignore[no-untyped-call]
-        ".symtab",
-    )
-    if symtab is None:
+    symtab = elf.get_section_by_name(".symtab")
+    if not isinstance(symtab, SymbolTableSection):
         msg = "ELF has no .symtab; cannot resolve symbols"
         raise ValueError(msg)
     for symbol in symtab.iter_symbols():
@@ -156,8 +154,7 @@ def enumerate_branches(
     """
     result: list[ConditionalBranch] = []
     with open(elf_path, "rb") as f:
-        # pyelftools is untyped; the ELFFile constructor is untyped too.
-        elf = ELFFile(f)  # type: ignore[no-untyped-call]
+        elf = ELFFile(f)
         arch = _detect_arch(elf)
         cs = _capstone_for(arch)
         cs.detail = True

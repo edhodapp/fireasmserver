@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from elftools.elf.sections import SymbolTableSection
 
 from branch_cov.disasm import (
     _capstone_for,
@@ -160,14 +161,14 @@ class TestSymbolAddress:
         sym = MagicMock()
         sym.name = "_entry"
         sym.__getitem__.side_effect = lambda k: {"st_value": 0x40}[k]
-        symtab = MagicMock()
+        symtab = MagicMock(spec=SymbolTableSection)
         symtab.iter_symbols.return_value = [sym]
         elf = MagicMock()
         elf.get_section_by_name.return_value = symtab
         assert _symbol_address(elf, "_entry") == 0x40
 
     def test_symbol_missing_raises(self) -> None:
-        symtab = MagicMock()
+        symtab = MagicMock(spec=SymbolTableSection)
         symtab.iter_symbols.return_value = []
         elf = MagicMock()
         elf.get_section_by_name.return_value = symtab
